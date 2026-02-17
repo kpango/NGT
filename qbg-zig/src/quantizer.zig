@@ -2,6 +2,7 @@ const std = @import("std");
 const ngt = @import("ngt.zig");
 const serializer = @import("serializer.zig");
 const context = @import("context.zig");
+const distance = @import("distance.zig");
 
 pub const NGTQ_SIMD_BLOCK_SIZE = 16;
 pub const NGTQ_BATCH_SIZE = 2;
@@ -128,7 +129,7 @@ pub const Quantizer = struct {
         return stream_size / 2;
     }
 
-    pub fn createDistanceLookup(self: *Quantizer, query: []const f32) ![][]f32 {
+    pub fn createDistanceLookup(self: *Quantizer, query: []const f32, metric: distance.Metric) ![][]f32 {
         if (self.local_codebooks.len == 0) return error.NoLocalCodebooks;
 
         var rotated_buf: ?[]f32 = null;
@@ -170,12 +171,7 @@ pub const Quantizer = struct {
             for (0..n_centroids) |c| {
                 if (centroids.objects[c]) |centroid| {
                     if (centroid.len != sub_dim) return error.DimensionMismatch;
-                    var dist: f32 = 0;
-                    for (0..sub_dim) |k| {
-                        const diff = query_sub[k] - centroid[k];
-                        dist += diff * diff;
-                    }
-                    lut[d][c] = dist;
+                    lut[d][c] = distance.compute_sub(metric, query_sub, centroid);
                 } else {
                     lut[d][c] = std.math.inf(f32);
                 }
@@ -184,8 +180,8 @@ pub const Quantizer = struct {
         return lut;
     }
 
-    pub fn createDistanceLookupUint8(self: *Quantizer, query: []const f32) !DistanceLookupTableUint8 {
-        const flut = try self.createDistanceLookup(query);
+    pub fn createDistanceLookupUint8(self: *Quantizer, query: []const f32, metric: distance.Metric) !DistanceLookupTableUint8 {
+        const flut = try self.createDistanceLookup(query, metric);
         defer {
             for (flut) |l| self.allocator.free(l);
             self.allocator.free(flut);

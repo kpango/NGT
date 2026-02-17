@@ -1,6 +1,7 @@
 const std = @import("std");
 const serializer = @import("serializer.zig");
 const context = @import("context.zig");
+const distance = @import("distance.zig");
 
 pub const ObjectDistance = struct {
     id: u32,
@@ -8,8 +9,8 @@ pub const ObjectDistance = struct {
 
     pub fn read(ser: *serializer.Serializer) !ObjectDistance {
         const id = try ser.readInt(u32);
-        const distance = try ser.readFloat(f32);
-        return .{ .id = id, .distance = distance };
+        const distance_val = try ser.readFloat(f32);
+        return .{ .id = id, .distance = distance_val };
     }
 
     pub fn compare(_: void, a: ObjectDistance, b: ObjectDistance) std.math.Order {
@@ -114,16 +115,6 @@ pub const ObjectRepository = struct {
     }
 };
 
-pub fn l2_distance(a: []const f32, b: []const f32) f32 {
-    var sum: f32 = 0;
-    const len = @min(a.len, b.len);
-    for (0..len) |i| {
-        const diff = a[i] - b[i];
-        sum += diff * diff;
-    }
-    return std.math.sqrt(sum);
-}
-
 fn prefetch_object(obj: []const f32) void {
     if (obj.len > 0) {
         @prefetch(&obj[0], .{ .rw = .read, .locality = 3, .cache = .data });
@@ -134,6 +125,7 @@ pub const Index = struct {
     graph: GraphRepository,
     objects: ObjectRepository,
     allocator: std.mem.Allocator,
+    metric: distance.Metric = .L2,
 
     pub fn deinit(self: *Index) void {
         self.graph.deinit();
@@ -163,12 +155,11 @@ pub const Index = struct {
             .graph = graph,
             .objects = objects,
             .allocator = allocator,
+            // Metric could be loaded from property file
         };
     }
 
-    // Greedy graph search using reusable SearchContext
     pub fn search(self: *Index, ctx: *context.SearchContext, query: []const f32, size: usize, epsilon: f32) ![]ObjectDistance {
-        // Reset context
         try ctx.prepare_graph_search(self.objects.objects.len);
 
         var start_node: u32 = 1;
@@ -185,7 +176,7 @@ pub const Index = struct {
              return &[_]ObjectDistance{};
         }
 
-        const start_dist = l2_distance(query, self.objects.objects[start_node].?);
+        const start_dist = distance.compute(self.metric, query, self.objects.objects[start_node].?);
         const start_obj = ObjectDistance{ .id = start_node, .distance = start_dist };
 
         try ctx.unchecked.add(start_obj);
@@ -201,12 +192,8 @@ pub const Index = struct {
             if (node_opt) |neighbors| {
                 ctx.candidates.clearRetainingCapacity();
 
-                // 1. Gather unvisited neighbors
                 for (neighbors) |neighbor_ref| {
                     const neighbor_id = neighbor_ref.id;
-                    // DynamicBitSet bounds checked in set/isSet?
-                    // We ensured capacity >= objects.len.
-                    // ID should be valid.
                     if (neighbor_id >= ctx.visited.capacity) continue;
 
                     if (ctx.visited.isSet(neighbor_id)) continue;
@@ -217,17 +204,15 @@ pub const Index = struct {
                     }
                 }
 
-                // 2. Prefetch
                 for (ctx.candidates.items) |cid| {
                     if (self.objects.objects[cid]) |obj| {
                         prefetch_object(obj);
                     }
                 }
 
-                // 3. Compute
                 for (ctx.candidates.items) |cid| {
                     if (self.objects.objects[cid]) |neighbor_obj| {
-                        const dist = l2_distance(query, neighbor_obj);
+                        const dist = distance.compute(self.metric, query, neighbor_obj);
                         const obj = ObjectDistance{ .id = cid, .distance = dist };
 
                         try ctx.unchecked.add(obj);
@@ -242,13 +227,7 @@ pub const Index = struct {
             }
         }
 
-        // Return result COPY
-        // Or return slice of SearchContext internal?
-        // Caller usually frees. If we return slice, it must be allocated.
         var final_results = try self.allocator.alloc(ObjectDistance, ctx.results.count());
-        // Copy elements (destructive to PQ, but context will be reset anyway)
-        // Actually, we might want to keep PQ intact if we want to reuse results?
-        // But `prepare` clears it.
         var i: usize = ctx.results.count();
         while (ctx.results.removeOrNull()) |item| {
             i -= 1;

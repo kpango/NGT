@@ -5,6 +5,7 @@ const qbg_mod = @import("qbg.zig");
 const quantizer_mod = @import("quantizer.zig");
 const serializer_mod = @import("serializer.zig");
 const context = @import("context.zig");
+const distance = @import("distance.zig");
 
 test "end-to-end load and search" {
     const allocator = std.testing.allocator;
@@ -117,25 +118,38 @@ test "end-to-end load and search" {
 
     defer std.fs.cwd().deleteTree(test_idx) catch {};
 
-    // Search
     const query = try allocator.dupe(f32, &[_]f32{ 1.0, 1.0 });
     defer allocator.free(query);
 
     var ctx = context.SearchContext.init(allocator);
     defer ctx.deinit();
 
-    const results = try index.search(&ctx, query, 10, 0.1, 0.1);
-    defer allocator.free(results);
+    // 1. Test L2 (Default)
+    index.metric = .L2;
+    const results_l2 = try index.search(&ctx, query, 10, 0.1, 0.1);
+    defer allocator.free(results_l2);
 
-    try std.testing.expect(results.len >= 1);
-
-    var found = false;
-    for (results) |res| {
-        if (res.id == 1) {
-            found = true;
-            try std.testing.expectApproxEqAbs(@as(f32, 0.7071), res.distance, 0.01);
-            break;
-        }
+    try std.testing.expect(results_l2.len >= 1);
+    // Sub0: (1.0 - 0.5)^2 = 0.25
+    // Sub1: (1.0 - 0.5)^2 = 0.25
+    // Total L2 sq = 0.5. L2 = sqrt(0.5) ~ 0.7071
+    if (results_l2.len > 0) {
+        try std.testing.expectEqual(@as(u32, 1), results_l2[0].id);
+        try std.testing.expectApproxEqAbs(@as(f32, 0.7071), results_l2[0].distance, 0.01);
     }
-    try std.testing.expect(found);
+
+    // 2. Test L1
+    // Update metric
+    index.metric = .L1;
+    const results_l1 = try index.search(&ctx, query, 10, 0.1, 0.1);
+    defer allocator.free(results_l1);
+
+    try std.testing.expect(results_l1.len >= 1);
+    // Sub0: |1.0 - 0.5| = 0.5
+    // Sub1: |1.0 - 0.5| = 0.5
+    // Total L1 = 1.0
+    if (results_l1.len > 0) {
+        try std.testing.expectEqual(@as(u32, 1), results_l1[0].id);
+        try std.testing.expectApproxEqAbs(@as(f32, 1.0), results_l1[0].distance, 0.01);
+    }
 }
