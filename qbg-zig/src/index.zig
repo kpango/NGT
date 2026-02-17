@@ -28,6 +28,15 @@ pub const Index = struct {
         self.qbg_repo.deinit();
     }
 
+    // Prefetch a slice of memory
+    fn prefetch_slice(ptr: []const u8) void {
+        var i: usize = 0;
+        // Prefetch with cache line stride (64 bytes usually)
+        while (i < ptr.len) : (i += 64) {
+            @prefetch(&ptr[i], .{ .rw = .read, .locality = 3, .cache = .data });
+        }
+    }
+
     inline fn simd_lookup(lut: @Vector(16, u8), indices: @Vector(16, u8)) @Vector(16, u8) {
         if (builtin.cpu.arch == .x86_64 and std.Target.x86.featureSetHas(builtin.cpu.features, .avx2)) {
              return asm (
@@ -69,8 +78,6 @@ pub const Index = struct {
             const blk_no = idx / 16;
             const remaining = n_objects - idx;
 
-            // Accumulators in u16 (assuming max distance < 65535, valid for NGTQ u8 accumulation)
-            // 16 objects -> one @Vector(16, u16)
             var acc_u16 = @Vector(16, u16){ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
 
             for (0..m) |sub| {
@@ -89,25 +96,15 @@ pub const Index = struct {
                 const low_nibbles = codes_8 & @as(@Vector(8, u8), @splat(0x0F));
                 const high_nibbles = codes_8 >> @as(@Vector(8, u8), @splat(4));
 
-                // Shuffle mask: {0, 8, 1, 9, ...}
-                // low: 0..7
-                // high: 0..7 (mapped to 8..15 in shuffle)
                 const indices = @shuffle(u8, low_nibbles, high_nibbles,
                     @Vector(16, i32){0, 8, 1, 9, 2, 10, 3, 11, 4, 12, 5, 13, 6, 14, 7, 15}
                 );
 
                 const values_u8 = simd_lookup(lut_vec, indices);
-
-                // Accumulate u8 into u16
-                // Extend u8 to u16
-                const values_u16 = @as(@Vector(16, u16), values_u8); // Zero extension
+                const values_u16 = @as(@Vector(16, u16), values_u8);
                 acc_u16 += values_u16;
             }
 
-            // Convert to float, apply single scale and offset
-            // f_dist = acc_u16 * scale + total_offset
-
-            // Split into two halves for f32 (8 elements) conversion
             const acc0_u16 = @shuffle(u16, acc_u16, undefined, @Vector(8, i32){0, 1, 2, 3, 4, 5, 6, 7});
             const acc1_u16 = @shuffle(u16, acc_u16, undefined, @Vector(8, i32){8, 9, 10, 11, 12, 13, 14, 15});
 
@@ -160,6 +157,9 @@ pub const Index = struct {
 
             const blob = self.qbg_repo.nodes[blob_id];
             const n_obj = blob.ids.len;
+
+            // Prefetch the blob's objects
+            prefetch_slice(blob.objects);
 
             if (dist_buffer.capacity < n_obj) {
             }

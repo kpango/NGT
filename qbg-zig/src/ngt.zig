@@ -123,6 +123,13 @@ pub fn l2_distance(a: []const f32, b: []const f32) f32 {
     return std.math.sqrt(sum);
 }
 
+fn prefetch_object(obj: []const f32) void {
+    if (obj.len > 0) {
+        @prefetch(&obj[0], .{ .rw = .read, .locality = 3, .cache = .data });
+        // Typically prefetching the start is enough for L2 distance sequential access
+    }
+}
+
 pub const Index = struct {
     graph: GraphRepository,
     objects: ObjectRepository,
@@ -159,15 +166,10 @@ pub const Index = struct {
         };
     }
 
-    // Simple greedy graph search
+    // Simple greedy graph search with prefetching
     pub fn search(self: *Index, query: []const f32, size: usize, epsilon: f32) ![]ObjectDistance {
         var visited = std.AutoHashMap(u32, void).init(self.allocator);
         defer visited.deinit();
-
-        // Candidates priority queue (min-heap by distance) to track exploration frontier?
-        // NGT uses:
-        // - `unchecked`: PriorityQueue (min distance top) of candidates to explore.
-        // - `results`: PriorityQueue (max distance top) of found neighbors (k-NN).
 
         var unchecked = std.PriorityQueue(ObjectDistance, void, ObjectDistance.compare).init(self.allocator, {});
         defer unchecked.deinit();
@@ -175,12 +177,11 @@ pub const Index = struct {
         var results = std.PriorityQueue(ObjectDistance, void, ObjectDistance.compareReverse).init(self.allocator, {});
         defer results.deinit();
 
-        // Random seed
-        // Assuming at least one node exists.
-        // Try node 1? (NGT usually starts IDs from 1)
+        var candidates = std.ArrayList(u32).init(self.allocator);
+        defer candidates.deinit();
+
         var start_node: u32 = 1;
         if (self.graph.nodes.len > 1) {
-            // Find first valid node
             for (1..self.graph.nodes.len) |i| {
                 if (self.graph.nodes[i] != null) {
                     start_node = @intCast(i);
@@ -207,14 +208,30 @@ pub const Index = struct {
 
             const node_opt = if (target.id < self.graph.nodes.len) self.graph.nodes[target.id] else null;
             if (node_opt) |neighbors| {
+                candidates.clearRetainingCapacity();
+
+                // 1. Gather unvisited neighbors
                 for (neighbors) |neighbor_ref| {
                     const neighbor_id = neighbor_ref.id;
                     if (visited.contains(neighbor_id)) continue;
                     try visited.put(neighbor_id, {});
+                    if (self.objects.objects[neighbor_id] != null) {
+                        try candidates.append(neighbor_id);
+                    }
+                }
 
-                    if (self.objects.objects[neighbor_id]) |neighbor_obj| {
+                // 2. Prefetch all candidates
+                for (candidates.items) |cid| {
+                    if (self.objects.objects[cid]) |obj| {
+                        prefetch_object(obj);
+                    }
+                }
+
+                // 3. Compute distances
+                for (candidates.items) |cid| {
+                    if (self.objects.objects[cid]) |neighbor_obj| {
                         const dist = l2_distance(query, neighbor_obj);
-                        const obj = ObjectDistance{ .id = neighbor_id, .distance = dist };
+                        const obj = ObjectDistance{ .id = cid, .distance = dist };
 
                         try unchecked.add(obj);
                         try results.add(obj);
@@ -228,7 +245,6 @@ pub const Index = struct {
             }
         }
 
-        // Collect results
         var final_results = try self.allocator.alloc(ObjectDistance, results.count());
         var i: usize = results.count();
         while (results.removeOrNull()) |item| {
