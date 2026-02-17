@@ -89,11 +89,38 @@ test "end-to-end load and search" {
         try writer.writeInt(u32, 1, .little); // ids size
         try writer.writeInt(u32, 1, .little); // ID 1
 
-        var objects = try allocator.alloc(u8, 32);
+        // Objects: 1 object, 2 subvectors.
+        // align_blk = 32. n=1. s=32.
+        // bytes = 32 * 2 / 2 = 32? Wait.
+        // batch=2, blk=16. align_blk = 16*2? No.
+        // align_blk = NGTQ_SIMD_BLOCK_SIZE * NGTQ_BATCH_SIZE is used in NGT for something else?
+        // Let's re-verify logic.
+        // Quantizer.h: getNumOfAlignedObjects = ((n-1)/16+1)*16.
+        // streamSize = n_aligned * m_aligned.
+        // byteSize = streamSize / 2.
+        // Here n=1 -> n_aligned=16. m=2 -> m_aligned=2.
+        // streamSize = 16 * 2 = 32.
+        // byteSize = 16 bytes.
+        // So I should write 16 bytes.
+
+        var objects = try allocator.alloc(u8, 16);
         defer allocator.free(objects);
         @memset(objects, 0);
-        objects[0] = 0x01; // sub0=1 (pos 0)
-        objects[8] = 0x01; // sub1=1 (pos 16 / 2 = 8)
+
+        // Interleaved layout:
+        // Block 0 (objects 0..15).
+        // Sub 0: 16 nibbles -> 8 bytes.
+        // Sub 1: 16 nibbles -> 8 bytes.
+        // Total 16 bytes.
+
+        // Obj 0 is at index 0.
+        // Sub 0: byte 0, low nibble (bits 0-3).
+        // Sub 1: byte 8, low nibble.
+
+        // Set code 1 for sub 0 (pos 0) -> 0x01
+        objects[0] = 0x01;
+        // Set code 1 for sub 1 (pos 16) -> 0x01 at byte 8
+        objects[8] = 0x01;
 
         try writer.writeAll(objects);
 
@@ -106,7 +133,6 @@ test "end-to-end load and search" {
     qg_dir.close();
 
     // Load
-    // Use full path to avoid relative path issues if test runs in different CWD
     var cwd_buf: [1024]u8 = undefined;
     const cwd_path = try std.fs.cwd().realpath(".", &cwd_buf);
     const abs_idx_path = try std.fs.path.join(allocator, &[_][]const u8{ cwd_path, test_idx });
@@ -130,24 +156,6 @@ test "end-to-end load and search" {
     for (results) |res| {
         if (res.id == 1) {
             found = true;
-            // Dist calculation:
-            // Sub0: (1.0 - 0.5)^2 = 0.25
-            // Sub1: (1.0 - 0.5)^2 = 0.25
-            // Total = 0.5
-            // With Uint8 Quantization:
-            // sub0 dist = 0.25. sub1 dist = 0.25.
-            // min=0.25, max=0.25. offset=0.25, scale=0.
-            // quantized dist = 0.
-            // total = sqrt(0 + 0.25 + 0.25) ?
-            // total offset = 0.5.
-            // sqrt(0*0 + 0.5) = sqrt(0.5) ~= 0.707
-
-            // Wait, logic: distance = sqrt(sum + totalOffset).
-            // Here sum of u8 lookups is 0.
-            // distance = sqrt(0.5) = 0.707.
-            // But true distance is sqrt(0.5).
-            // So result should be correct.
-
             try std.testing.expectApproxEqAbs(@as(f32, 0.7071), res.distance, 0.01);
             break;
         }

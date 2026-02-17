@@ -28,26 +28,33 @@ pub const Index = struct {
         self.qbg_repo.deinit();
     }
 
-    // SIMD Optimized search
-    // Using inline assembly for x86_64 AVX2 shuffle
-    fn compute_pq_distance_simd(
-        lut: *quantizer_mod.DistanceLookupTableUint8,
-        objects: []const u8,
-        n_objects: usize,
-        m: usize,
-        distances: []f32
-    ) void {
-        // Only optimized for m >= 2 and multiples of 2 (NGTQ_BATCH_SIZE)
-        // Only optimized for AVX2 (x86_64)
+    inline fn simd_lookup(lut: @Vector(16, u8), indices: @Vector(16, u8)) @Vector(16, u8) {
         if (builtin.cpu.arch == .x86_64 and std.Target.x86.featureSetHas(builtin.cpu.features, .avx2)) {
-             compute_pq_distance_avx2(lut, objects, n_objects, m, distances);
+             return asm (
+                 "vpshufb %[idx], %[lut], %[res]"
+                 : [res] "=x" (-> @Vector(16, u8)),
+                 : [idx] "x" (indices),
+                   [lut] "x" (lut)
+             );
+        } else if (builtin.cpu.arch == .aarch64 and std.Target.aarch64.featureSetHas(builtin.cpu.features, .neon)) {
+             return asm (
+                 "tbl %[res].16b, {%[lut].16b}, %[idx].16b"
+                 : [res] "=w" (-> @Vector(16, u8)),
+                 : [lut] "w" (lut),
+                   [idx] "w" (indices)
+             );
         } else {
-             // Fallback to scalar
-             compute_pq_distance_scalar(lut, objects, n_objects, m, distances);
+             var res: @Vector(16, u8) = undefined;
+             const l_arr: [16]u8 = @bitCast(lut);
+             const i_arr: [16]u8 = @bitCast(indices);
+             inline for (0..16) |i| {
+                 res[i] = l_arr[i_arr[i] & 0x0F];
+             }
+             return res;
         }
     }
 
-    fn compute_pq_distance_scalar(
+    fn compute_pq_distance(
         lut: *quantizer_mod.DistanceLookupTableUint8,
         objects: []const u8,
         n_objects: usize,
@@ -57,226 +64,75 @@ pub const Index = struct {
         const m_aligned = ((m - 1) / 2 + 1) * 2;
         const blk_size = 16 * m_aligned;
 
-        for (0..n_objects) |idx| {
-            var dist_u32: u32 = 0;
-            const blk_no = idx / 16;
-            const oft = idx % 16;
-
-            for (0..m) |sub| {
-                 const pos = blk_no * blk_size + 16 * sub + oft;
-                 const packed_pos = pos / 2;
-                 const is_high = (pos % 2) == 1;
-
-                 const byte = objects[packed_pos];
-                 const code = if (is_high) (byte >> 4) else (byte & 0x0F);
-
-                 dist_u32 += lut.lut[sub][code];
-            }
-            // Approximation: sum(dist) * scale + offset
-            // NGT implementation sums scaled values separately if scales differ.
-            // But usually QBG uses `totalOffset` and unified scale?
-            // In Quantizer.h `QuantizedObjectDistanceUint8` -> `operator()` uses `distance += distanceLUT.getDistance(...)`
-            // Wait, standard NGT QBG uses float LUT if exact approximation is needed, or uint8 LUT.
-            // If uint8 LUT:
-            // dist = sqrt(sum(lut[code]) * scale + offset)
-            // This assumes unified scale.
-            // If individual scales, it sums `lut[code] * scale[sub]`.
-            // Our `createDistanceLookupUint8` computes individual scales.
-            // But if we want fast SIMD, we assume unified or we do vector madd.
-
-            // Let's implement correct scalar logic matching our LUT generation:
-            var dist_f: f32 = 0;
-            for (0..m) |sub| {
-                 const pos = blk_no * blk_size + 16 * sub + oft;
-                 const packed_pos = pos / 2;
-                 const is_high = (pos % 2) == 1;
-                 const byte = objects[packed_pos];
-                 const code = if (is_high) (byte >> 4) else (byte & 0x0F);
-
-                 dist_f += @as(f32, @floatFromInt(lut.lut[sub][code])) * lut.scales[sub] + lut.offsets[sub];
-            }
-            distances[idx] = std.math.sqrt(dist_f);
-        }
-    }
-
-    fn compute_pq_distance_avx2(
-        lut: *quantizer_mod.DistanceLookupTableUint8,
-        objects: []const u8,
-        n_objects: usize,
-        m: usize,
-        distances: []f32
-    ) void {
-        const m_aligned = ((m - 1) / 2 + 1) * 2;
-        const blk_size = 16 * m_aligned; // bytes per block of 16 objects
-
-        // Process in blocks of 16 objects
         var idx: usize = 0;
         while (idx < n_objects) : (idx += 16) {
             const blk_no = idx / 16;
             const remaining = n_objects - idx;
-            const current_blk_n = @min(16, remaining); // Should be 16 unless last block
-
-            // We accumulate 16 distances (for objects idx..idx+15) in parallel.
-            // AVX2 registers are 256-bit (32 bytes).
-            // We can store 8 floats in one YMM register.
-            // So we need 2 YMM registers for 16 objects: acc0 (0..7), acc1 (8..15).
 
             var acc0 = @Vector(8, f32){ 0, 0, 0, 0, 0, 0, 0, 0 };
             var acc1 = @Vector(8, f32){ 0, 0, 0, 0, 0, 0, 0, 0 };
 
             for (0..m) |sub| {
-                // Load LUT for this subspace (16 bytes -> 128 bit)
-                const lut_sub = lut.lut[sub];
-                // Need to load into XMM.
-                // Assuming lut_sub has 16 elements (or padded).
                 var lut_vec: @Vector(16, u8) = undefined;
-                @memcpy(&lut_vec, lut_sub[0..16]); // Safe if 16 centroids
-
-                // Broadcast LUT to YMM (duplicate 128-bit to both lanes) for vpshufb
-                // Zig @shuffle can do this?
-                // const lut_ymm = @shuffle(u8, lut_vec, lut_vec, ...);
-                // But we need to use it in asm.
-
-                // Load Packed Codes for 16 objects in this subspace.
-                // In interleaved format, the 16 codes for 16 objects of subspace `sub`
-                // are stored contiguously in 16 nibbles -> 8 bytes.
-                // Offset: blk_no * blk_size + 16 * sub (in nibbles).
-                // Byte offset: (blk_no * blk_size + 16 * sub) / 2.
-                // Wait, logic check:
-                // arrange: stream[blkNo * alignedBlockSize + 16 * sub + oft] = byte (not packed)
-                // compress: stream[idx] is byte. Packs into uint4.
-                // idx iterates stream linearly.
-                // Stream order: Block 0 -> Sub 0 (16 bytes) -> Sub 1 (16 bytes).
-                // Packed order: Block 0 -> Sub 0 (8 bytes) -> Sub 1 (8 bytes).
+                @memcpy(&lut_vec, lut.lut[sub][0..16]);
 
                 const byte_offset = (blk_no * blk_size + 16 * sub) / 2;
-                const codes_packed_ptr = objects.ptr + byte_offset;
 
-                // We need to expand 8 bytes to 16 bytes (nibbles).
-                // Load 8 bytes (64 bit) -> broadcast to XMM or load?
-                // Actually, we can load 128-bit (16 bytes) which covers sub and sub+1?
-                // Or just load 64-bit and unpack.
-
-                // Asm implementation for unpacking and lookup:
-                // 1. Load 8 bytes (codes) into XMM.
-                // 2. Unpack to 16 bytes:
-                //    - Lo nibbles: AND 0x0F
-                //    - Hi nibbles: Shift Right 4.
-                //    Wait, packing: `uint4Objects[idx / 2] |= (stream[idx] << 4)` (idx odd).
-                //    So High Nibble is Obj(odd). Low Nibble is Obj(even).
-                //    Obj0 (low), Obj1 (high).
-                //    We need to separate them.
-                //    Byte: [H: Obj1, L: Obj0]
-                //    We want: [Obj0, Obj1, Obj2, ...]
-                //    So we unpack 8 bytes to 16 bytes.
-                //    XMM: [B0, B1, ... B7, 0...0]
-                //    Unpack:
-                //      Low:  [B0&F, B1&F... B7&F] -> indices for even objects?
-                //      High: [B0>>4, B1>>4...] -> indices for odd objects?
-                //    BUT shuffle needs them in order 0..15.
-                //    So we need to interleave.
-                //    Bytes: [O1 O0], [O3 O2], ...
-                //    We want [O0, O1, O2, O3...].
-                //    So Low(B0), High(B0), Low(B1), High(B1)...
-
-                // AVX2 instructions:
-                // vpmovzxbw (byte to word)? No.
-                // We can use bit masking and shifting.
-
-                // Let's try to do this accumulation in standard Zig vector operations if possible,
-                // relying on compiler optimization, or fallback to asm.
-
-                // Pure Zig implementation of the inner loop logic (vectorized manually):
-                const codes_8 = @as(*const @Vector(8, u8), @ptrCast(@alignCast(codes_packed_ptr))).*;
-
-                // Expand to 16 bytes
-                var indices: @Vector(16, u8) = undefined;
-                // indices[0] = codes_8[0] & 0xF;
-                // indices[1] = codes_8[0] >> 4;
-                // ...
-                // This is essentially interleave.
-                // Zig 0.11/0.12+ supports extensive vector ops.
-
-                // Low nibbles
-                const low_nibbles = codes_8 & @as(@Vector(8, u8), @splat(0x0F));
-                // High nibbles
-                const high_nibbles = codes_8 >> @as(@Vector(8, u8), @splat(4));
-
-                // Interleave
-                const indices_low = @shuffle(u8, low_nibbles, high_nibbles, @Vector(16, i32){0, -1, 1, -2, 2, -3, 3, -4, 4, -5, 5, -6, 6, -7, 7, -8});
-                // Note: shuffle mask: positive index selects from first arg, negative (-1-index) from second.
-                // 0 -> low[0]. -1 -> high[0].
-
-                indices = indices_low;
-
-                // Lookup
-                // We need to look up 16 values from lut_sub.
-                // Vector indexing? `lut_vec[indices]`.
-                // Zig doesn't support vector indexing with vector yet?
-                // We can use `@shuffle` if indices are comptime, but they are runtime.
-                // So we need `pshufb`.
-
-                // Use Asm for pshufb
-                var values: @Vector(16, u8) = undefined;
-                const lut_vec_16: @Vector(16, u8) = lut_vec;
-
-                if (builtin.cpu.arch == .x86_64) {
-                    values = asm (
-                        "vpshufb %[idx], %[lut], %[res]"
-                        : [res] "=x" (-> @Vector(16, u8)),
-                        : [idx] "x" (indices),
-                          [lut] "x" (lut_vec_16)
-                    );
+                var codes_8: @Vector(8, u8) = undefined;
+                if (byte_offset + 8 <= objects.len) {
+                    @memcpy(&codes_8, objects[byte_offset..][0..8]);
                 } else {
-                    // Fallback
-                    for (0..16) |k| {
-                        values[k] = lut_sub[indices[k]];
-                    }
+                    @memset(&codes_8, 0);
                 }
 
-                // Accumulate to floats
+                const low_nibbles = codes_8 & @as(@Vector(8, u8), @splat(0x0F));
+                const high_nibbles = codes_8 >> @as(@Vector(8, u8), @splat(4));
+
+                // Fix shuffle mask to use ~0 for first vector (indices 0-7) and ~0 + 8 for second (indices 8-15)
+                // We want [low[0], high[0], low[1], high[1] ... ]
+                // low is indices 0..7
+                // high is indices 0..7 OF THE SECOND VECTOR, which maps to 8..15 in shuffle mask?
+                // Zig @shuffle(T, a, b, mask): mask index I selects:
+                // if I < len(a): a[I]
+                // else: b[I - len(a)]
+                // length of a is 8.
+                // so index 8 selects b[0].
+                // We want high[0] -> index 8.
+                // We want low[0] -> index 0.
+
+                const indices = @shuffle(u8, low_nibbles, high_nibbles,
+                    @Vector(16, i32){0, 8, 1, 9, 2, 10, 3, 11, 4, 12, 5, 13, 6, 14, 7, 15}
+                );
+
+                const values = simd_lookup(lut_vec, indices);
+
                 const scale = lut.scales[sub];
                 const offset = lut.offsets[sub];
-
-                // Convert u8 values to f32 and madd
-                // Split 16 values into 2x8 floats
-                const vals_low: @Vector(8, u8) = @shuffle(u8, values, undefined, @Vector(8, i32){0, 1, 2, 3, 4, 5, 6, 7});
-                const vals_high: @Vector(8, u8) = @shuffle(u8, values, undefined, @Vector(8, i32){8, 9, 10, 11, 12, 13, 14, 15});
-
-                const f_low = convertU8ToF32(vals_low);
-                const f_high = convertU8ToF32(vals_high);
-
                 const v_scale = @as(@Vector(8, f32), @splat(scale));
                 const v_offset = @as(@Vector(8, f32), @splat(offset));
 
-                acc0 += f_low * v_scale + v_offset;
-                acc1 += f_high * v_scale + v_offset;
+                const vals0 = @shuffle(u8, values, undefined, @Vector(8, i32){0, 1, 2, 3, 4, 5, 6, 7});
+                const vals1 = @shuffle(u8, values, undefined, @Vector(8, i32){8, 9, 10, 11, 12, 13, 14, 15});
+
+                const f0 = convertU8ToF32(vals0);
+                const f1 = convertU8ToF32(vals1);
+
+                acc0 += f0 * v_scale + v_offset;
+                acc1 += f1 * v_scale + v_offset;
             }
 
-            // Sqrt and Store
             acc0 = @sqrt(acc0);
             acc1 = @sqrt(acc1);
 
-            // Store results
-            // Be careful with bounds if remaining < 16
-            if (remaining >= 16) {
-                @as(*@Vector(8, f32), @ptrCast(&distances[idx])).*;
-                @as(*@Vector(8, f32), @ptrCast(&distances[idx+8])).* = acc1;
-                // Wait, previous line statement has no effect. Assignment needed.
-                const dest0 = distances[idx..idx+8];
-                @as(*@Vector(8, f32), @ptrCast(dest0.ptr)).* = acc0;
+            const store_len = @min(16, remaining);
 
-                const dest1 = distances[idx+8..idx+16];
-                @as(*@Vector(8, f32), @ptrCast(dest1.ptr)).* = acc1;
-            } else {
-                // Partial store
-                var res: [16]f32 = undefined;
-                @as(*@Vector(8, f32), @ptrCast(&res[0])).* = acc0;
-                @as(*@Vector(8, f32), @ptrCast(&res[8])).* = acc1;
-                for (0..remaining) |k| {
-                    distances[idx + k] = res[k];
-                }
-            }
+            var res: [16]f32 = undefined;
+            const p0: *align(1) @Vector(8, f32) = @ptrCast(&res[0]);
+            p0.* = acc0;
+            const p1: *align(1) @Vector(8, f32) = @ptrCast(&res[8]);
+            p1.* = acc1;
+
+            @memcpy(distances[idx..idx+store_len], res[0..store_len]);
         }
     }
 
@@ -291,14 +147,12 @@ pub const Index = struct {
         const blobs = try self.quantizer.global_codebook.search(query, size, blob_epsilon);
         defer self.allocator.free(blobs);
 
-        // Use Uint8 LUT
         var lut = try self.quantizer.createDistanceLookupUint8(query);
         defer lut.deinit();
 
         var results = std.PriorityQueue(ngt.ObjectDistance, void, ngt.ObjectDistance.compareReverse).init(self.allocator, {});
         defer results.deinit();
 
-        // Reusable buffer for distances
         var dist_buffer = std.ArrayList(f32).init(self.allocator);
         defer dist_buffer.deinit();
 
@@ -309,9 +163,11 @@ pub const Index = struct {
             const blob = self.qbg_repo.nodes[blob_id];
             const n_obj = blob.ids.len;
 
+            if (dist_buffer.capacity < n_obj) {
+            }
             try dist_buffer.resize(n_obj);
 
-            compute_pq_distance_simd(&lut, blob.objects, n_obj, self.quantizer.division_no, dist_buffer.items);
+            compute_pq_distance(&lut, blob.objects, n_obj, self.quantizer.division_no, dist_buffer.items);
 
             for (0..n_obj) |k| {
                 const obj_id = blob.ids[k];
