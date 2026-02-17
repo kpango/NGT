@@ -5,6 +5,21 @@ const serializer = @import("serializer.zig");
 pub const NGTQ_SIMD_BLOCK_SIZE = 16;
 pub const NGTQ_BATCH_SIZE = 2;
 
+pub const DistanceLookupTableUint8 = struct {
+    lut: [][]u8, // [division_no][n_centroids]
+    scales: []f32, // [division_no]
+    offsets: []f32, // [division_no]
+    total_offset: f32,
+    allocator: std.mem.Allocator,
+
+    pub fn deinit(self: *DistanceLookupTableUint8) void {
+        for (self.lut) |l| self.allocator.free(l);
+        self.allocator.free(self.lut);
+        self.allocator.free(self.scales);
+        self.allocator.free(self.offsets);
+    }
+};
+
 pub const Quantizer = struct {
     global_codebook: ngt.Index,
     local_codebooks: []ngt.ObjectRepository,
@@ -25,13 +40,13 @@ pub const Quantizer = struct {
     }
 
     pub fn load(allocator: std.mem.Allocator, path: []const u8) !Quantizer {
-        // Load global codebook (NGT Index)
+        // Load global codebook
         var global_path = try std.fs.path.join(allocator, &[_][]const u8{ path, "global" });
         defer allocator.free(global_path);
 
         const global_codebook = try ngt.Index.load(allocator, global_path);
 
-        // Load local codebooks (NGT Object Repositories)
+        // Load local codebooks
         var local_repos = std.ArrayList(ngt.ObjectRepository).init(allocator);
         defer local_repos.deinit();
 
@@ -64,7 +79,7 @@ pub const Quantizer = struct {
         const local_codebooks = try local_repos.toOwnedSlice();
         const division_no: u32 = @intCast(local_codebooks.len);
 
-        // Load Rotation "R"
+        // Load Rotation
         var rotation: ?[]f32 = null;
         var rotation_path = try std.fs.path.join(allocator, &[_][]const u8{ path, "R" });
         defer allocator.free(rotation_path);
@@ -108,10 +123,9 @@ pub const Quantizer = struct {
         };
     }
 
-    // Returns byte size for quantized stream of n objects (4-bit PQ)
     pub fn getUint4StreamSize(self: *Quantizer, n: u64) usize {
-        const batch_size = NGTQ_BATCH_SIZE; // 2
-        const block_size = NGTQ_SIMD_BLOCK_SIZE; // 16
+        const batch_size = NGTQ_BATCH_SIZE;
+        const block_size = NGTQ_SIMD_BLOCK_SIZE;
 
         const m_aligned = ((self.division_no - 1) / batch_size + 1) * batch_size;
         const n_aligned = ((n - 1) / block_size + 1) * block_size;
@@ -121,6 +135,7 @@ pub const Quantizer = struct {
     }
 
     pub fn createDistanceLookup(self: *Quantizer, query: []const f32) ![][]f32 {
+        // Scalar implementation (f32)
         if (self.local_codebooks.len == 0) return error.NoLocalCodebooks;
 
         var rotated_buf: ?[]f32 = null;
@@ -132,7 +147,6 @@ pub const Quantizer = struct {
              if (rot.len == dim * dim) {
                  const buf = try self.allocator.alloc(f32, dim);
                  rotated_buf = buf;
-                 // R * q
                  for (0..dim) |r| {
                      var sum: f32 = 0;
                      for (0..dim) |c| {
@@ -151,7 +165,6 @@ pub const Quantizer = struct {
         }
 
         const sub_dim = query_vec.len / self.division_no;
-        if (sub_dim == 0) return error.InvalidDimension;
 
         for (0..self.division_no) |d| {
             const centroids = self.local_codebooks[d];
@@ -162,7 +175,6 @@ pub const Quantizer = struct {
 
             for (0..n_centroids) |c| {
                 if (centroids.objects[c]) |centroid| {
-                    if (centroid.len != sub_dim) return error.DimensionMismatch;
                     var dist: f32 = 0;
                     for (0..sub_dim) |k| {
                         const diff = query_sub[k] - centroid[k];
@@ -175,5 +187,64 @@ pub const Quantizer = struct {
             }
         }
         return lut;
+    }
+
+    pub fn createDistanceLookupUint8(self: *Quantizer, query: []const f32) !DistanceLookupTableUint8 {
+        // Calculate float distances first
+        const flut = try self.createDistanceLookup(query);
+        defer {
+            for (flut) |l| self.allocator.free(l);
+            self.allocator.free(flut);
+        }
+
+        const lut = try self.allocator.alloc([]u8, self.division_no);
+        const scales = try self.allocator.alloc(f32, self.division_no);
+        const offsets = try self.allocator.alloc(f32, self.division_no);
+        var total_offset: f32 = 0;
+
+        for (0..self.division_no) |d| {
+            const f_sub_lut = flut[d];
+            var min: f32 = std.math.floatMax(f32);
+            var max: f32 = -std.math.floatMax(f32);
+
+            for (f_sub_lut) |val| {
+                if (val < min) min = val;
+                if (val > max and val != std.math.inf(f32)) max = val;
+            }
+            // If min is inf (empty), handle gracefully
+            if (min == std.math.floatMax(f32)) {
+                min = 0;
+                max = 0;
+            }
+
+            const offset = min;
+            const scale = if (max > min) (max - min) / 255.0 else 0.0;
+
+            scales[d] = scale;
+            offsets[d] = offset;
+            total_offset += offset;
+
+            lut[d] = try self.allocator.alloc(u8, f_sub_lut.len);
+            for (f_sub_lut, 0..) |val, i| {
+                if (val == std.math.inf(f32)) {
+                    lut[d][i] = 255;
+                } else {
+                    if (scale > 0) {
+                        const q = (val - offset) / scale;
+                        lut[d][i] = @intFromFloat(@round(q));
+                    } else {
+                        lut[d][i] = 0;
+                    }
+                }
+            }
+        }
+
+        return .{
+            .lut = lut,
+            .scales = scales,
+            .offsets = offsets,
+            .total_offset = total_offset,
+            .allocator = self.allocator,
+        };
     }
 };

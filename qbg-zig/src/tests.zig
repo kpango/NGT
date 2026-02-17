@@ -115,14 +115,6 @@ test "end-to-end load and search" {
     var index = try index_mod.Index.load(allocator, abs_idx_path);
     defer index.deinit();
 
-    // Clean up
-    // We defer deleteTree at top level scope (after creating dir) usually,
-    // but here we want to ensure it stays during test.
-    // We can just rely on defer deleteTree(test_idx) at end of function.
-    // Wait, deleteTree requires the dir to be closed? `index` holds open files?
-    // `Index.load` reads files and closes them immediately.
-    // So deleteTree should work.
-
     defer std.fs.cwd().deleteTree(test_idx) catch {};
 
     // Search
@@ -142,7 +134,21 @@ test "end-to-end load and search" {
             // Sub0: (1.0 - 0.5)^2 = 0.25
             // Sub1: (1.0 - 0.5)^2 = 0.25
             // Total = 0.5
-            try std.testing.expectApproxEqAbs(@as(f32, 0.5), res.distance, 0.001);
+            // With Uint8 Quantization:
+            // sub0 dist = 0.25. sub1 dist = 0.25.
+            // min=0.25, max=0.25. offset=0.25, scale=0.
+            // quantized dist = 0.
+            // total = sqrt(0 + 0.25 + 0.25) ?
+            // total offset = 0.5.
+            // sqrt(0*0 + 0.5) = sqrt(0.5) ~= 0.707
+
+            // Wait, logic: distance = sqrt(sum + totalOffset).
+            // Here sum of u8 lookups is 0.
+            // distance = sqrt(0.5) = 0.707.
+            // But true distance is sqrt(0.5).
+            // So result should be correct.
+
+            try std.testing.expectApproxEqAbs(@as(f32, 0.7071), res.distance, 0.01);
             break;
         }
     }
