@@ -1,0 +1,239 @@
+const std = @import("std");
+const ngt = @import("ngt.zig");
+const serializer = @import("serializer.zig");
+const context = @import("context.zig");
+const distance = @import("distance.zig");
+
+pub const NGTQ_SIMD_BLOCK_SIZE = 16;
+pub const NGTQ_BATCH_SIZE = 2;
+
+pub const DistanceLookupTableUint8 = struct {
+    lut: [][]u8, // [division_no][padded_n_centroids]
+    scale: f32,
+    offset: f32,
+    total_offset: f32,
+    allocator: std.mem.Allocator,
+
+    pub fn deinit(self: *DistanceLookupTableUint8) void {
+        for (self.lut) |l| self.allocator.free(l);
+        self.allocator.free(self.lut);
+    }
+};
+
+pub const Quantizer = struct {
+    global_codebook: ngt.Index,
+    local_codebooks: []ngt.ObjectRepository,
+    rotation: ?[]f32,
+    dimension: u32,
+    division_no: u32,
+    allocator: std.mem.Allocator,
+
+    pub fn deinit(self: *Quantizer) void {
+        self.global_codebook.deinit();
+        for (self.local_codebooks) |*repo| {
+            repo.deinit();
+        }
+        self.allocator.free(self.local_codebooks);
+        if (self.rotation) |rot| {
+            self.allocator.free(rot);
+        }
+    }
+
+    pub fn load(allocator: std.mem.Allocator, path: []const u8) !Quantizer {
+        var global_path = try std.fs.path.join(allocator, &[_][]const u8{ path, "global" });
+        defer allocator.free(global_path);
+
+        const global_codebook = try ngt.Index.load(allocator, global_path);
+
+        var local_repos = std.ArrayList(ngt.ObjectRepository).init(allocator);
+        defer local_repos.deinit();
+
+        var i: u32 = 0;
+        while (true) : (i += 1) {
+            var name_buf: [32]u8 = undefined;
+            const name = std.fmt.bufPrint(&name_buf, "local{}", .{i}) catch break;
+            var local_dir_path = try std.fs.path.join(allocator, &[_][]const u8{ path, name });
+            defer allocator.free(local_dir_path);
+
+            const file = std.fs.cwd().openDir(local_dir_path, .{}) catch |err| {
+                if (err == error.FileNotFound) break;
+                return err;
+            };
+            file.close();
+
+            var obj_path = try std.fs.path.join(allocator, &[_][]const u8{ local_dir_path, "obj" });
+            defer allocator.free(obj_path);
+
+            const obj_file = try std.fs.cwd().openFile(obj_path, .{});
+            defer obj_file.close();
+
+            var obj_reader = obj_file.reader();
+            var obj_ser = serializer.Serializer.init(allocator, obj_reader.any());
+
+            const repo = try ngt.ObjectRepository.read(allocator, &obj_ser);
+            try local_repos.append(repo);
+        }
+
+        const local_codebooks = try local_repos.toOwnedSlice();
+        const division_no: u32 = @intCast(local_codebooks.len);
+
+        var rotation: ?[]f32 = null;
+        var rotation_path = try std.fs.path.join(allocator, &[_][]const u8{ path, "R" });
+        defer allocator.free(rotation_path);
+
+        if (std.fs.cwd().openFile(rotation_path, .{})) |rot_file| {
+            defer rot_file.close();
+            var reader = rot_file.reader();
+            var floats = std.ArrayList(f32).init(allocator);
+            defer floats.deinit();
+
+            var buf: [4096]u8 = undefined;
+            while (try reader.readUntilDelimiterOrEof(&buf, '\n')) |line| {
+                var it = std.mem.tokenizeAny(u8, line, " \t\r");
+                while (it.next()) |token| {
+                     const val = std.fmt.parseFloat(f32, token) catch continue;
+                     try floats.append(val);
+                }
+            }
+            rotation = try floats.toOwnedSlice();
+        } else |err| {
+        }
+
+        var dimension: u32 = 0;
+        if (global_codebook.objects.objects.len > 0) {
+             for (global_codebook.objects.objects) |obj_opt| {
+                 if (obj_opt) |obj| {
+                     dimension = @intCast(obj.len);
+                     break;
+                 }
+             }
+        }
+
+        return .{
+            .global_codebook = global_codebook,
+            .local_codebooks = local_codebooks,
+            .rotation = rotation,
+            .dimension = dimension,
+            .division_no = division_no,
+            .allocator = allocator,
+        };
+    }
+
+    pub fn getUint4StreamSize(self: *Quantizer, n: u64) usize {
+        if (n == 0) return 0;
+        const batch_size = NGTQ_BATCH_SIZE;
+        const block_size = NGTQ_SIMD_BLOCK_SIZE;
+        const m_aligned = ((self.division_no - 1) / batch_size + 1) * batch_size;
+        const n_aligned = ((n - 1) / block_size + 1) * block_size;
+        const stream_size = n_aligned * m_aligned;
+        return stream_size / 2;
+    }
+
+    pub fn createDistanceLookup(self: *Quantizer, query: []const f32, metric: distance.Metric) ![][]f32 {
+        if (self.local_codebooks.len == 0) return error.NoLocalCodebooks;
+
+        var rotated_buf: ?[]f32 = null;
+        var query_vec: []const f32 = query;
+        defer if (rotated_buf) |buf| self.allocator.free(buf);
+
+        if (self.rotation) |rot| {
+             const dim = query.len;
+             if (rot.len == dim * dim) {
+                 const buf = try self.allocator.alloc(f32, dim);
+                 rotated_buf = buf;
+                 for (0..dim) |r| {
+                     var sum: f32 = 0;
+                     for (0..dim) |c| {
+                         sum += rot[r * dim + c] * query[c];
+                     }
+                     buf[r] = sum;
+                 }
+                 query_vec = buf;
+             }
+        }
+
+        const lut = try self.allocator.alloc([]f32, self.division_no);
+        errdefer {
+             for (lut) |l| if (l.len > 0) self.allocator.free(l);
+             self.allocator.free(lut);
+        }
+
+        const sub_dim = query_vec.len / self.division_no;
+        if (sub_dim == 0) return error.InvalidDimension;
+
+        for (0..self.division_no) |d| {
+            const centroids = self.local_codebooks[d];
+            const n_centroids = centroids.objects.len;
+            lut[d] = try self.allocator.alloc(f32, n_centroids);
+
+            const query_sub = query_vec[d * sub_dim .. (d + 1) * sub_dim];
+
+            for (0..n_centroids) |c| {
+                if (centroids.objects[c]) |centroid| {
+                    if (centroid.len != sub_dim) return error.DimensionMismatch;
+                    lut[d][c] = distance.compute_sub(metric, query_sub, centroid);
+                } else {
+                    lut[d][c] = std.math.inf(f32);
+                }
+            }
+        }
+        return lut;
+    }
+
+    pub fn createDistanceLookupUint8(self: *Quantizer, query: []const f32, metric: distance.Metric) !DistanceLookupTableUint8 {
+        const flut = try self.createDistanceLookup(query, metric);
+        defer {
+            for (flut) |l| self.allocator.free(l);
+            self.allocator.free(flut);
+        }
+
+        const lut = try self.allocator.alloc([]u8, self.division_no);
+        errdefer self.allocator.free(lut);
+
+        var global_min: f32 = std.math.floatMax(f32);
+        var global_max: f32 = -std.math.floatMax(f32);
+
+        for (0..self.division_no) |d| {
+            for (flut[d]) |val| {
+                if (val < global_min) global_min = val;
+                if (val > global_max and val != std.math.inf(f32)) global_max = val;
+            }
+        }
+        if (global_min == std.math.floatMax(f32)) {
+            global_min = 0;
+            global_max = 0;
+        }
+
+        const offset = global_min;
+        const scale = if (global_max > global_min) (global_max - global_min) / 255.0 else 0.0;
+        const total_offset = offset * @as(f32, @floatFromInt(self.division_no));
+
+        for (0..self.division_no) |d| {
+            const f_sub_lut = flut[d];
+            const lut_size = @max(f_sub_lut.len, 16);
+            lut[d] = try self.allocator.alloc(u8, lut_size);
+            @memset(lut[d], 0);
+
+            for (f_sub_lut, 0..) |val, i| {
+                if (val == std.math.inf(f32)) {
+                    lut[d][i] = 255;
+                } else {
+                    if (scale > 0) {
+                        const q = (val - offset) / scale;
+                        lut[d][i] = @intFromFloat(@round(q));
+                    } else {
+                        lut[d][i] = 0;
+                    }
+                }
+            }
+        }
+
+        return .{
+            .lut = lut,
+            .scale = scale,
+            .offset = offset,
+            .total_offset = total_offset,
+            .allocator = self.allocator,
+        };
+    }
+};
