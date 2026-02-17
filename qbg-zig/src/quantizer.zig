@@ -1,6 +1,7 @@
 const std = @import("std");
 const ngt = @import("ngt.zig");
 const serializer = @import("serializer.zig");
+const context = @import("context.zig");
 
 pub const NGTQ_SIMD_BLOCK_SIZE = 16;
 pub const NGTQ_BATCH_SIZE = 2;
@@ -193,7 +194,6 @@ pub const Quantizer = struct {
         const lut = try self.allocator.alloc([]u8, self.division_no);
         errdefer self.allocator.free(lut);
 
-        // Find Global Min/Max for Total Scale Offset Compression
         var global_min: f32 = std.math.floatMax(f32);
         var global_max: f32 = -std.math.floatMax(f32);
 

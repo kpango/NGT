@@ -1,5 +1,6 @@
 const std = @import("std");
 const serializer = @import("serializer.zig");
+const context = @import("context.zig");
 
 pub const ObjectDistance = struct {
     id: u32,
@@ -126,7 +127,6 @@ pub fn l2_distance(a: []const f32, b: []const f32) f32 {
 fn prefetch_object(obj: []const f32) void {
     if (obj.len > 0) {
         @prefetch(&obj[0], .{ .rw = .read, .locality = 3, .cache = .data });
-        // Typically prefetching the start is enough for L2 distance sequential access
     }
 }
 
@@ -166,19 +166,10 @@ pub const Index = struct {
         };
     }
 
-    // Simple greedy graph search with prefetching
-    pub fn search(self: *Index, query: []const f32, size: usize, epsilon: f32) ![]ObjectDistance {
-        var visited = std.AutoHashMap(u32, void).init(self.allocator);
-        defer visited.deinit();
-
-        var unchecked = std.PriorityQueue(ObjectDistance, void, ObjectDistance.compare).init(self.allocator, {});
-        defer unchecked.deinit();
-
-        var results = std.PriorityQueue(ObjectDistance, void, ObjectDistance.compareReverse).init(self.allocator, {});
-        defer results.deinit();
-
-        var candidates = std.ArrayList(u32).init(self.allocator);
-        defer candidates.deinit();
+    // Greedy graph search using reusable SearchContext
+    pub fn search(self: *Index, ctx: *context.SearchContext, query: []const f32, size: usize, epsilon: f32) ![]ObjectDistance {
+        // Reset context
+        try ctx.prepare_graph_search(self.objects.objects.len);
 
         var start_node: u32 = 1;
         if (self.graph.nodes.len > 1) {
@@ -197,57 +188,69 @@ pub const Index = struct {
         const start_dist = l2_distance(query, self.objects.objects[start_node].?);
         const start_obj = ObjectDistance{ .id = start_node, .distance = start_dist };
 
-        try unchecked.add(start_obj);
-        try results.add(start_obj);
-        try visited.put(start_node, {});
+        try ctx.unchecked.add(start_obj);
+        try ctx.results.add(start_obj);
+        ctx.visited.set(start_node);
 
         var exploration_radius = start_dist * (1.0 + epsilon);
 
-        while (unchecked.removeOrNull()) |target| {
+        while (ctx.unchecked.removeOrNull()) |target| {
             if (target.distance > exploration_radius) break;
 
             const node_opt = if (target.id < self.graph.nodes.len) self.graph.nodes[target.id] else null;
             if (node_opt) |neighbors| {
-                candidates.clearRetainingCapacity();
+                ctx.candidates.clearRetainingCapacity();
 
                 // 1. Gather unvisited neighbors
                 for (neighbors) |neighbor_ref| {
                     const neighbor_id = neighbor_ref.id;
-                    if (visited.contains(neighbor_id)) continue;
-                    try visited.put(neighbor_id, {});
+                    // DynamicBitSet bounds checked in set/isSet?
+                    // We ensured capacity >= objects.len.
+                    // ID should be valid.
+                    if (neighbor_id >= ctx.visited.capacity) continue;
+
+                    if (ctx.visited.isSet(neighbor_id)) continue;
+                    ctx.visited.set(neighbor_id);
+
                     if (self.objects.objects[neighbor_id] != null) {
-                        try candidates.append(neighbor_id);
+                        try ctx.candidates.append(neighbor_id);
                     }
                 }
 
-                // 2. Prefetch all candidates
-                for (candidates.items) |cid| {
+                // 2. Prefetch
+                for (ctx.candidates.items) |cid| {
                     if (self.objects.objects[cid]) |obj| {
                         prefetch_object(obj);
                     }
                 }
 
-                // 3. Compute distances
-                for (candidates.items) |cid| {
+                // 3. Compute
+                for (ctx.candidates.items) |cid| {
                     if (self.objects.objects[cid]) |neighbor_obj| {
                         const dist = l2_distance(query, neighbor_obj);
                         const obj = ObjectDistance{ .id = cid, .distance = dist };
 
-                        try unchecked.add(obj);
-                        try results.add(obj);
+                        try ctx.unchecked.add(obj);
+                        try ctx.results.add(obj);
 
-                        if (results.count() > size) {
-                            _ = results.remove(); // Remove furthest
-                            exploration_radius = results.peek().?.distance * (1.0 + epsilon);
+                        if (ctx.results.count() > size) {
+                            _ = ctx.results.remove();
+                            exploration_radius = ctx.results.peek().?.distance * (1.0 + epsilon);
                         }
                     }
                 }
             }
         }
 
-        var final_results = try self.allocator.alloc(ObjectDistance, results.count());
-        var i: usize = results.count();
-        while (results.removeOrNull()) |item| {
+        // Return result COPY
+        // Or return slice of SearchContext internal?
+        // Caller usually frees. If we return slice, it must be allocated.
+        var final_results = try self.allocator.alloc(ObjectDistance, ctx.results.count());
+        // Copy elements (destructive to PQ, but context will be reset anyway)
+        // Actually, we might want to keep PQ intact if we want to reuse results?
+        // But `prepare` clears it.
+        var i: usize = ctx.results.count();
+        while (ctx.results.removeOrNull()) |item| {
             i -= 1;
             final_results[i] = item;
         }

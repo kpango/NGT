@@ -4,6 +4,7 @@ const ngt_mod = @import("ngt.zig");
 const qbg_mod = @import("qbg.zig");
 const quantizer_mod = @import("quantizer.zig");
 const serializer_mod = @import("serializer.zig");
+const context = @import("context.zig");
 
 test "end-to-end load and search" {
     const allocator = std.testing.allocator;
@@ -89,38 +90,11 @@ test "end-to-end load and search" {
         try writer.writeInt(u32, 1, .little); // ids size
         try writer.writeInt(u32, 1, .little); // ID 1
 
-        // Objects: 1 object, 2 subvectors.
-        // align_blk = 32. n=1. s=32.
-        // bytes = 32 * 2 / 2 = 32? Wait.
-        // batch=2, blk=16. align_blk = 16*2? No.
-        // align_blk = NGTQ_SIMD_BLOCK_SIZE * NGTQ_BATCH_SIZE is used in NGT for something else?
-        // Let's re-verify logic.
-        // Quantizer.h: getNumOfAlignedObjects = ((n-1)/16+1)*16.
-        // streamSize = n_aligned * m_aligned.
-        // byteSize = streamSize / 2.
-        // Here n=1 -> n_aligned=16. m=2 -> m_aligned=2.
-        // streamSize = 16 * 2 = 32.
-        // byteSize = 16 bytes.
-        // So I should write 16 bytes.
-
         var objects = try allocator.alloc(u8, 16);
         defer allocator.free(objects);
         @memset(objects, 0);
-
-        // Interleaved layout:
-        // Block 0 (objects 0..15).
-        // Sub 0: 16 nibbles -> 8 bytes.
-        // Sub 1: 16 nibbles -> 8 bytes.
-        // Total 16 bytes.
-
-        // Obj 0 is at index 0.
-        // Sub 0: byte 0, low nibble (bits 0-3).
-        // Sub 1: byte 8, low nibble.
-
-        // Set code 1 for sub 0 (pos 0) -> 0x01
-        objects[0] = 0x01;
-        // Set code 1 for sub 1 (pos 16) -> 0x01 at byte 8
-        objects[8] = 0x01;
+        objects[0] = 0x01; // sub0=1 (pos 0)
+        objects[8] = 0x01; // sub1=1 (pos 16 / 2 = 8)
 
         try writer.writeAll(objects);
 
@@ -147,7 +121,10 @@ test "end-to-end load and search" {
     const query = try allocator.dupe(f32, &[_]f32{ 1.0, 1.0 });
     defer allocator.free(query);
 
-    const results = try index.search(query, 10, 0.1, 0.1);
+    var ctx = context.SearchContext.init(allocator);
+    defer ctx.deinit();
+
+    const results = try index.search(&ctx, query, 10, 0.1, 0.1);
     defer allocator.free(results);
 
     try std.testing.expect(results.len >= 1);

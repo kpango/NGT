@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const ngt = @import("ngt.zig");
 const quantizer_mod = @import("quantizer.zig");
 const qbg = @import("qbg.zig");
+const context = @import("context.zig");
 
 pub const Index = struct {
     quantizer: quantizer_mod.Quantizer,
@@ -28,15 +29,15 @@ pub const Index = struct {
         self.qbg_repo.deinit();
     }
 
-    // Prefetch a slice of memory
+    // ... prefetch_slice ...
     fn prefetch_slice(ptr: []const u8) void {
         var i: usize = 0;
-        // Prefetch with cache line stride (64 bytes usually)
         while (i < ptr.len) : (i += 64) {
             @prefetch(&ptr[i], .{ .rw = .read, .locality = 3, .cache = .data });
         }
     }
 
+    // ... simd_lookup ...
     inline fn simd_lookup(lut: @Vector(16, u8), indices: @Vector(16, u8)) @Vector(16, u8) {
         if (builtin.cpu.arch == .x86_64 and std.Target.x86.featureSetHas(builtin.cpu.features, .avx2)) {
              return asm (
@@ -63,6 +64,7 @@ pub const Index = struct {
         }
     }
 
+    // ... compute_pq_distance ...
     fn compute_pq_distance(
         lut: *quantizer_mod.DistanceLookupTableUint8,
         objects: []const u8,
@@ -138,18 +140,15 @@ pub const Index = struct {
         };
     }
 
-    pub fn search(self: *Index, query: []const f32, size: usize, epsilon: f32, blob_epsilon: f32) ![]ngt.ObjectDistance {
-        const blobs = try self.quantizer.global_codebook.search(query, size, blob_epsilon);
+    pub fn search(self: *Index, ctx: *context.SearchContext, query: []const f32, size: usize, epsilon: f32, blob_epsilon: f32) ![]ngt.ObjectDistance {
+        const blobs = try self.quantizer.global_codebook.search(ctx, query, size, blob_epsilon);
         defer self.allocator.free(blobs);
 
         var lut = try self.quantizer.createDistanceLookupUint8(query);
         defer lut.deinit();
 
-        var results = std.PriorityQueue(ngt.ObjectDistance, void, ngt.ObjectDistance.compareReverse).init(self.allocator, {});
-        defer results.deinit();
-
-        var dist_buffer = std.ArrayList(f32).init(self.allocator);
-        defer dist_buffer.deinit();
+        // Prepare context for QBG (clears results PQ)
+        ctx.prepare_qbg_search();
 
         for (blobs) |blob_node| {
             const blob_id = blob_node.id;
@@ -158,28 +157,28 @@ pub const Index = struct {
             const blob = self.qbg_repo.nodes[blob_id];
             const n_obj = blob.ids.len;
 
-            // Prefetch the blob's objects
             prefetch_slice(blob.objects);
 
-            if (dist_buffer.capacity < n_obj) {
-            }
-            try dist_buffer.resize(n_obj);
+            // Use reused buffer in context
+            try ctx.dist_buffer.resize(n_obj);
 
-            compute_pq_distance(&lut, blob.objects, n_obj, self.quantizer.division_no, dist_buffer.items);
+            compute_pq_distance(&lut, blob.objects, n_obj, self.quantizer.division_no, ctx.dist_buffer.items);
 
             for (0..n_obj) |k| {
                 const obj_id = blob.ids[k];
-                const dist = dist_buffer.items[k];
-                try results.add(.{ .id = obj_id, .distance = dist });
-                if (results.count() > size) {
-                    _ = results.remove();
+                const dist = ctx.dist_buffer.items[k];
+
+                try ctx.results.add(.{ .id = obj_id, .distance = dist });
+                if (ctx.results.count() > size) {
+                    _ = ctx.results.remove();
                 }
             }
         }
 
-        var final_results = try self.allocator.alloc(ngt.ObjectDistance, results.count());
-        var i: usize = results.count();
-        while (results.removeOrNull()) |item| {
+        // Return results copy
+        var final_results = try self.allocator.alloc(ngt.ObjectDistance, ctx.results.count());
+        var i: usize = ctx.results.count();
+        while (ctx.results.removeOrNull()) |item| {
             i -= 1;
             final_results[i] = item;
         }
