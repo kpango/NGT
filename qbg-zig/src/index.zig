@@ -69,8 +69,9 @@ pub const Index = struct {
             const blk_no = idx / 16;
             const remaining = n_objects - idx;
 
-            var acc0 = @Vector(8, f32){ 0, 0, 0, 0, 0, 0, 0, 0 };
-            var acc1 = @Vector(8, f32){ 0, 0, 0, 0, 0, 0, 0, 0 };
+            // Accumulators in u16 (assuming max distance < 65535, valid for NGTQ u8 accumulation)
+            // 16 objects -> one @Vector(16, u16)
+            var acc_u16 = @Vector(16, u16){ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
 
             for (0..m) |sub| {
                 var lut_vec: @Vector(16, u8) = undefined;
@@ -88,55 +89,52 @@ pub const Index = struct {
                 const low_nibbles = codes_8 & @as(@Vector(8, u8), @splat(0x0F));
                 const high_nibbles = codes_8 >> @as(@Vector(8, u8), @splat(4));
 
-                // Fix shuffle mask to use ~0 for first vector (indices 0-7) and ~0 + 8 for second (indices 8-15)
-                // We want [low[0], high[0], low[1], high[1] ... ]
-                // low is indices 0..7
-                // high is indices 0..7 OF THE SECOND VECTOR, which maps to 8..15 in shuffle mask?
-                // Zig @shuffle(T, a, b, mask): mask index I selects:
-                // if I < len(a): a[I]
-                // else: b[I - len(a)]
-                // length of a is 8.
-                // so index 8 selects b[0].
-                // We want high[0] -> index 8.
-                // We want low[0] -> index 0.
-
+                // Shuffle mask: {0, 8, 1, 9, ...}
+                // low: 0..7
+                // high: 0..7 (mapped to 8..15 in shuffle)
                 const indices = @shuffle(u8, low_nibbles, high_nibbles,
                     @Vector(16, i32){0, 8, 1, 9, 2, 10, 3, 11, 4, 12, 5, 13, 6, 14, 7, 15}
                 );
 
-                const values = simd_lookup(lut_vec, indices);
+                const values_u8 = simd_lookup(lut_vec, indices);
 
-                const scale = lut.scales[sub];
-                const offset = lut.offsets[sub];
-                const v_scale = @as(@Vector(8, f32), @splat(scale));
-                const v_offset = @as(@Vector(8, f32), @splat(offset));
-
-                const vals0 = @shuffle(u8, values, undefined, @Vector(8, i32){0, 1, 2, 3, 4, 5, 6, 7});
-                const vals1 = @shuffle(u8, values, undefined, @Vector(8, i32){8, 9, 10, 11, 12, 13, 14, 15});
-
-                const f0 = convertU8ToF32(vals0);
-                const f1 = convertU8ToF32(vals1);
-
-                acc0 += f0 * v_scale + v_offset;
-                acc1 += f1 * v_scale + v_offset;
+                // Accumulate u8 into u16
+                // Extend u8 to u16
+                const values_u16 = @as(@Vector(16, u16), values_u8); // Zero extension
+                acc_u16 += values_u16;
             }
 
-            acc0 = @sqrt(acc0);
-            acc1 = @sqrt(acc1);
+            // Convert to float, apply single scale and offset
+            // f_dist = acc_u16 * scale + total_offset
+
+            // Split into two halves for f32 (8 elements) conversion
+            const acc0_u16 = @shuffle(u16, acc_u16, undefined, @Vector(8, i32){0, 1, 2, 3, 4, 5, 6, 7});
+            const acc1_u16 = @shuffle(u16, acc_u16, undefined, @Vector(8, i32){8, 9, 10, 11, 12, 13, 14, 15});
+
+            const acc0_f = convertU16ToF32(acc0_u16);
+            const acc1_f = convertU16ToF32(acc1_u16);
+
+            const v_scale = @as(@Vector(8, f32), @splat(lut.scale));
+            const v_total_offset = @as(@Vector(8, f32), @splat(lut.total_offset));
+
+            var res0 = acc0_f * v_scale + v_total_offset;
+            var res1 = acc1_f * v_scale + v_total_offset;
+
+            res0 = @sqrt(res0);
+            res1 = @sqrt(res1);
 
             const store_len = @min(16, remaining);
-
             var res: [16]f32 = undefined;
             const p0: *align(1) @Vector(8, f32) = @ptrCast(&res[0]);
-            p0.* = acc0;
+            p0.* = res0;
             const p1: *align(1) @Vector(8, f32) = @ptrCast(&res[8]);
-            p1.* = acc1;
+            p1.* = res1;
 
             @memcpy(distances[idx..idx+store_len], res[0..store_len]);
         }
     }
 
-    fn convertU8ToF32(v: @Vector(8, u8)) @Vector(8, f32) {
+    fn convertU16ToF32(v: @Vector(8, u16)) @Vector(8, f32) {
         return @Vector(8, f32){
             @floatFromInt(v[0]), @floatFromInt(v[1]), @floatFromInt(v[2]), @floatFromInt(v[3]),
             @floatFromInt(v[4]), @floatFromInt(v[5]), @floatFromInt(v[6]), @floatFromInt(v[7])

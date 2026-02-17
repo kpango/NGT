@@ -7,16 +7,14 @@ pub const NGTQ_BATCH_SIZE = 2;
 
 pub const DistanceLookupTableUint8 = struct {
     lut: [][]u8, // [division_no][padded_n_centroids]
-    scales: []f32, // [division_no]
-    offsets: []f32, // [division_no]
+    scale: f32,
+    offset: f32,
     total_offset: f32,
     allocator: std.mem.Allocator,
 
     pub fn deinit(self: *DistanceLookupTableUint8) void {
         for (self.lut) |l| self.allocator.free(l);
         self.allocator.free(self.lut);
-        self.allocator.free(self.scales);
-        self.allocator.free(self.offsets);
     }
 };
 
@@ -40,13 +38,11 @@ pub const Quantizer = struct {
     }
 
     pub fn load(allocator: std.mem.Allocator, path: []const u8) !Quantizer {
-        // Load global codebook (NGT Index)
         var global_path = try std.fs.path.join(allocator, &[_][]const u8{ path, "global" });
         defer allocator.free(global_path);
 
         const global_codebook = try ngt.Index.load(allocator, global_path);
 
-        // Load local codebooks (NGT Object Repositories)
         var local_repos = std.ArrayList(ngt.ObjectRepository).init(allocator);
         defer local_repos.deinit();
 
@@ -79,7 +75,6 @@ pub const Quantizer = struct {
         const local_codebooks = try local_repos.toOwnedSlice();
         const division_no: u32 = @intCast(local_codebooks.len);
 
-        // Load Rotation "R"
         var rotation: ?[]f32 = null;
         var rotation_path = try std.fs.path.join(allocator, &[_][]const u8{ path, "R" });
         defer allocator.free(rotation_path);
@@ -100,7 +95,6 @@ pub const Quantizer = struct {
             }
             rotation = try floats.toOwnedSlice();
         } else |err| {
-            // Ignore if not found
         }
 
         var dimension: u32 = 0;
@@ -123,16 +117,12 @@ pub const Quantizer = struct {
         };
     }
 
-    // Returns byte size for quantized stream of n objects (4-bit PQ)
     pub fn getUint4StreamSize(self: *Quantizer, n: u64) usize {
         if (n == 0) return 0;
-
         const batch_size = NGTQ_BATCH_SIZE;
         const block_size = NGTQ_SIMD_BLOCK_SIZE;
-
         const m_aligned = ((self.division_no - 1) / batch_size + 1) * batch_size;
         const n_aligned = ((n - 1) / block_size + 1) * block_size;
-
         const stream_size = n_aligned * m_aligned;
         return stream_size / 2;
     }
@@ -149,7 +139,6 @@ pub const Quantizer = struct {
              if (rot.len == dim * dim) {
                  const buf = try self.allocator.alloc(f32, dim);
                  rotated_buf = buf;
-                 // R * q
                  for (0..dim) |r| {
                      var sum: f32 = 0;
                      for (0..dim) |c| {
@@ -202,35 +191,31 @@ pub const Quantizer = struct {
         }
 
         const lut = try self.allocator.alloc([]u8, self.division_no);
-        const scales = try self.allocator.alloc(f32, self.division_no);
-        const offsets = try self.allocator.alloc(f32, self.division_no);
-        var total_offset: f32 = 0;
+        errdefer self.allocator.free(lut);
+
+        // Find Global Min/Max for Total Scale Offset Compression
+        var global_min: f32 = std.math.floatMax(f32);
+        var global_max: f32 = -std.math.floatMax(f32);
+
+        for (0..self.division_no) |d| {
+            for (flut[d]) |val| {
+                if (val < global_min) global_min = val;
+                if (val > global_max and val != std.math.inf(f32)) global_max = val;
+            }
+        }
+        if (global_min == std.math.floatMax(f32)) {
+            global_min = 0;
+            global_max = 0;
+        }
+
+        const offset = global_min;
+        const scale = if (global_max > global_min) (global_max - global_min) / 255.0 else 0.0;
+        const total_offset = offset * @as(f32, @floatFromInt(self.division_no));
 
         for (0..self.division_no) |d| {
             const f_sub_lut = flut[d];
-            var min: f32 = std.math.floatMax(f32);
-            var max: f32 = -std.math.floatMax(f32);
-
-            for (f_sub_lut) |val| {
-                if (val < min) min = val;
-                if (val > max and val != std.math.inf(f32)) max = val;
-            }
-            if (min == std.math.floatMax(f32)) {
-                min = 0;
-                max = 0;
-            }
-
-            const offset = min;
-            const scale = if (max > min) (max - min) / 255.0 else 0.0;
-
-            scales[d] = scale;
-            offsets[d] = offset;
-            total_offset += offset;
-
-            // Pad LUT to at least 16 bytes for SIMD safety
             const lut_size = @max(f_sub_lut.len, 16);
             lut[d] = try self.allocator.alloc(u8, lut_size);
-
             @memset(lut[d], 0);
 
             for (f_sub_lut, 0..) |val, i| {
@@ -249,8 +234,8 @@ pub const Quantizer = struct {
 
         return .{
             .lut = lut,
-            .scales = scales,
-            .offsets = offsets,
+            .scale = scale,
+            .offset = offset,
             .total_offset = total_offset,
             .allocator = self.allocator,
         };
