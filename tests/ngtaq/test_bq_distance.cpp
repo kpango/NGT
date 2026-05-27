@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstring>
 #include <iostream>
+#include <vector>
 
 #include "NGT/NGTAQ/BQDistance.h"
 
@@ -213,6 +214,28 @@ static void testKnownValue() {
 }
 
 // ---------------------------------------------------------------------------
+// Test 7: D=576 (= 9*64) tests the AVX-512 remainder loop (9 words: 8 in SIMD + 1 scalar)
+// ---------------------------------------------------------------------------
+static void testNonMultipleOf8Words() {
+    // D=576 (= 9*64) tests the AVX-512 remainder loop (9 words: 8 in SIMD + 1 scalar)
+    // Use the generic formula as ground truth and compare with bqDistance output.
+    const int words = 9, D = words * 64;
+    std::vector<uint64_t> pA(words, 0xAAAAAAAAAAAAAAAAULL);
+    std::vector<uint64_t> pB(words, 0xFFFFFFFFFFFFFFFFULL);
+    std::vector<uint64_t> qA(words, 0x5555555555555555ULL);
+    std::vector<uint64_t> qB(words, 0xFFFFFFFFFFFFFFFFULL);
+
+    // Ground truth: generic scalar
+    uint64_t expected_count = 0;
+    for (int i = 0; i < words; i++)
+        expected_count += __builtin_popcountll((pA[i] ^ qA[i]) & (pB[i] | qB[i]));
+    float expected = static_cast<float>(expected_count) / D;
+
+    float got = NGTAQ::bqDistance(pA.data(), pB.data(), qA.data(), qB.data(), words, D);
+    EXPECT_NEAR(got, expected, 1e-6f);
+}
+
+// ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 int main() {
@@ -222,6 +245,7 @@ int main() {
   testSymmetry();
   testNormalization();
   testKnownValue();
+  testNonMultipleOf8Words();
 
   if (failures == 0) {
     std::cout << "All tests PASSED\n";

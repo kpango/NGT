@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include <cassert>
 #include <cstdint>
 
 #if defined(NGT_AVX512) || defined(NGT_AVX2)
@@ -27,7 +28,7 @@ namespace NGTAQ {
 // ---------------------------------------------------------------------------
 // AVX-512 path — requires AVX512F + AVX512VPOPCNTDQ
 // ---------------------------------------------------------------------------
-#if defined(NGT_AVX512)
+#if defined(NGT_AVX512) && defined(__AVX512VPOPCNTDQ__)
 
 inline float bqDistance(const uint64_t* __restrict__ pA,
                         const uint64_t* __restrict__ pB,
@@ -35,6 +36,8 @@ inline float bqDistance(const uint64_t* __restrict__ pA,
                         const uint64_t* __restrict__ qB,
                         int words,
                         int D) noexcept {
+  // Requires D > 0 (D == words * 64; caller must ensure non-empty input)
+  assert(D > 0 && "bqDistance: D must be positive");
   __m512i acc = _mm512_setzero_si512();
   int i       = 0;
   // Process 8 words (512 bits) per iteration
@@ -49,10 +52,7 @@ inline float bqDistance(const uint64_t* __restrict__ pA,
     acc         = _mm512_add_epi64(acc, _mm512_popcnt_epi64(msk));
   }
   // Horizontal sum of 8 x 64-bit lanes
-  uint64_t buf[8];
-  _mm512_storeu_si512(reinterpret_cast<__m512i*>(buf), acc);
-  uint64_t total = buf[0] + buf[1] + buf[2] + buf[3] +
-                   buf[4] + buf[5] + buf[6] + buf[7];
+  uint64_t total = static_cast<uint64_t>(_mm512_reduce_add_epi64(acc));
   // Scalar tail
   for (; i < words; ++i) {
     total += static_cast<uint64_t>(__builtin_popcountll((pA[i] ^ qA[i]) & (pB[i] | qB[i])));
@@ -71,6 +71,8 @@ inline float bqDistance(const uint64_t* __restrict__ pA,
                         const uint64_t* __restrict__ qB,
                         int words,
                         int D) noexcept {
+  // Requires D > 0 (D == words * 64; caller must ensure non-empty input)
+  assert(D > 0 && "bqDistance: D must be positive");
   uint64_t total = 0;
   int i          = 0;
   // Process 4 words (256 bits) per iteration
@@ -82,15 +84,11 @@ inline float bqDistance(const uint64_t* __restrict__ pA,
     __m256i xr  = _mm256_xor_si256(va, qa);
     __m256i ors = _mm256_or_si256(vb, qb);
     __m256i msk = _mm256_and_si256(xr, ors);
-    // Extract 4 x 64-bit words and popcount
-    total += static_cast<uint64_t>(__builtin_popcountll(
-        static_cast<uint64_t>(_mm256_extract_epi64(msk, 0))));
-    total += static_cast<uint64_t>(__builtin_popcountll(
-        static_cast<uint64_t>(_mm256_extract_epi64(msk, 1))));
-    total += static_cast<uint64_t>(__builtin_popcountll(
-        static_cast<uint64_t>(_mm256_extract_epi64(msk, 2))));
-    total += static_cast<uint64_t>(__builtin_popcountll(
-        static_cast<uint64_t>(_mm256_extract_epi64(msk, 3))));
+    // Store to memory and popcount 4 x 64-bit words
+    alignas(32) uint64_t tmp[4];
+    _mm256_store_si256(reinterpret_cast<__m256i*>(tmp), msk);
+    total += __builtin_popcountll(tmp[0]) + __builtin_popcountll(tmp[1])
+           + __builtin_popcountll(tmp[2]) + __builtin_popcountll(tmp[3]);
   }
   // Scalar tail
   for (; i < words; ++i) {
@@ -110,6 +108,8 @@ inline float bqDistance(const uint64_t* __restrict__ pA,
                         const uint64_t* __restrict__ qB,
                         int words,
                         int D) noexcept {
+  // Requires D > 0 (D == words * 64; caller must ensure non-empty input)
+  assert(D > 0 && "bqDistance: D must be positive");
   uint64_t total = 0;
   for (int i = 0; i < words; ++i) {
     total += static_cast<uint64_t>(__builtin_popcountll((pA[i] ^ qA[i]) & (pB[i] | qB[i])));
