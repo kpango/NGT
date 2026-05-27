@@ -50,12 +50,27 @@ NGTAQIndex NGTAQIndex::fromNGT(const std::string& ngt_path, const Property& prop
 
     // Load all float vectors (NGT uses 1-based IDs)
     std::vector<std::vector<float>> raw_vecs(N, std::vector<float>(D));
+    std::vector<bool> is_hole(N, false);
     for (size_t i = 1; i <= N; i++) {
         try {
             objspace.getObject(static_cast<NGT::ObjectID>(i), raw_vecs[i - 1]);
         } catch (...) {
             // NGT may have holes (deleted objects); leave slot as zero-initialized.
             raw_vecs[i - 1].assign(D, 0.0f);
+            is_hole[i - 1] = true;
+        }
+    }
+
+    // Pre-normalize for cosine metric so that dot(q_norm, v_norm) == cosine sim.
+    if (prop.metric == NGT::ObjectSpace::DistanceTypeAngle ||
+        prop.metric == NGT::ObjectSpace::DistanceTypeCosine) {
+        for (auto& v : raw_vecs) {
+            float norm_sq = 0.0f;
+            for (float x : v) norm_sq += x * x;
+            if (norm_sq > 0.0f) {
+                float inv_norm = 1.0f / std::sqrt(norm_sq);
+                for (float& x : v) x *= inv_norm;
+            }
         }
     }
 
@@ -77,6 +92,11 @@ NGTAQIndex NGTAQIndex::fromNGT(const std::string& ngt_path, const Property& prop
         graph->addNode(sign_buf.data(), mag_buf.data());
     }
     graph->finalizeCSR();
+
+    // Tombstone ghost nodes (holes in the NGT object repository).
+    for (size_t i = 0; i < N; ++i) {
+        if (is_hole[i]) graph->removeNode(static_cast<uint32_t>(i));
+    }
 
     // Build alpha-CG graph from NGT edges
     AlphaCGPruner pruner(prop.alpha, prop.kappa);
@@ -165,9 +185,16 @@ std::vector<SearchResult> NGTAQIndex::search(
             }
             exact_dist = std::sqrt(sq);
         } else {
-            // Cosine: assume vectors are normalized, dist = 1 - dot
+            // Cosine: raw_vecs_ stores pre-normalized vectors; normalize query too.
+            std::vector<float> qn(query.data(), query.data() + D);
+            float norm_sq = 0.0f;
+            for (float x : qn) norm_sq += x * x;
+            if (norm_sq > 0.0f) {
+                float inv_norm = 1.0f / std::sqrt(norm_sq);
+                for (float& x : qn) x *= inv_norm;
+            }
             float dot = 0.0f;
-            for (int j = 0; j < D; ++j) dot += query[j] * vec[j];
+            for (int j = 0; j < D; ++j) dot += qn[j] * vec[j];
             exact_dist = 1.0f - dot;
         }
         float bq_dist = bqDistance(q_sign.data(), q_mag.data(),
@@ -201,6 +228,16 @@ uint32_t NGTAQIndex::insert(const std::vector<float>& vec) {
     std::unique_lock<std::shared_mutex> lock(graph_->mutex());
     uint32_t new_id = graph_->addNode(sign.data(), mag.data());
     raw_vecs_.push_back(std::vector<float>(vec.begin(), vec.begin() + D));
+    if (prop_.metric == NGT::ObjectSpace::DistanceTypeAngle ||
+        prop_.metric == NGT::ObjectSpace::DistanceTypeCosine) {
+        auto& v = raw_vecs_.back();
+        float norm_sq = 0.0f;
+        for (float x : v) norm_sq += x * x;
+        if (norm_sq > 0.0f) {
+            float inv_norm = 1.0f / std::sqrt(norm_sq);
+            for (float& x : v) x *= inv_norm;
+        }
+    }
 
     if (graph_->size() > 1) {
         // finalizeCSR() to create the slot for new_id before routing/setNeighbors
@@ -229,8 +266,7 @@ uint32_t NGTAQIndex::insert(const std::vector<float>& vec) {
                 graph_->getSignPlane(u), graph_->getMagPlane(u),
                 words, D);
         };
-        AlphaCGPruner pruner(prop_.alpha, prop_.kappa);
-        auto pruned = pruner.prune(candidates, bq_.tau(), dist_fn);
+        auto pruned = pruner_.prune(candidates, bq_.tau(), dist_fn);
         graph_->setNeighbors(new_id, pruned);
     } else {
         // Only one node: just finalize
@@ -337,6 +373,9 @@ NGTAQIndex NGTAQIndex::load(const std::string& path) {
     // 1. Property
     Property prop;
     is.read(reinterpret_cast<char*>(&prop), sizeof(prop));
+    if (!is) throw std::runtime_error("NGTAQIndex::load: failed to read property from " + path);
+    if (prop.dimension <= 0 || prop.dimension > 65536)
+        throw std::runtime_error("NGTAQIndex::load: invalid dimension in file");
 
     // 2. BinaryQuantizer
     BinaryQuantizer bq;
@@ -349,6 +388,8 @@ NGTAQIndex NGTAQIndex::load(const std::string& path) {
     // 4. Entry points
     uint32_t n_ep = 0;
     is.read(reinterpret_cast<char*>(&n_ep), sizeof(n_ep));
+    if (!is) throw std::runtime_error("NGTAQIndex::load: failed to read entry point count");
+    if (n_ep > 65536) throw std::runtime_error("NGTAQIndex::load: n_ep too large, file may be corrupt");
     std::vector<uint32_t> entry_points(n_ep);
     if (n_ep > 0)
         is.read(reinterpret_cast<char*>(entry_points.data()), n_ep * sizeof(uint32_t));
@@ -356,6 +397,8 @@ NGTAQIndex NGTAQIndex::load(const std::string& path) {
     // 5. Raw vecs
     uint64_t n_vecs = 0;
     is.read(reinterpret_cast<char*>(&n_vecs), sizeof(n_vecs));
+    if (!is) throw std::runtime_error("NGTAQIndex::load: failed to read vec count");
+    if (n_vecs > 100000000ULL) throw std::runtime_error("NGTAQIndex::load: vec count too large");
     std::vector<std::vector<float>> raw_vecs(n_vecs);
     for (uint64_t i = 0; i < n_vecs; ++i) {
         uint64_t dim = 0;
@@ -397,7 +440,9 @@ std::vector<uint32_t> NGTAQIndex::selectEntryPoints(
     if (selected.empty()) return {};
 
     while (static_cast<int>(selected.size()) < n) {
-        const int cand_size = std::min(200, static_cast<int>(graph.size()));
+        // Use activeCount so we don't waste all samples on tombstones.
+        const int cand_size = std::min(200, static_cast<int>(graph.activeCount()));
+        if (cand_size == 0) break;
         float best_min_dist = -1.0f;
         uint32_t best_id = selected[0];
 

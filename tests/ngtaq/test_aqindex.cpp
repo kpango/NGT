@@ -199,6 +199,23 @@ void testFromNGTAndSearch() {
     std::cout << "recall@" << k << " = " << recall << " (min 0.90) ";
     EXPECT_GE(recall, 0.90f);
 
+    // Sub-test: verify DABS pruning path with default k_prime_factor=2.0f.
+    // With aggressive pruning, recall is lower; just verify it returns k results
+    // and doesn't crash.
+    {
+        NGTAQ::NGTAQIndex::Property p2;
+        p2.dimension = D;
+        p2.n_tau_samples = 200;
+        p2.k_prime_factor = 2.0f;  // realistic default
+        p2.gamma_enq = 0.15f;
+        p2.gamma_term = 0.35f;
+        auto aq_default = NGTAQ::NGTAQIndex::fromNGT(idx_path, p2);
+        auto res2 = aq_default.search(queries[0], k);
+        // With default k_prime_factor=2, routing prunes aggressively.
+        // Verify it returns results (may be < k for small N) and doesn't crash.
+        EXPECT_TRUE(!res2.empty());
+    }
+
     // Test save/load round-trip (use first 3 queries for speed)
     std::string save_path = "/tmp/aqindex_test.bin";
     aq.save(save_path);

@@ -48,10 +48,18 @@ public:
 
     size_t size() const;
 
+    // Thread safety: must be called without concurrent insert()/remove()/rebuild().
     void save(const std::string& path) const;
     static NGTAQIndex load(const std::string& path);
 
 private:
+    // Concurrency model:
+    //   graph_->mutex() (std::shared_mutex) protects: graph_, raw_vecs_, entry_points_
+    //   Shared lock: search(), size()
+    //   Unique lock: insert(), remove(), rebuild()
+    //   No lock: save() — caller must ensure no concurrent mutations
+    //
+    // prop_, bq_, pruner_, searcher_ are effectively immutable after construction.
     Property                        prop_;
     BinaryQuantizer                 bq_;
     std::unique_ptr<SoAGraph>       graph_;       // unique_ptr because SoAGraph is non-movable
