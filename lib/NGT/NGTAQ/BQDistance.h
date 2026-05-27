@@ -62,8 +62,9 @@ inline float bqDistance(const uint64_t* __restrict__ pA,
 
 // ---------------------------------------------------------------------------
 // AVX2 path — 256-bit XOR/OR/AND, then scalar popcount per 64-bit word
+// Also used on AVX-512 machines that lack VPOPCNTDQ (e.g. Skylake-X, Cascade Lake).
 // ---------------------------------------------------------------------------
-#elif defined(NGT_AVX2)
+#elif defined(NGT_AVX512) || defined(NGT_AVX2)
 
 inline float bqDistance(const uint64_t* __restrict__ pA,
                         const uint64_t* __restrict__ pB,
@@ -84,7 +85,7 @@ inline float bqDistance(const uint64_t* __restrict__ pA,
     __m256i xr  = _mm256_xor_si256(va, qa);
     __m256i ors = _mm256_or_si256(vb, qb);
     __m256i msk = _mm256_and_si256(xr, ors);
-    // Store to memory and popcount 4 x 64-bit words
+    // Use store+popcount rather than _mm256_extract_epi64 (x86_64-only, warns on 32-bit).
     alignas(32) uint64_t tmp[4];
     _mm256_store_si256(reinterpret_cast<__m256i*>(tmp), msk);
     total += __builtin_popcountll(tmp[0]) + __builtin_popcountll(tmp[1])
