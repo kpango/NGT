@@ -55,7 +55,7 @@ void testRouteReturnsKResults() {
 
     // Should return at least k candidates for refinement (k' = 2k)
     EXPECT_TRUE(candidates.size() >= static_cast<size_t>(k));
-    EXPECT_TRUE(candidates.size() <= static_cast<size_t>(N));
+    EXPECT_TRUE(candidates.size() <= static_cast<size_t>(std::min(k * 2, N)));
 
     // All returned IDs must be valid
     for (uint32_t id : candidates) {
@@ -80,7 +80,7 @@ void testRouteNoDuplicates() {
 }
 
 void testColdStartExploresAll() {
-    // With γ_term = very large, should not terminate early → explore all nodes
+    // With γ gates very large, no early termination → all N nodes collected.
     const int D = 64, N = 5, k = 3;
     auto gp = buildFullyConnectedBQGraph(N, D);
 
@@ -91,8 +91,17 @@ void testColdStartExploresAll() {
     std::vector<uint64_t> qs(1, 0), qm(1, 0xFFFFFFFFFFFFFFFFULL);
     auto cands = searcher.route(qs.data(), qm.data(), k, *gp, {0});
 
-    // Should return min(k', N) = min(2*k, N) = min(6, 5) = 5 candidates
-    EXPECT_EQ(cands.size(), static_cast<size_t>(std::min(k * 2, N)));
+    // k' = min(2k, N) = 5; verify count
+    const size_t expected = static_cast<size_t>(std::min(k * 2, N));
+    EXPECT_EQ(cands.size(), expected);
+
+    // Verify all N node IDs are present (cold start = full exploration)
+    std::vector<uint32_t> sorted_cands = cands;
+    std::sort(sorted_cands.begin(), sorted_cands.end());
+    for (int i = 0; i < N; ++i) {
+        EXPECT_TRUE(std::binary_search(sorted_cands.begin(), sorted_cands.end(),
+                                       static_cast<uint32_t>(i)));
+    }
 }
 
 int main() {

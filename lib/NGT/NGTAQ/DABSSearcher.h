@@ -51,6 +51,8 @@ public:
         const std::vector<uint32_t>& entry_points) const
     {
         const int k_prime = static_cast<int>(k * k_prime_factor);
+        if (k <= 0) return {};
+        if (k_prime <= 0) return {};
         const int words   = graph.words();
         const int D       = words * 64;
 
@@ -59,7 +61,10 @@ public:
         std::priority_queue<Entry, std::vector<Entry>, std::greater<Entry>> cand_q;
         // Max-heap of size k_prime: farthest on top, used for result collection
         std::priority_queue<Entry> result_q;
+        // NOTE: route() is not thread-safe against concurrent modifications to `graph`.
+        // Callers must hold at least a shared lock on graph.mutex() for the duration.
         std::unordered_set<uint32_t> visited;
+        visited.reserve(entry_points.size() * 16);  // reduce rehash for typical fan-out
 
         // d_k: k-th best BQ distance seen so far; gates don't fire until k results found
         float d_k = std::numeric_limits<float>::infinity();
@@ -82,24 +87,26 @@ public:
             cand_q.pop();
 
             // Termination gate: only after k results accumulated
-            if (static_cast<int>(result_q.size()) >= k &&
+            if (result_q.size() >= static_cast<size_t>(k) &&
                 dist_qx > (1.0f + gamma_term) * d_k) {
                 break;
             }
 
             // Update result heap
-            if (static_cast<int>(result_q.size()) < k_prime) {
+            if (result_q.size() < static_cast<size_t>(k_prime)) {
                 result_q.push({dist_qx, x});
                 // When we first accumulate k results, pin d_k to the k-th best
                 // (max-heap top = k-th worst = k-th best when size == k)
-                if (static_cast<int>(result_q.size()) == k) {
+                if (result_q.size() == static_cast<size_t>(k)) {
                     d_k = result_q.top().first;
                 }
             } else if (dist_qx < result_q.top().first) {
                 result_q.pop();
                 result_q.push({dist_qx, x});
-                // After k_prime results, top = k_prime-th worst >= k-th worst.
-                // Conservative: gates may fire slightly later, but correctness maintained.
+                // Keep d_k fresh: after displacement, the heap top is the new worst of
+                // k_prime candidates, which is still >= the true k-th best.
+                // Updating here prevents stale-d_k from over-tightening the gates.
+                d_k = result_q.top().first;
             }
 
             // Explore neighbors
@@ -107,19 +114,21 @@ public:
             for (uint32_t u : neighbors) {
                 if (graph.isTombstone(u)) continue;
                 if (visited.count(u)) continue;
-                visited.insert(u);
 
                 float d_qu = bqDistance(
                     query_sign, query_mag,
                     graph.getSignPlane(u), graph.getMagPlane(u),
                     words, D);
 
-                // Enqueue gate: skip if clearly too far (only after k results)
-                if (static_cast<int>(result_q.size()) >= k &&
+                // Enqueue gate: skip if clearly too far (only after k results).
+                // Check BEFORE inserting into visited so that if d_k tightens later
+                // via a different path, the node is not permanently excluded.
+                if (result_q.size() >= static_cast<size_t>(k) &&
                     d_qu > (1.0f + gamma_enq) * d_k) {
                     continue;
                 }
 
+                visited.insert(u);
                 cand_q.push({d_qu, u});
             }
         }
