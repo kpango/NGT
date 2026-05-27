@@ -85,7 +85,7 @@ void testTauCalibration() {
     std::vector<const float*> ptrs;
     for (auto& v : vecs) ptrs.push_back(v.data());
 
-    bq.calibrateTau(ptrs, 500, D, NGT::ObjectSpace::DistanceTypeInnerProduct);
+    bq.calibrateTau(ptrs, 500, NGT::ObjectSpace::DistanceTypeInnerProduct);
 
     EXPECT_TRUE(bq.tau() > 0.0f);
     EXPECT_TRUE(bq.tau() < 0.5f);

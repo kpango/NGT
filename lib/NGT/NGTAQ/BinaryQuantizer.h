@@ -87,9 +87,8 @@ class BinaryQuantizer {
   void calibrateTau(
       const std::vector<const float*>& vecs,
       int n_sample_pairs,
-      int D,
       NGT::ObjectSpace::DistanceType metric) {
-    assert(static_cast<int>(vecs.size()) >= 2);
+    if (static_cast<int>(vecs.size()) < 2 || n_sample_pairs <= 0) return;
     n_sample_pairs = std::min(
         n_sample_pairs,
         static_cast<int>(vecs.size()) * (static_cast<int>(vecs.size()) - 1) / 2);
@@ -99,15 +98,15 @@ class BinaryQuantizer {
 
     // --- Estimate sigma from sample of rotated components ---
     thread_local std::vector<float> rotated_buf;
-    rotated_buf.resize(D);
+    rotated_buf.resize(dim_);
 
     int n_vecs_sample = std::min(1000, static_cast<int>(vecs.size()));
     std::vector<float> all_abs_components;
-    all_abs_components.reserve(static_cast<size_t>(n_vecs_sample) * D);
+    all_abs_components.reserve(static_cast<size_t>(n_vecs_sample) * dim_);
     for (int s = 0; s < n_vecs_sample; s++) {
       int idx = pick(rng);
       applyNormalizeAndRotate(vecs[idx], rotated_buf.data());
-      for (int i = 0; i < D; i++)
+      for (int i = 0; i < dim_; i++)
         all_abs_components.push_back(std::abs(rotated_buf[i]));
     }
     float sum_abs = 0.0f;
@@ -117,7 +116,6 @@ class BinaryQuantizer {
              / std::sqrt(2.0f / static_cast<float>(M_PI));
 
     // --- Collect |δ_BQ - δ_true| with probe tau=0.5 ---
-    float saved_tau = tau_;
     tau_ = 0.5f;
 
     std::vector<float> errors;
@@ -135,13 +133,11 @@ class BinaryQuantizer {
       encode(vecs[j], signQ.data(), magQ.data());
 
       float delta_bq   = bqDistance(
-          signP.data(), magP.data(), signQ.data(), magQ.data(), words_, D);
-      float delta_true = computeNormalizedDistance(vecs[i], vecs[j], D, metric);
+          signP.data(), magP.data(), signQ.data(), magQ.data(), words_, dim_);
+      float delta_true = computeNormalizedDistance(vecs[i], vecs[j], dim_, metric);
 
       errors.push_back(std::abs(delta_bq - delta_true));
     }
-
-    tau_ = saved_tau;
 
     // tau = 99th percentile of error distribution
     std::sort(errors.begin(), errors.end());
@@ -170,9 +166,7 @@ class BinaryQuantizer {
     rotation_.resize(rot_size);
     if (rot_size > 0)
       is.read(reinterpret_cast<char*>(rotation_.data()), rot_size * sizeof(float));
-    rotation_dim_ = (rot_size > 0)
-        ? static_cast<int>(std::sqrt(static_cast<float>(rot_size)))
-        : 0;
+    rotation_dim_ = dim_;
   }
 
  private:
@@ -184,6 +178,7 @@ class BinaryQuantizer {
   std::vector<float> rotation_;  // Row-major rotation matrix [dim_ × dim_]
 
   void applyNormalizeAndRotate(const float* raw, float* out_rotated) const {
+    assert(!rotation_.empty() && "rotation not initialized; call setRotation or setIdentityRotation first");
     thread_local std::vector<float> normalized;
     normalized.resize(dim_);
     float norm = 0.0f;
