@@ -4,7 +4,6 @@
 #include "NGT/Graph.h"
 
 #include <algorithm>
-#include <cassert>
 #include <cmath>
 #include <limits>
 #include <mutex>
@@ -52,7 +51,12 @@ NGTAQIndex NGTAQIndex::fromNGT(const std::string& ngt_path, const Property& prop
     // Load all float vectors (NGT uses 1-based IDs)
     std::vector<std::vector<float>> raw_vecs(N, std::vector<float>(D));
     for (size_t i = 1; i <= N; i++) {
-        objspace.getObject(static_cast<NGT::ObjectID>(i), raw_vecs[i - 1]);
+        try {
+            objspace.getObject(static_cast<NGT::ObjectID>(i), raw_vecs[i - 1]);
+        } catch (...) {
+            // NGT may have holes (deleted objects); leave slot as zero-initialized.
+            raw_vecs[i - 1].assign(D, 0.0f);
+        }
     }
 
     // Init BQ with identity rotation
@@ -129,7 +133,8 @@ NGTAQIndex NGTAQIndex::fromNGT(const std::string& ngt_path, const Property& prop
 std::vector<SearchResult> NGTAQIndex::search(
     const std::vector<float>& query, int k) const
 {
-    assert(static_cast<int>(query.size()) >= prop_.dimension);
+    if (static_cast<int>(query.size()) < prop_.dimension)
+        throw std::invalid_argument("NGTAQIndex::search: query dimension mismatch");
     const int D = prop_.dimension;
     const int words = D / 64;
 
@@ -137,15 +142,15 @@ std::vector<SearchResult> NGTAQIndex::search(
     std::vector<uint64_t> q_sign(words), q_mag(words);
     bq_.encode(query.data(), q_sign.data(), q_mag.data());
 
-    // Route in BQ space
-    std::vector<uint32_t> cand_ids;
-    {
-        std::shared_lock<std::shared_mutex> lock(graph_->mutex());
-        cand_ids = searcher_.route(q_sign.data(), q_mag.data(),
-                                   k, *graph_, entry_points_);
-    }
+    // Acquire shared lock once, covering both routing and refinement.
+    // insert() holds unique_lock when pushing to raw_vecs_, so shared_lock
+    // here prevents concurrent raw_vecs_ modification during refinement.
+    std::shared_lock<std::shared_mutex> lock(graph_->mutex());
 
-    // Refine with exact distances
+    auto cand_ids = searcher_.route(q_sign.data(), q_mag.data(),
+                                    k, *graph_, entry_points_);
+
+    // Refine with exact distances (raw_vecs_ is protected by the shared_lock above)
     std::vector<SearchResult> results;
     results.reserve(cand_ids.size());
     for (uint32_t id : cand_ids) {
@@ -185,7 +190,8 @@ std::vector<SearchResult> NGTAQIndex::search(
 // insert
 // ---------------------------------------------------------------------------
 uint32_t NGTAQIndex::insert(const std::vector<float>& vec) {
-    assert(static_cast<int>(vec.size()) >= prop_.dimension);
+    if (static_cast<int>(vec.size()) < prop_.dimension)
+        throw std::invalid_argument("NGTAQIndex::insert: vector dimension mismatch");
     const int D = prop_.dimension;
     const int words = D / 64;
 
@@ -247,26 +253,33 @@ void NGTAQIndex::remove(uint32_t id) {
 void NGTAQIndex::rebuild() {
     std::unique_lock<std::shared_mutex> lock(graph_->mutex());
 
-    // Build old_to_new mapping before rebuild() shuffles IDs
+    // Compute old_to_new mapping from current tombstone state.
+    // SoAGraph::rebuild() applies the same logic internally.
+    // By holding the unique_lock throughout, both scans see identical state.
     const size_t N = graph_->size();
-    std::vector<uint32_t> old_to_new(N, UINT32_MAX);
-    uint32_t new_id = 0;
+    std::vector<uint32_t> old_to_new(N, static_cast<uint32_t>(-1));
+    uint32_t next_id = 0;
     for (uint32_t i = 0; i < static_cast<uint32_t>(N); ++i) {
-        if (!graph_->isTombstone(i)) old_to_new[i] = new_id++;
+        if (!graph_->isTombstone(i)) old_to_new[i] = next_id++;
     }
 
-    graph_->rebuild();
-
-    // Compact raw_vecs_ to match new IDs
-    std::vector<std::vector<float>> new_raw_vecs(new_id);
+    // Reorder raw_vecs_ to match the post-rebuild node ordering.
+    std::vector<std::vector<float>> new_vecs(next_id);
     for (uint32_t i = 0; i < static_cast<uint32_t>(N); ++i) {
-        if (old_to_new[i] != UINT32_MAX && i < static_cast<uint32_t>(raw_vecs_.size())) {
-            new_raw_vecs[old_to_new[i]] = std::move(raw_vecs_[i]);
+        if (old_to_new[i] != static_cast<uint32_t>(-1)) {
+            if (i < static_cast<uint32_t>(raw_vecs_.size())) {
+                new_vecs[old_to_new[i]] = std::move(raw_vecs_[i]);
+            }
         }
     }
-    raw_vecs_ = std::move(new_raw_vecs);
+    raw_vecs_ = std::move(new_vecs);
 
-    // Re-select entry points
+    // SoAGraph::rebuild() compacts active nodes using the same isTombstone
+    // scan; since we hold the unique_lock, no concurrent modifications can
+    // cause the two mappings to diverge.
+    graph_->rebuild();
+
+    // Re-select entry points after compaction.
     int n_ep = std::min(prop_.n_entry_points, static_cast<int>(graph_->size()));
     entry_points_ = selectEntryPoints(*graph_, n_ep);
 }
@@ -310,6 +323,8 @@ void NGTAQIndex::save(const std::string& path) const {
         if (dim > 0)
             os.write(reinterpret_cast<const char*>(v.data()), dim * sizeof(float));
     }
+    os.flush();
+    if (!os) throw std::runtime_error("NGTAQIndex::save: write error on " + path);
 }
 
 // ---------------------------------------------------------------------------

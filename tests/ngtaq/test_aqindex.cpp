@@ -250,7 +250,7 @@ void testInsertAndRemove() {
     auto extra_vecs = randomGaussianVectors(1, D, 999);
     const std::vector<float>& new_vec = extra_vecs[0];
     uint32_t new_id = aq.insert(new_vec);
-    EXPECT_GE(aq.size(), initial_size + 1);
+    EXPECT_EQ(aq.size(), initial_size + 1);
 
     // Search for the new vector. It may or may not appear in results since
     // reverse edges are not updated on insert (only forward edges from new_id).
