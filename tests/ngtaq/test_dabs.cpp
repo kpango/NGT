@@ -80,27 +80,56 @@ void testRouteNoDuplicates() {
 }
 
 void testColdStartExploresAll() {
-    // With γ gates very large, no early termination → all N nodes collected.
-    const int D = 64, N = 5, k = 3;
-    auto gp = buildFullyConnectedBQGraph(N, D);
+    // Sub-test A: N <= k_prime → all N nodes should appear in results.
+    // With gamma gates very large, no early termination → result_q fills to min(k_prime, N)=N.
+    {
+        const int D = 64, N = 5, k = 3;
+        // N=5, k_prime=6 → min(6,5)=5=N, so all N nodes fit in result_q.
+        static_assert(N <= k * 2, "sub-test A requires N <= k_prime");
+        auto gp = buildFullyConnectedBQGraph(N, D);
 
-    NGTAQ::DABSSearcher searcher;
-    searcher.gamma_enq  = 1000.0f; // no enqueue gate
-    searcher.gamma_term = 1000.0f; // no termination gate
+        NGTAQ::DABSSearcher searcher;
+        searcher.gamma_enq  = 1000.0f;
+        searcher.gamma_term = 1000.0f;
 
-    std::vector<uint64_t> qs(1, 0), qm(1, 0xFFFFFFFFFFFFFFFFULL);
-    auto cands = searcher.route(qs.data(), qm.data(), k, *gp, {0});
+        std::vector<uint64_t> qs(1, 0), qm(1, 0xFFFFFFFFFFFFFFFFULL);
+        auto cands = searcher.route(qs.data(), qm.data(), k, *gp, {0});
 
-    // k' = min(2k, N) = 5; verify count
-    const size_t expected = static_cast<size_t>(std::min(k * 2, N));
-    EXPECT_EQ(cands.size(), expected);
+        // All N=5 nodes fit in k_prime=6 slots; verify count and membership.
+        EXPECT_EQ(cands.size(), static_cast<size_t>(N));
+        std::vector<uint32_t> sorted_cands = cands;
+        std::sort(sorted_cands.begin(), sorted_cands.end());
+        for (int i = 0; i < N; ++i) {
+            EXPECT_TRUE(std::binary_search(sorted_cands.begin(), sorted_cands.end(),
+                                           static_cast<uint32_t>(i)));
+        }
+    }
 
-    // Verify all N node IDs are present (cold start = full exploration)
-    std::vector<uint32_t> sorted_cands = cands;
-    std::sort(sorted_cands.begin(), sorted_cands.end());
-    for (int i = 0; i < N; ++i) {
-        EXPECT_TRUE(std::binary_search(sorted_cands.begin(), sorted_cands.end(),
-                                       static_cast<uint32_t>(i)));
+    // Sub-test B: N > k_prime → result_q is capped at k_prime, not all N nodes returned.
+    // Verify exactly k_prime distinct IDs are returned and no duplicates.
+    {
+        const int D = 64, N = 20, k = 4;  // k_prime = 8 < 20
+        auto gp = buildFullyConnectedBQGraph(N, D);
+
+        NGTAQ::DABSSearcher searcher;
+        searcher.gamma_enq  = 1000.0f;
+        searcher.gamma_term = 1000.0f;
+
+        std::vector<uint64_t> qs(1, 0), qm(1, 0xFFFFFFFFFFFFFFFFULL);
+        auto cands = searcher.route(qs.data(), qm.data(), k, *gp, {0});
+
+        // k_prime = 8, N = 20 → exactly k_prime results (cap applies)
+        const int k_prime = k * 2;
+        EXPECT_EQ(cands.size(), static_cast<size_t>(std::min(k_prime, N)));
+
+        // No duplicates
+        std::vector<uint32_t> sorted_cands = cands;
+        std::sort(sorted_cands.begin(), sorted_cands.end());
+        auto uniq_end = std::unique(sorted_cands.begin(), sorted_cands.end());
+        EXPECT_TRUE(uniq_end == sorted_cands.end());
+
+        // All IDs valid
+        for (uint32_t id : cands) EXPECT_TRUE(id < static_cast<uint32_t>(N));
     }
 }
 

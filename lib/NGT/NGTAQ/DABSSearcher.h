@@ -43,6 +43,10 @@ public:
 
     // BQ-only routing. Returns up to k' = k*k_prime_factor candidate IDs sorted
     // by BQ distance ascending.
+    //
+    // Thread safety: NOT safe against concurrent modifications to `graph`.
+    // Callers must hold at least a shared lock on graph.mutex() for the duration
+    // of this call.
     std::vector<uint32_t> route(
         const uint64_t* query_sign,
         const uint64_t* query_mag,
@@ -61,8 +65,6 @@ public:
         std::priority_queue<Entry, std::vector<Entry>, std::greater<Entry>> cand_q;
         // Max-heap of size k_prime: farthest on top, used for result collection
         std::priority_queue<Entry> result_q;
-        // NOTE: route() is not thread-safe against concurrent modifications to `graph`.
-        // Callers must hold at least a shared lock on graph.mutex() for the duration.
         std::unordered_set<uint32_t> visited;
         visited.reserve(entry_points.size() * 16);  // reduce rehash for typical fan-out
 
@@ -95,9 +97,9 @@ public:
             // Update result heap
             if (result_q.size() < static_cast<size_t>(k_prime)) {
                 result_q.push({dist_qx, x});
-                // When we first accumulate k results, pin d_k to the k-th best
-                // (max-heap top = k-th worst = k-th best when size == k)
-                if (result_q.size() == static_cast<size_t>(k)) {
+                // Update d_k whenever heap has k or more results so that
+                // the gates use the current k-th best (not just the first time).
+                if (result_q.size() >= static_cast<size_t>(k)) {
                     d_k = result_q.top().first;
                 }
             } else if (dist_qx < result_q.top().first) {
