@@ -10,8 +10,10 @@
 #include "NGT/NGTAQ/AQIndex.h"
 #include <chrono>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -38,7 +40,14 @@ int main(int argc, char** argv) {
     }
     const std::string ngt_path  = argv[1];
     const std::string query_path = argv[2];
-    const int k = (argc > 3) ? std::stoi(argv[3]) : 10;
+    int k = 10;
+    if (argc > 3) {
+        try { k = std::stoi(argv[3]); }
+        catch (const std::exception& e) {
+            std::cerr << "Invalid k argument '" << argv[3] << "': " << e.what() << "\n";
+            return 1;
+        }
+    }
 
     auto queries = loadTSV(query_path);
     if (queries.empty()) { std::cerr << "No queries loaded from: " << query_path << "\n"; return 1; }
@@ -63,11 +72,10 @@ int main(int argc, char** argv) {
 
         auto aq = NGTAQ::NGTAQIndex::fromNGT(ngt_path, prop);
 
-        std::cout << "  Searching " << queries.size() << " queries x "
-                  << (queries.size() >= 3 ? 3 : 1) << " warmup runs...\n";
-
-        // Warmup (first 3 queries, not timed)
-        for (size_t i = 0; i < std::min(queries.size(), size_t(3)); ++i) {
+        // Warmup: first 3 queries, not timed (warms instruction cache + BQ encoder)
+        const size_t warmup_n = std::min(queries.size(), size_t(3));
+        std::cout << "  Warming up with " << warmup_n << " queries (untimed)...\n";
+        for (size_t i = 0; i < warmup_n; ++i) {
             aq.search(queries[i], k);
         }
 
@@ -84,10 +92,11 @@ int main(int argc, char** argv) {
             std::chrono::duration<double, std::milli>(t1 - t0).count();
         const double qps = (static_cast<double>(queries.size()) / elapsed_ms) * 1000.0;
 
-        std::cout << "  gamma_term=" << gamma_term
-                  << "  QPS=" << static_cast<int>(qps)
+        std::cout << std::fixed << std::setprecision(1)
+                  << "  gamma_term=" << gamma_term
+                  << "  QPS=" << qps
                   << "  avg_results=" << (static_cast<double>(total_results) / queries.size())
-                  << "  elapsed_ms=" << static_cast<int>(elapsed_ms)
+                  << "  elapsed_ms=" << elapsed_ms
                   << "\n";
     }
 
