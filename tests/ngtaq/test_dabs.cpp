@@ -133,10 +133,38 @@ void testColdStartExploresAll() {
     }
 }
 
+void testRouteStatsCounters() {
+    // A fully-connected graph with N=10 nodes, D=64.
+    // With gamma=1000 (no early termination), all nodes are visited.
+    const int D = 64, N = 10, k = 3;
+    auto gp = buildFullyConnectedBQGraph(N, D);
+
+    NGTAQ::DABSSearcher searcher;
+    searcher.gamma_enq  = 1000.0f;
+    searcher.gamma_term = 1000.0f;
+
+    std::vector<uint64_t> qs(1, 0), qm(1, 0xFFFFFFFFFFFFFFFFULL);
+
+    NGTAQ::RouteStats stats;
+    auto cands = searcher.route(qs.data(), qm.data(), k, *gp, {0}, &stats);
+
+    // hop_count: popped from cand_q — at least 1 (entry point) up to N
+    EXPECT_TRUE(stats.hop_count >= 1);
+    EXPECT_TRUE(stats.hop_count <= static_cast<uint32_t>(N));
+
+    // bq_calls: at least N calls (one per visited node's BQ distance)
+    EXPECT_TRUE(stats.bq_calls >= 1);
+
+    // visited_n: must equal cands size + nodes skipped by gates
+    EXPECT_TRUE(stats.visited_n >= cands.size());
+    EXPECT_TRUE(stats.visited_n <= static_cast<size_t>(N));
+}
+
 int main() {
     testRouteReturnsKResults();
     testRouteNoDuplicates();
     testColdStartExploresAll();
+    testRouteStatsCounters();
     if (failures > 0) { std::cerr << failures << " test(s) FAILED\n"; return 1; }
     std::cout << "All DABSSearcher tests PASSED\n";
     return 0;

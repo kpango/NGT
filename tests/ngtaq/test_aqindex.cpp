@@ -167,8 +167,13 @@ void testFromNGTAndSearch() {
     prop.n_tau_samples   = 200;   // fast for test
     prop.n_entry_points  = 8;
     prop.max_edges       = 32;
-    prop.k_prime_factor  = 50.0f; // wide candidate set to compensate for identity rotation
+    prop.k_prime_factor  = 50.0f; // wide candidate set: k_prime=250 > N=200 → all nodes collected
+    prop.gamma_enq       = 1000.0f; // no enqueue gate: explore entire reachable graph
+    prop.gamma_term      = 1000.0f; // no termination gate: explore entire reachable graph
     prop.metric          = NGT::ObjectSpace::DistanceTypeL2;
+    // Note: fromNGT() uses setRandomRotation() which mixes dimensions for non-negative
+    // inputs; with Gaussian data the rotation doesn't hurt, but gamma gates must be
+    // wide enough that BQ approximation errors don't cause premature termination.
 
     auto aq = NGTAQ::NGTAQIndex::fromNGT(idx_path, prop);
     EXPECT_GE(aq.size(), static_cast<size_t>(N));

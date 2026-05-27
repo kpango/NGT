@@ -35,6 +35,14 @@ struct SearchResult {
     float    bq_distance;  // BQ routing distance
 };
 
+// Optional output statistics for a single route() call.
+// Pass a non-null pointer to collect; nullptr (default) has no overhead.
+struct RouteStats {
+    uint32_t hop_count = 0;   // nodes popped from cand_q and expanded
+    uint32_t bq_calls  = 0;   // total bqDistance() invocations (seeds + neighbors)
+    uint32_t visited_n = 0;   // nodes inserted into visited set
+};
+
 class DABSSearcher {
 public:
     float gamma_enq      = 0.15f;  // enqueue gate
@@ -52,7 +60,8 @@ public:
         const uint64_t* query_mag,
         int k,
         const SoAGraph& graph,
-        const std::vector<uint32_t>& entry_points) const
+        const std::vector<uint32_t>& entry_points,
+        RouteStats* stats = nullptr) const
     {
         const int k_prime = static_cast<int>(k * k_prime_factor);
         if (k <= 0) return {};
@@ -97,6 +106,7 @@ public:
                 query_sign, query_mag,
                 graph.getSignPlane(ep), graph.getMagPlane(ep),
                 words, D);
+            if (stats) ++stats->bq_calls;
             cand_q.push({d, ep});
             visited.insert(ep);
         }
@@ -104,6 +114,7 @@ public:
         while (!cand_q.empty()) {
             auto [dist_qx, x] = cand_q.top();
             cand_q.pop();
+            if (stats) ++stats->hop_count;
 
             // Termination gate: only after k results accumulated
             if (dk_tracker.size() >= static_cast<size_t>(k) &&
@@ -135,6 +146,7 @@ public:
                     query_sign, query_mag,
                     graph.getSignPlane(u), graph.getMagPlane(u),
                     words, D);
+                if (stats) ++stats->bq_calls;
 
                 // Enqueue gate: skip if clearly too far (only after k results found).
                 if (dk_tracker.size() >= static_cast<size_t>(k) &&
@@ -154,6 +166,8 @@ public:
             result_q.pop();
         }
         std::sort(rv.begin(), rv.end());  // ascending by distance
+
+        if (stats) stats->visited_n = static_cast<uint32_t>(visited.size());
 
         std::vector<uint32_t> ids;
         ids.reserve(rv.size());
