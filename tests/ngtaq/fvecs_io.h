@@ -23,7 +23,8 @@ inline std::vector<std::vector<float>> loadFvecs(const std::string& path) {
         if (dim <= 0 || dim > 65536)
             throw std::runtime_error("loadFvecs: implausible dim=" + std::to_string(dim));
         std::vector<float> v(static_cast<size_t>(dim));
-        if (!f.read(reinterpret_cast<char*>(v.data()), dim * sizeof(float))) break;
+        if (!f.read(reinterpret_cast<char*>(v.data()), static_cast<std::streamsize>(static_cast<size_t>(dim) * sizeof(float))))
+            throw std::runtime_error("loadFvecs: truncated data at vector " + std::to_string(vecs.size()));
         vecs.push_back(std::move(v));
     }
     return vecs;
@@ -38,7 +39,8 @@ inline std::vector<std::vector<int32_t>> loadIvecs(const std::string& path) {
         if (k <= 0 || k > 65536)
             throw std::runtime_error("loadIvecs: implausible k=" + std::to_string(k));
         std::vector<int32_t> v(static_cast<size_t>(k));
-        if (!f.read(reinterpret_cast<char*>(v.data()), k * sizeof(int32_t))) break;
+        if (!f.read(reinterpret_cast<char*>(v.data()), static_cast<std::streamsize>(static_cast<size_t>(k) * sizeof(int32_t))))
+            throw std::runtime_error("loadIvecs: truncated data at vector " + std::to_string(vecs.size()));
         vecs.push_back(std::move(v));
     }
     return vecs;

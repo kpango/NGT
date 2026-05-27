@@ -1,6 +1,5 @@
 // tests/ngtaq/test_fvecs_io.cpp
 #include "fvecs_io.h"
-#include <cassert>
 #include <cstdio>
 #include <fstream>
 #include <iostream>
@@ -16,8 +15,8 @@ static void writeFvecs(const std::string& p) {
     int32_t dim = 4;
     float rows[3][4] = {{1,2,3,4},{5,6,7,8},{9,10,11,12}};
     for (int i = 0; i < 3; ++i) {
-        f.write(reinterpret_cast<char*>(&dim), 4);
-        f.write(reinterpret_cast<char*>(rows[i]), 16);
+        f.write(reinterpret_cast<char*>(&dim), sizeof(dim));
+        f.write(reinterpret_cast<char*>(rows[i]), static_cast<std::streamsize>(static_cast<size_t>(dim) * sizeof(float)));
     }
 }
 static void writeIvecs(const std::string& p) {
@@ -25,8 +24,8 @@ static void writeIvecs(const std::string& p) {
     int32_t k = 3;
     int32_t ids[2][3] = {{0,1,2},{3,4,5}};
     for (int i = 0; i < 2; ++i) {
-        f.write(reinterpret_cast<char*>(&k), 4);
-        f.write(reinterpret_cast<char*>(ids[i]), 12);
+        f.write(reinterpret_cast<char*>(&k), sizeof(k));
+        f.write(reinterpret_cast<char*>(ids[i]), static_cast<std::streamsize>(static_cast<size_t>(k) * sizeof(int32_t)));
     }
 }
 
@@ -53,6 +52,11 @@ void testIvecs() {
 void testMissing() {
     bool threw = false;
     try { NGTAQ::loadFvecs("/tmp/does_not_exist_xyz.fvecs"); }
+    catch (const std::exception&) { threw = true; }
+    EXPECT_EQ(threw, true);
+
+    threw = false;
+    try { NGTAQ::loadIvecs("/tmp/does_not_exist_xyz.ivecs"); }
     catch (const std::exception&) { threw = true; }
     EXPECT_EQ(threw, true);
 }
