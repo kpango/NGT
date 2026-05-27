@@ -13,8 +13,8 @@ foreach(TEST_SRC
     test_alpha_cg
     test_dabs
     test_aqindex
-    test_fvecs_io
     benchmark_aqindex
+    test_fvecs_io
     benchmark_sift1m
     build_ngt_sift1m
 )
