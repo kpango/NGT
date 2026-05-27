@@ -65,11 +65,28 @@ public:
         std::priority_queue<Entry, std::vector<Entry>, std::greater<Entry>> cand_q;
         // Max-heap of size k_prime: farthest on top, used for result collection
         std::priority_queue<Entry> result_q;
+        // Separate max-heap of exactly k items to track the true k-th best distance.
+        // result_q grows to k_prime, so result_q.top() tracks the k_prime-th best,
+        // which is too loose for early termination gates.
+        std::priority_queue<float> dk_tracker;
         std::unordered_set<uint32_t> visited;
         visited.reserve(entry_points.size() * 16);  // reduce rehash for typical fan-out
 
-        // d_k: k-th best BQ distance seen so far; gates don't fire until k results found
+        // d_k: true k-th best BQ distance; gates don't fire until k results found
         float d_k = std::numeric_limits<float>::infinity();
+
+        // Helper: update dk_tracker and d_k when a new result candidate arrives.
+        auto update_dk = [&](float dist) {
+            if (dk_tracker.size() < static_cast<size_t>(k)) {
+                dk_tracker.push(dist);
+                if (dk_tracker.size() == static_cast<size_t>(k))
+                    d_k = dk_tracker.top();
+            } else if (dist < dk_tracker.top()) {
+                dk_tracker.pop();
+                dk_tracker.push(dist);
+                d_k = dk_tracker.top();
+            }
+        };
 
         // Seed from entry points
         for (uint32_t ep : entry_points) {
@@ -89,48 +106,42 @@ public:
             cand_q.pop();
 
             // Termination gate: only after k results accumulated
-            if (result_q.size() >= static_cast<size_t>(k) &&
+            if (dk_tracker.size() >= static_cast<size_t>(k) &&
                 dist_qx > (1.0f + gamma_term) * d_k) {
                 break;
             }
 
-            // Update result heap
+            // Update result heap and dk_tracker
             if (result_q.size() < static_cast<size_t>(k_prime)) {
                 result_q.push({dist_qx, x});
-                // Update d_k whenever heap has k or more results so that
-                // the gates use the current k-th best (not just the first time).
-                if (result_q.size() >= static_cast<size_t>(k)) {
-                    d_k = result_q.top().first;
-                }
+                update_dk(dist_qx);
             } else if (dist_qx < result_q.top().first) {
                 result_q.pop();
                 result_q.push({dist_qx, x});
-                // Keep d_k fresh: after displacement, the heap top is the new worst of
-                // k_prime candidates, which is still >= the true k-th best.
-                // Updating here prevents stale-d_k from over-tightening the gates.
-                d_k = result_q.top().first;
+                update_dk(dist_qx);
             }
 
             // Explore neighbors
             auto neighbors = graph.getNeighbors(x);
             for (uint32_t u : neighbors) {
                 if (graph.isTombstone(u)) continue;
+                // Mark visited immediately to prevent redundant BQ distance
+                // computations when the same node appears as a neighbor of
+                // multiple visited nodes.
                 if (visited.count(u)) continue;
+                visited.insert(u);
 
                 float d_qu = bqDistance(
                     query_sign, query_mag,
                     graph.getSignPlane(u), graph.getMagPlane(u),
                     words, D);
 
-                // Enqueue gate: skip if clearly too far (only after k results).
-                // Check BEFORE inserting into visited so that if d_k tightens later
-                // via a different path, the node is not permanently excluded.
-                if (result_q.size() >= static_cast<size_t>(k) &&
+                // Enqueue gate: skip if clearly too far (only after k results found).
+                if (dk_tracker.size() >= static_cast<size_t>(k) &&
                     d_qu > (1.0f + gamma_enq) * d_k) {
                     continue;
                 }
 
-                visited.insert(u);
                 cand_q.push({d_qu, u});
             }
         }
