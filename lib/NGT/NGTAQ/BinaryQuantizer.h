@@ -40,10 +40,61 @@ class BinaryQuantizer {
   }
 
   // Use identity rotation (no rotation). Useful for testing.
+  // WARNING: do NOT use with non-negative input vectors (e.g. SIFT histograms).
+  // All sign bits will be 0, making BQ distance always 0.
   void setIdentityRotation() {
     rotation_dim_ = dim_;
     rotation_.assign(static_cast<size_t>(dim_) * dim_, 0.0f);
     for (int i = 0; i < dim_; i++) rotation_[i * dim_ + i] = 1.0f;
+  }
+
+  // Random sign flip (diagonal rotation with ±1 entries, seed-reproducible).
+  // Each dimension is independently negated with probability 0.5.
+  // NOTE: diagonal sign flips do NOT fix the non-negative input problem —
+  // the sign XOR between two vectors is unaffected by a shared sign flip.
+  // Use setRandomRotation() for inputs that are all non-negative (e.g. SIFT).
+  void setRandomSignFlip(uint32_t seed = 42) {
+    rotation_dim_ = dim_;
+    rotation_.assign(static_cast<size_t>(dim_) * dim_, 0.0f);
+    std::mt19937 rng(seed);
+    std::bernoulli_distribution flip(0.5);
+    for (int i = 0; i < dim_; i++)
+      rotation_[i * static_cast<size_t>(dim_) + i] = flip(rng) ? 1.0f : -1.0f;
+  }
+
+  // Random orthogonal rotation via Gram-Schmidt on a random Gaussian matrix.
+  // Mixes all dimensions, making sign bits informative even for non-negative
+  // inputs (e.g. SIFT histograms after L2 normalization).
+  // O(D³) to generate (once at index build time), O(D²) to apply per encode.
+  void setRandomRotation(uint32_t seed = 42) {
+    rotation_dim_ = dim_;
+    const int D = dim_;
+    // Fill with iid N(0,1) entries
+    std::mt19937 rng(seed);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    std::vector<float> M(static_cast<size_t>(D) * D);
+    for (auto& v : M) v = nd(rng);
+    // Gram-Schmidt orthogonalization (row-wise)
+    rotation_.resize(static_cast<size_t>(D) * D);
+    for (int i = 0; i < D; ++i) {
+      // Copy row i from M
+      float* ri = rotation_.data() + i * D;
+      std::copy(M.begin() + i * D, M.begin() + (i + 1) * D, ri);
+      // Subtract projections onto already-orthogonalized rows
+      for (int j = 0; j < i; ++j) {
+        const float* rj = rotation_.data() + j * D;
+        float dot = 0.0f;
+        for (int k = 0; k < D; ++k) dot += rj[k] * ri[k];
+        for (int k = 0; k < D; ++k) ri[k] -= dot * rj[k];
+      }
+      // Normalize row i
+      float norm2 = 0.0f;
+      for (int k = 0; k < D; ++k) norm2 += ri[k] * ri[k];
+      if (norm2 > 1e-12f) {
+        float inv = 1.0f / std::sqrt(norm2);
+        for (int k = 0; k < D; ++k) ri[k] *= inv;
+      }
+    }
   }
 
   // Set rotation from a pre-computed NGTQ::Rotation (row-major, dim x dim).

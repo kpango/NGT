@@ -74,10 +74,13 @@ NGTAQIndex NGTAQIndex::fromNGT(const std::string& ngt_path, const Property& prop
         }
     }
 
-    // Init BQ with identity rotation
+    // Random orthogonal rotation via Gram-Schmidt on a Gaussian random matrix.
+    // Mixes all dimensions so sign bits are informative even for non-negative
+    // inputs such as SIFT histograms (identity/diagonal rotations leave sign bits
+    // all-zero after L2 normalization, making BQ distance trivially 0).
     BinaryQuantizer bq;
     bq.init(D);
-    bq.setIdentityRotation();
+    bq.setRandomRotation();
 
     // Calibrate tau (NO D param)
     std::vector<const float*> ptrs(N);
