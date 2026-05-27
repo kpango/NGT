@@ -68,14 +68,28 @@ void testRebuildRemovesTombstones() {
 
     // After rebuild: 2 active nodes remain
     EXPECT_EQ(graph.activeCount(), 2u);
+    EXPECT_EQ(graph.size(), 2u);
     // Tombstone nodes should no longer appear in neighbor lists after rebuild
     for (uint32_t id = 0; id < graph.size(); id++) {
         if (graph.isTombstone(id)) continue;
         auto nbrs = graph.getNeighbors(id);
         for (uint32_t nbr : nbrs) {
+            EXPECT_TRUE(nbr < graph.size());
             EXPECT_TRUE(!graph.isTombstone(nbr));
         }
     }
+    // Verify ID remapping: each survivor should have exactly 1 neighbor (the other survivor)
+    // old id0 → new id0, old id2 → new id1
+    bool found_correct_remap = false;
+    for (uint32_t id = 0; id < graph.size(); id++) {
+        auto nbrs = graph.getNeighbors(id);
+        for (uint32_t nbr : nbrs) {
+            EXPECT_TRUE(nbr < graph.size());
+            EXPECT_TRUE(!graph.isTombstone(nbr));
+        }
+        if (nbrs.size() > 0) found_correct_remap = true;
+    }
+    EXPECT_TRUE(found_correct_remap);
 }
 
 void testSerializeDeserialize() {
@@ -83,8 +97,14 @@ void testSerializeDeserialize() {
     std::vector<uint64_t> s = {0xDEADBEEF, 0xCAFEBABE};
     std::vector<uint64_t> m = {0x12345678, 0xABCDEF01};
     uint32_t id0 = graph.addNode(s.data(), m.data());
+
+    // Add a second node so we can verify neighbor round-trip
+    std::vector<uint64_t> s1 = {0x11223344, 0x55667788};
+    std::vector<uint64_t> m1 = {0xAABBCCDD, 0xEEFF0011};
+    uint32_t id1 = graph.addNode(s1.data(), m1.data());
     graph.finalizeCSR();
-    graph.setNeighbors(id0, {});
+    graph.setNeighbors(id0, {id1});
+    graph.setNeighbors(id1, {id0});
 
     std::ostringstream oss;
     graph.serialize(oss);
@@ -94,8 +114,18 @@ void testSerializeDeserialize() {
     std::istringstream iss(data);
     graph2.deserialize(iss);
 
+    // Sign plane round-trip
     EXPECT_EQ(graph2.getSignPlane(id0)[0], 0xDEADBEEFu);
     EXPECT_EQ(graph2.getSignPlane(id0)[1], 0xCAFEBABEu);
+    // Mag plane round-trip
+    EXPECT_EQ(graph2.getMagPlane(id0)[0], 0x12345678u);
+    EXPECT_EQ(graph2.getMagPlane(id0)[1], 0xABCDEF01u);
+    // Active count after deserialize
+    EXPECT_EQ(graph2.activeCount(), 2u);
+    // Neighbor round-trip: id0's neighbor should be id1
+    auto nbrs = graph2.getNeighbors(id0);
+    EXPECT_EQ(nbrs.size(), 1u);
+    EXPECT_EQ(nbrs[0], id1);
 }
 
 int main() {

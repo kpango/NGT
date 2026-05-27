@@ -64,7 +64,7 @@ public:
     // Replace neighbor list for node_id. Adjusts all subsequent offsets.
     // Thread-unsafe: caller must hold exclusive lock.
     void setNeighbors(uint32_t node_id, std::vector<uint32_t> neighbors) {
-        assert(node_id + 1 < offsets_.size() && "call finalizeCSR() before setNeighbors()");
+        assert(static_cast<size_t>(node_id) + 1 < offsets_.size() && "call finalizeCSR() before setNeighbors()");
         uint32_t begin = offsets_[node_id];
         uint32_t end   = offsets_[node_id + 1];
         int old_count  = static_cast<int>(end - begin);
@@ -85,7 +85,7 @@ public:
     // Returns view into edge_ids_ for node_id's neighbors.
     // Requires finalizeCSR() to have been called.
     NeighborView getNeighbors(uint32_t node_id) const {
-        assert(node_id + 1 < offsets_.size() && "call finalizeCSR() before getNeighbors()");
+        assert(static_cast<size_t>(node_id) + 1 < offsets_.size() && "call finalizeCSR() before getNeighbors()");
         uint32_t begin = offsets_[node_id];
         uint32_t end   = offsets_[node_id + 1];
         return {edge_ids_.data() + begin, end - begin};
@@ -123,6 +123,7 @@ public:
     // Compact out all tombstone nodes: re-maps IDs, purges tombstone-ID neighbors.
     // Caller must hold exclusive lock on mutex().
     void rebuild() {
+        finalizeCSR();  // ensure CSR sentinel present before getNeighbors()
         size_t N = state_.size();
         std::vector<uint32_t> old_to_new(N, UINT32_MAX);
         uint32_t new_id = 0;
@@ -146,6 +147,7 @@ public:
 
             auto nbrs = getNeighbors(i);
             for (uint32_t nbr : nbrs) {
+                if (nbr >= static_cast<uint32_t>(N)) continue;  // guard corrupted IDs
                 if (state_[nbr] == ACTIVE)
                     fresh.edge_ids_.push_back(old_to_new[nbr]);
             }
@@ -164,7 +166,8 @@ public:
     // RW lock for external thread safety
     std::shared_mutex& mutex() { return mutex_; }
 
-    void serialize(std::ostream& os) const {
+    void serialize(std::ostream& os) {
+        finalizeCSR();  // ensure sentinel present (idempotent)
         auto n     = static_cast<uint32_t>(state_.size());
         auto w     = static_cast<uint32_t>(words_);
         auto edges = static_cast<uint32_t>(edge_ids_.size());
@@ -195,6 +198,12 @@ public:
         is.read(reinterpret_cast<char*>(edge_ids_.data()), edges * sizeof(uint32_t));
         is.read(reinterpret_cast<char*>(bq_sign_.data()),  static_cast<size_t>(n) * words_ * sizeof(uint64_t));
         is.read(reinterpret_cast<char*>(bq_mag_.data()),   static_cast<size_t>(n) * words_ * sizeof(uint64_t));
+        // Clear on stream failure to avoid partially-initialized state
+        if (!is) {
+            state_.clear(); offsets_.clear(); edge_ids_.clear();
+            bq_sign_.clear(); bq_mag_.clear();
+            words_ = 0;
+        }
     }
 
 private:
