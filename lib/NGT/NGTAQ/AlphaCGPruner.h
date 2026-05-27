@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <cassert>
 #include <cstdint>
 #include <functional>
 #include <utility>
@@ -21,7 +22,9 @@ public:
         : alpha_base(alpha), kappa(kap) {}
 
     float effectiveAlpha(float tau) const {
-        return alpha_base + kappa * tau;
+        float ae = alpha_base + kappa * tau;
+        assert(ae > 0.0f && "alpha_base + kappa*tau must be positive");
+        return ae;
     }
 
     // Pruning threshold: if δ_BQ(v, u) < threshold, v "covers" u and u is pruned.
@@ -63,9 +66,10 @@ public:
     }
 
     // Test-friendly variant: takes explicit pairwise distances instead of a distance function.
-    // inter_dists layout: for each candidate ci (in order), provides dist(accepted[ai], cand[ci])
-    // for ai = 0..accepted.size()-1 (at time ci is processed, i.e., BEFORE potentially adding ci).
-    // Total entries needed: sum over all candidates of accepted.size() at time of processing.
+    // inter_dists layout: for candidate ci, provides dist(accepted[ai], candidates[ci].first)
+    // for ai = 0..accepted_count_before_ci - 1 (BEFORE potentially adding ci to accepted).
+    // Required size: sum_{i=0}^{N-1} accepted_count_before_i
+    // (= 0 if all accepted, up to N*(N-1)/2 if none are pruned).
     std::vector<uint32_t> pruneWithDistances(
         const std::vector<std::pair<uint32_t, float>>& candidates,
         const std::vector<float>& inter_dists,
@@ -83,6 +87,7 @@ public:
 
             if (threshold > 0.0f) {
                 for (size_t ai = 0; ai < n_accepted; ++ai) {
+                    assert(inter_idx + ai < inter_dists.size() && "inter_dists is too short for the given candidates");
                     if (inter_dists[inter_idx + ai] < threshold) {
                         dominated = true;
                         break;
