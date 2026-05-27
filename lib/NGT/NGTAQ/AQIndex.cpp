@@ -98,11 +98,14 @@ NGTAQIndex NGTAQIndex::fromNGT(const std::string& ngt_path, const Property& prop
         if (is_hole[i]) graph->removeNode(static_cast<uint32_t>(i));
     }
 
-    // Build alpha-CG graph from NGT edges
+    // Build alpha-CG graph from NGT edges.
+    // Collect all pruned adjacency lists first, then call resetEdges() in one
+    // O(N·k) pass. Sequential setNeighbors() would be O(N²) due to CSR shifts.
     AlphaCGPruner pruner(prop.alpha, prop.kappa);
     const float tau = bq.tau();
     NGT::GraphIndex& gi = static_cast<NGT::GraphIndex&>(ngt.getIndex());
 
+    std::vector<std::vector<uint32_t>> adj(N);
     for (size_t i = 1; i <= N; i++) {
         uint32_t aq_id = static_cast<uint32_t>(i - 1);
         NGT::GraphNode* node = nullptr;
@@ -135,9 +138,9 @@ NGTAQIndex NGTAQIndex::fromNGT(const std::string& ngt_path, const Property& prop
                 graph->getSignPlane(u), graph->getMagPlane(u),
                 words, D);
         };
-        auto pruned = pruner.prune(candidates, tau, dist_fn);
-        graph->setNeighbors(aq_id, pruned);
+        adj[aq_id] = pruner.prune(candidates, tau, dist_fn);
     }
+    graph->resetEdges(adj);
 
     // Select entry points
     int n_ep = std::min(prop.n_entry_points, static_cast<int>(N));

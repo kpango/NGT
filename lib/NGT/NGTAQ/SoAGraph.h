@@ -61,6 +61,24 @@ public:
         offsets_.push_back(static_cast<uint32_t>(edge_ids_.size()));
     }
 
+    // Rebuild all edge data from a full adjacency list in O(N·k).
+    // Replaces edge_ids_ and offsets_ entirely; state_/bq_sign_/bq_mag_ unchanged.
+    // Thread-unsafe: caller must hold exclusive lock.
+    void resetEdges(const std::vector<std::vector<uint32_t>>& adj) {
+        assert(adj.size() == state_.size());
+        const size_t N = state_.size();
+        size_t total = 0;
+        for (const auto& nbrs : adj) total += nbrs.size();
+        edge_ids_.clear();
+        edge_ids_.reserve(total);
+        offsets_.resize(N + 1);
+        offsets_[0] = 0;
+        for (size_t i = 0; i < N; ++i) {
+            for (uint32_t nbr : adj[i]) edge_ids_.push_back(nbr);
+            offsets_[i + 1] = static_cast<uint32_t>(edge_ids_.size());
+        }
+    }
+
     // Replace neighbor list for node_id. Adjusts all subsequent offsets.
     // Thread-unsafe: caller must hold exclusive lock.
     void setNeighbors(uint32_t node_id, std::vector<uint32_t> neighbors) {
