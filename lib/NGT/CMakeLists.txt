@@ -4,7 +4,7 @@ if( ${UNIX} )
 	include_directories("${CMAKE_CURRENT_BINARY_DIR}" "${PROJECT_SOURCE_DIR}/lib" "${PROJECT_BINARY_DIR}/lib/")
 
 	if(${NGT_QBG_DISABLED})
-		file(GLOB NGT_SOURCES *.cpp)
+		file(GLOB NGT_SOURCES *.cpp NGTAQ/*.cpp)
 	else()
 		file(GLOB NGT_SOURCES *.cpp NGTQ/*.cpp NGTAQ/*.cpp)
 	endif()

@@ -6,6 +6,11 @@
 #include "NGT/NGTAQ/BinaryQuantizer.h"
 #include "NGT/NGTAQ/DABSSearcher.h"
 #include "NGT/NGTAQ/SoAGraph.h"
+#include "NGT/NGTAQ/SRHT.h"
+#include "NGT/NGTAQ/KMeansCentering.h"
+#include "NGT/NGTAQ/PCAProjector.h"
+#include "NGT/NGTAQ/ADCTable.h"
+#include "NGT/NGTAQ/ADCDistance.h"
 
 #include <fstream>
 #include <memory>
@@ -66,6 +71,23 @@ public:
     void save(const std::string& path) const;
     static NGTAQIndex load(const std::string& path);
 
+    // ---- v2 ADC path ----
+
+    // Build v2 index from existing NGT float32 index.
+    // SRHT rotation + K-means centering + PCA top-32 + VectorRecord encoding.
+    static NGTAQIndex fromNGTv2(const std::string& ngt_path, const Property& prop);
+
+    // ADC search using routeV2(). Requires is_v2_ == true.
+    std::vector<SearchResult> searchV2(
+        const std::vector<float>& query, int k,
+        float gamma_enq = 0.2f, float gamma_term = 0.4f) const;
+
+    // Save/load v2 state to directory (separate from v1 state).
+    void saveV2(const std::string& dir) const;
+    void loadV2(const std::string& dir);
+
+    bool isV2() const { return is_v2_; }
+
 private:
     // Concurrency model:
     //   graph_->mutex() (std::shared_mutex) protects: graph_, raw_flat_, entry_points_
@@ -81,6 +103,14 @@ private:
     DABSSearcher                    searcher_;
     std::vector<uint32_t>           entry_points_;
     std::vector<float>              raw_flat_;     // flat [N*D] exact float vectors
+
+    // v2 ADC state (null/empty if not built via fromNGTv2)
+    bool                                      is_v2_ = false;
+    std::unique_ptr<NGT::NGTAQ::SRHT>         srht_v2_;
+    std::unique_ptr<NGT::NGTAQ::KMeansCentering> kmeans_v2_;
+    std::unique_ptr<NGT::NGTAQ::PCAProjector> pca_v2_;
+    std::vector<float>                        tier2_codebook_; // [16][32] = 512 floats
+    std::vector<uint32_t>                     v2_entry_points_;
 
     // Private constructor used by fromNGT() and load().
     NGTAQIndex(Property prop, BinaryQuantizer bq,

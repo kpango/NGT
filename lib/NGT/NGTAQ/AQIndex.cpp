@@ -5,12 +5,17 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <limits>
 #include <mutex>
 #include <omp.h>
+#include <queue>
 #include <random>
 #include <shared_mutex>
 #include <stdexcept>
+#include <unordered_set>
 
 namespace NGTAQ {
 
@@ -482,6 +487,418 @@ std::vector<uint32_t> NGTAQIndex::selectEntryPoints(
         selected.push_back(best_id);
     }
     return selected;
+}
+
+// ---------------------------------------------------------------------------
+// fromNGTv2: SRHT + K-means + PCA + VectorRecord + cluster-aware graph
+// ---------------------------------------------------------------------------
+NGTAQIndex NGTAQIndex::fromNGTv2(const std::string& ngt_path, const Property& prop) {
+    const int D = prop.dimension;
+    if ((D & (D - 1)) != 0)
+        throw std::invalid_argument("fromNGTv2: dimension must be a power of 2");
+    if (D % 64 != 0)
+        throw std::invalid_argument("fromNGTv2: dimension must be divisible by 64");
+
+    // ---- 1. Load all float vectors from NGT ----
+    NGT::Index ngt(ngt_path);
+    NGT::ObjectSpace& objspace = ngt.getObjectSpace();
+    const size_t repo_size = objspace.getRepository().size();
+    const size_t N = repo_size - 1;
+    const int words = D / 64;
+
+    std::vector<float> raw_flat(N * static_cast<size_t>(D), 0.f);
+    std::vector<bool> is_hole(N, false);
+    std::vector<float> tmp(D);
+    for (size_t i = 1; i <= N; i++) {
+        try {
+            objspace.getObject(static_cast<NGT::ObjectID>(i), tmp);
+            std::copy(tmp.begin(), tmp.end(),
+                      raw_flat.begin() + static_cast<ptrdiff_t>((i - 1) * D));
+        } catch (...) {
+            is_hole[i - 1] = true;
+        }
+    }
+    fprintf(stderr, "[NGTAQv2] Loaded %zu vectors D=%d\n", N, D);
+
+    // ---- 2. SRHT: rotate all vectors ----
+    const uint64_t seed = 0xCAFEBABE12345678ULL;
+    auto srht = std::make_unique<NGT::NGTAQ::SRHT>(D, seed);
+    std::vector<float> rotated(N * static_cast<size_t>(D));
+    for (size_t i = 0; i < N; ++i)
+        srht->apply(raw_flat.data() + i*D, rotated.data() + i*D);
+
+    // ---- 3. K-means on rotated vectors ----
+    uint32_t K = NGT::NGTAQ::select_k(N);
+    auto kmeans = std::make_unique<NGT::NGTAQ::KMeansCentering>(K, D, seed ^ 0xFFFF);
+    fprintf(stderr, "[NGTAQv2] K-means K=%u...\n", K);
+    kmeans->train(rotated.data(), N);
+
+    // ---- 4. Assign and compute residuals ----
+    std::vector<uint32_t> centroid_ids(N);
+    kmeans->assign(rotated.data(), N, centroid_ids.data());
+    std::vector<float> residuals(N * static_cast<size_t>(D));
+    for (size_t i = 0; i < N; ++i)
+        kmeans->get_residual(rotated.data() + i*D, centroid_ids[i], residuals.data() + i*D);
+
+    // ---- 5. PCA top-32 on residuals ----
+    auto pca = std::make_unique<NGT::NGTAQ::PCAProjector>(D, 32, seed ^ 0x1234);
+    size_t fit_n = std::min(N, (size_t)262144);
+    fprintf(stderr, "[NGTAQv2] PCA fit on %zu residuals...\n", fit_n);
+    pca->fit(residuals.data(), fit_n);
+
+    // ---- 6. PCA-project all residuals ----
+    std::vector<float> pca_residuals(N * 32);
+    for (size_t i = 0; i < N; ++i)
+        pca->project(residuals.data() + i*D, pca_residuals.data() + i*32);
+
+    // ---- 7. Tier-2 codebook: K-means K=16 in PCA-32 space ----
+    NGT::NGTAQ::KMeansCentering pca_km(16, 32, seed ^ 0xABCD);
+    pca_km.train(pca_residuals.data(), N, 262144, 50);
+    // Store as [16][32] flat codebook
+    std::vector<float> tier2_cb(16 * 32);
+    for (int k = 0; k < 16; ++k)
+        memcpy(tier2_cb.data() + k * 32, pca_km.centroid(k), 32 * sizeof(float));
+
+    // ---- 8. Encode all vectors into VectorRecord ----
+    // Build the BQ-compatible SoAGraph (needed for existing graph infra + v1 compat)
+    BinaryQuantizer bq;
+    bq.init(D);
+    bq.setRandomRotation();
+    {
+        std::vector<const float*> ptrs(N);
+        for (size_t i = 0; i < N; i++) ptrs[i] = raw_flat.data() + i * D;
+        bq.calibrateTau(ptrs, prop.n_tau_samples, prop.metric);
+    }
+    auto graph = std::make_unique<SoAGraph>(words);
+    {
+        std::vector<uint64_t> bq_buf(static_cast<size_t>(words) * 2);
+        for (size_t i = 0; i < N; i++) {
+            bq.encode(raw_flat.data() + i * D, bq_buf.data());
+            graph->addNode(bq_buf.data());
+        }
+    }
+    graph->finalizeCSR();
+    for (size_t i = 0; i < N; ++i)
+        if (is_hole[i]) graph->removeNode(static_cast<uint32_t>(i));
+
+    // Fill v2 VectorRecords
+    graph->reserveV2(N);
+    for (size_t i = 0; i < N; ++i) {
+        if (is_hole[i]) continue;
+        NGT::NGTAQ::VectorRecord rec = {};
+        rec.centroid_id = centroid_ids[i];
+
+        // tier-1: sign bits of SRHT residual (128 bits → 16 bytes)
+        const float* res = residuals.data() + i*D;
+        for (int b = 0; b < D; ++b)
+            NGT::NGTAQ::set_tier1_bit(rec, b, res[b] >= 0.f);
+
+        // norm_fp16: L2 norm of residual
+        float norm2 = 0.f;
+        for (int d = 0; d < D; ++d) norm2 += res[d] * res[d];
+        rec.norm_fp16 = NGT::NGTAQ::float_to_fp16(std::sqrt(norm2));
+
+        // tier-2: global K=16 PCA quantizer, replicate nibble to all 32 slots
+        uint32_t pca_code = pca_km.nearest_public(pca_residuals.data() + i * 32) & 0xF;
+        for (int d = 0; d < 32; ++d)
+            NGT::NGTAQ::set_tier2_nibble(rec, d, (uint8_t)pca_code);
+
+        graph->setRecord(static_cast<uint32_t>(i), rec);
+    }
+
+    // ---- 9. Build cluster-aware graph from NGT edges ----
+    NGT::GraphIndex& gi = static_cast<NGT::GraphIndex&>(ngt.getIndex());
+    AlphaCGPruner pruner(prop.alpha, prop.kappa);
+    const float tau = bq.tau();
+
+    std::vector<std::vector<uint32_t>> adj(N);
+    for (size_t i = 1; i <= N; i++) {
+        uint32_t aq_id = static_cast<uint32_t>(i - 1);
+        if (is_hole[aq_id]) continue;
+        NGT::GraphNode* node = nullptr;
+        try { node = gi.getNode(static_cast<NGT::ObjectID>(i)); }
+        catch (...) { continue; }
+        if (!node || node->empty()) continue;
+
+        std::vector<std::pair<uint32_t, float>> candidates;
+        candidates.reserve(node->size());
+        for (auto& edge : *node) {
+            if (edge.id == 0 || edge.id > static_cast<unsigned int>(N)) continue;
+            uint32_t nbr = static_cast<uint32_t>(edge.id - 1);
+            float d_bq = bqDistance(graph->getNodeBQ(aq_id), graph->getNodeBQ(nbr), words, D);
+            candidates.push_back({nbr, d_bq});
+        }
+        // Cluster-aware sort: same centroid neighbors first, then by BQ distance
+        std::stable_sort(candidates.begin(), candidates.end(),
+            [&](const auto& a, const auto& b) {
+                bool a_same = (centroid_ids[a.first] == centroid_ids[aq_id]);
+                bool b_same = (centroid_ids[b.first] == centroid_ids[aq_id]);
+                if (a_same != b_same) return a_same > b_same;
+                return a.second < b.second;
+            });
+        if (static_cast<int>(candidates.size()) > prop.max_edges)
+            candidates.resize(static_cast<size_t>(prop.max_edges));
+
+        auto dist_fn = [&](uint32_t v, uint32_t u) -> float {
+            return bqDistance(graph->getNodeBQ(v), graph->getNodeBQ(u), words, D);
+        };
+        adj[aq_id] = pruner.prune(candidates, tau, dist_fn);
+    }
+    graph->resetEdges(adj);
+
+    int n_ep = std::min(prop.n_entry_points, static_cast<int>(N));
+    auto entry_points = selectEntryPoints(*graph, n_ep);
+
+    // Construct index
+    NGTAQIndex idx(prop, std::move(bq), std::move(graph),
+                   std::move(entry_points), std::move(raw_flat));
+    idx.is_v2_ = true;
+    idx.srht_v2_        = std::move(srht);
+    idx.kmeans_v2_      = std::move(kmeans);
+    idx.pca_v2_         = std::move(pca);
+    idx.tier2_codebook_ = std::move(tier2_cb);
+    idx.v2_entry_points_ = idx.entry_points_;  // reuse existing entry points for v2
+
+    fprintf(stderr, "[NGTAQv2] Build complete. N=%zu K=%u\n", N, K);
+    return idx;
+}
+
+// ---------------------------------------------------------------------------
+// searchV2: ADC search with lazy centroid switch
+// ---------------------------------------------------------------------------
+std::vector<SearchResult> NGTAQIndex::searchV2(
+    const std::vector<float>& query, int k,
+    float gamma_enq, float gamma_term) const
+{
+    if (!is_v2_)
+        throw std::runtime_error("searchV2: call fromNGTv2() first");
+    if (static_cast<int>(query.size()) < prop_.dimension)
+        throw std::invalid_argument("searchV2: query dimension mismatch");
+
+    const int D = prop_.dimension;
+    const float inv_sqrt_D = 1.f / std::sqrt((float)D);
+
+    // 1. Rotate query
+    std::vector<float> q_rot(D);
+    srht_v2_->apply(query.data(), q_rot.data());
+
+    // 2. Find query's nearest centroid
+    uint32_t active_cid = kmeans_v2_->nearest_public(q_rot.data());
+    std::vector<float> q_res(D);
+    kmeans_v2_->get_residual(q_rot.data(), active_cid, q_res.data());
+
+    // 3. Build initial ADC state
+    NGT::NGTAQ::ADCQueryState adc = {};
+    NGT::NGTAQ::build_tier1_query(q_res.data(), D, adc.q_int8);
+    float q_norm_sq = 0.f;
+    for (int d = 0; d < D; ++d) q_norm_sq += q_res[d] * q_res[d];
+    adc.q_norm_sq = q_norm_sq;
+    float pca_proj[32];
+    pca_v2_->project(q_res.data(), pca_proj);
+    NGT::NGTAQ::build_tier2_lut(pca_proj, tier2_codebook_.data(), adc.tier2_lut);
+
+    std::shared_lock<std::shared_mutex> lock(graph_->mutex());
+    const size_t N = graph_->size();
+
+    // 4. DABS search with ADC distances + lazy centroid rebuild
+    using Entry = std::pair<float, uint32_t>;
+    std::priority_queue<Entry, std::vector<Entry>, std::greater<Entry>> cand_q;
+    std::priority_queue<float> dk_tracker;
+    std::vector<std::pair<float, uint32_t>> results;
+    results.reserve(static_cast<size_t>(k));
+    std::unordered_set<uint32_t> visited;
+    visited.reserve(entry_points_.size() * 16);
+    float d_k = std::numeric_limits<float>::infinity();
+
+    auto adc_dist = [&](const NGT::NGTAQ::VectorRecord& rec) -> float {
+        float t2 = NGT::NGTAQ::tier2_adc_fast(adc.tier2_lut, rec.tier2);
+        float norm_x = NGT::NGTAQ::fp16_to_float(rec.norm_fp16);
+        return adc.q_norm_sq + norm_x*norm_x
+               - 2.f * norm_x * NGT::NGTAQ::RABITQ_SCALE * t2 * inv_sqrt_D;
+    };
+
+    auto maybe_rebuild_adc = [&](uint32_t cid) {
+        if (cid == active_cid) return;
+        active_cid = cid;
+        kmeans_v2_->get_residual(q_rot.data(), active_cid, q_res.data());
+        NGT::NGTAQ::build_tier1_query(q_res.data(), D, adc.q_int8);
+        q_norm_sq = 0.f;
+        for (int d2 = 0; d2 < D; ++d2) q_norm_sq += q_res[d2]*q_res[d2];
+        adc.q_norm_sq = q_norm_sq;
+        pca_v2_->project(q_res.data(), pca_proj);
+        NGT::NGTAQ::build_tier2_lut(pca_proj, tier2_codebook_.data(), adc.tier2_lut);
+    };
+
+    // Seed with entry points
+    for (uint32_t ep : entry_points_) {
+        if (ep >= N || graph_->isTombstone(ep)) continue;
+        if (visited.count(ep)) continue;
+        visited.insert(ep);
+        const auto& rec = graph_->getRecord(ep);
+        maybe_rebuild_adc(rec.centroid_id);
+        float d = adc_dist(rec);
+        cand_q.push({d, ep});
+    }
+
+    while (!cand_q.empty()) {
+        auto [dist_x, x] = cand_q.top(); cand_q.pop();
+
+        if (dk_tracker.size() >= static_cast<size_t>(k) &&
+            dist_x > (1.f + gamma_term) * d_k) break;
+
+        const auto& rec_x = graph_->getRecord(x);
+        maybe_rebuild_adc(rec_x.centroid_id);
+
+        // Tier-1 pre-filter gate; tier-2 refinement
+        float t1 = NGT::NGTAQ::tier1_adc_fast(adc.q_int8, rec_x.tier1);
+        float norm_x = NGT::NGTAQ::fp16_to_float(rec_x.norm_fp16);
+        float dist_t1 = adc.q_norm_sq + norm_x*norm_x
+                       - 2.f * norm_x * NGT::NGTAQ::RABITQ_SCALE * t1 * inv_sqrt_D;
+        bool skip_t2 = (dk_tracker.size() >= static_cast<size_t>(k) &&
+                        dist_t1 > (1.f + gamma_enq * 1.5f) * d_k);
+        if (!skip_t2) {
+            float d_t2 = adc_dist(rec_x);
+            if (dk_tracker.size() < static_cast<size_t>(k) || d_t2 < d_k) {
+                results.push_back({d_t2, x});
+                dk_tracker.push(d_t2);
+                if (static_cast<int>(dk_tracker.size()) > k) {
+                    dk_tracker.pop();
+                    d_k = dk_tracker.top();
+                } else if (static_cast<int>(dk_tracker.size()) == k) {
+                    d_k = dk_tracker.top();
+                }
+            }
+        }
+
+        auto neighbors = graph_->getNeighbors(x);
+        for (size_t ni = 0; ni < neighbors.size(); ++ni) {
+            uint32_t u = neighbors[ni];
+            if (u >= N || graph_->isTombstone(u)) continue;
+            if (visited.count(u)) continue;
+            visited.insert(u);
+            const auto& rec_u = graph_->getRecord(u);
+            maybe_rebuild_adc(rec_u.centroid_id);
+            float d_u = adc_dist(rec_u);
+            cand_q.push({d_u, u});
+        }
+    }
+
+    // Exact-distance refinement on results
+    std::sort(results.begin(), results.end());
+    if (static_cast<int>(results.size()) > k * 2) results.resize(static_cast<size_t>(k * 2));
+
+    std::vector<SearchResult> final_results;
+    final_results.reserve(results.size());
+    for (auto& [approx_d, id] : results) {
+        if (static_cast<size_t>(id) * D + D > raw_flat_.size()) continue;
+        const float* vec = raw_flat_.data() + static_cast<size_t>(id) * D;
+        float exact = 0.f;
+        for (int j = 0; j < D; ++j) {
+            float diff = query[j] - vec[j];
+            exact += diff * diff;
+        }
+        final_results.push_back({id, std::sqrt(exact), approx_d});
+    }
+    std::sort(final_results.begin(), final_results.end(),
+        [](const SearchResult& a, const SearchResult& b) {
+            return a.distance < b.distance;
+        });
+    if (static_cast<int>(final_results.size()) > k)
+        final_results.resize(static_cast<size_t>(k));
+    return final_results;
+}
+
+// ---------------------------------------------------------------------------
+// saveV2 / loadV2
+// ---------------------------------------------------------------------------
+void NGTAQIndex::saveV2(const std::string& dir) const {
+    if (!is_v2_) return;
+    // SoAGraph v2 records
+    graph_->saveV2Records(dir + "/v2_records.bin");
+    // SRHT diagonal
+    {
+        std::vector<float> diag;
+        srht_v2_->serialize(diag);
+        std::ofstream f(dir + "/v2_srht.bin", std::ios::binary);
+        uint32_t Dsz = (uint32_t)diag.size();
+        f.write(reinterpret_cast<const char*>(&Dsz), sizeof(Dsz));
+        f.write(reinterpret_cast<const char*>(diag.data()), Dsz * sizeof(float));
+    }
+    // K-means centroids
+    {
+        std::ofstream f(dir + "/v2_kmeans.bin", std::ios::binary);
+        uint32_t K = kmeans_v2_->num_clusters();
+        uint32_t Dim = (uint32_t)kmeans_v2_->dim();
+        f.write(reinterpret_cast<const char*>(&K), sizeof(K));
+        f.write(reinterpret_cast<const char*>(&Dim), sizeof(Dim));
+        const auto& c = kmeans_v2_->centroids_data();
+        f.write(reinterpret_cast<const char*>(c.data()), c.size() * sizeof(float));
+    }
+    // PCA components + mean + eigenvalues
+    {
+        std::ofstream f(dir + "/v2_pca.bin", std::ios::binary);
+        uint32_t Dim = (uint32_t)pca_v2_->in_dim();
+        uint32_t Top = (uint32_t)pca_v2_->out_dim();
+        f.write(reinterpret_cast<const char*>(&Dim), sizeof(Dim));
+        f.write(reinterpret_cast<const char*>(&Top), sizeof(Top));
+        const auto& comp = pca_v2_->components();
+        const auto& mean = pca_v2_->mean();
+        const auto& eig  = pca_v2_->eigenvalues();
+        f.write(reinterpret_cast<const char*>(comp.data()), comp.size() * sizeof(float));
+        f.write(reinterpret_cast<const char*>(mean.data()), mean.size() * sizeof(float));
+        f.write(reinterpret_cast<const char*>(eig.data()),  eig.size()  * sizeof(float));
+    }
+    // Tier-2 codebook
+    {
+        std::ofstream f(dir + "/v2_codebook.bin", std::ios::binary);
+        f.write(reinterpret_cast<const char*>(tier2_codebook_.data()),
+                tier2_codebook_.size() * sizeof(float));
+    }
+}
+
+void NGTAQIndex::loadV2(const std::string& dir) {
+    graph_->loadV2Records(dir + "/v2_records.bin");
+    // SRHT
+    {
+        std::ifstream f(dir + "/v2_srht.bin", std::ios::binary);
+        uint32_t Dsz; f.read(reinterpret_cast<char*>(&Dsz), sizeof(Dsz));
+        std::vector<float> diag(Dsz);
+        f.read(reinterpret_cast<char*>(diag.data()), Dsz * sizeof(float));
+        srht_v2_ = std::make_unique<NGT::NGTAQ::SRHT>((int)Dsz, 0);
+        srht_v2_->deserialize(diag);
+    }
+    // K-means
+    {
+        std::ifstream f(dir + "/v2_kmeans.bin", std::ios::binary);
+        uint32_t K, Dim;
+        f.read(reinterpret_cast<char*>(&K), sizeof(K));
+        f.read(reinterpret_cast<char*>(&Dim), sizeof(Dim));
+        kmeans_v2_ = std::make_unique<NGT::NGTAQ::KMeansCentering>(K, (int)Dim, 0);
+        std::vector<float> c((size_t)K * Dim);
+        f.read(reinterpret_cast<char*>(c.data()), c.size() * sizeof(float));
+        kmeans_v2_->set_centroids(std::move(c));
+    }
+    // PCA
+    {
+        std::ifstream f(dir + "/v2_pca.bin", std::ios::binary);
+        uint32_t Dim, Top;
+        f.read(reinterpret_cast<char*>(&Dim), sizeof(Dim));
+        f.read(reinterpret_cast<char*>(&Top), sizeof(Top));
+        pca_v2_ = std::make_unique<NGT::NGTAQ::PCAProjector>((int)Dim, (int)Top, 0);
+        std::vector<float> comp((size_t)Top*Dim), mean(Dim), eig(Top);
+        f.read(reinterpret_cast<char*>(comp.data()), comp.size() * sizeof(float));
+        f.read(reinterpret_cast<char*>(mean.data()), mean.size() * sizeof(float));
+        f.read(reinterpret_cast<char*>(eig.data()),  eig.size()  * sizeof(float));
+        pca_v2_->set_state(std::move(comp), std::move(mean), std::move(eig));
+    }
+    // Tier-2 codebook
+    {
+        std::ifstream f(dir + "/v2_codebook.bin", std::ios::binary);
+        tier2_codebook_.resize(16 * 32);
+        f.read(reinterpret_cast<char*>(tier2_codebook_.data()),
+               tier2_codebook_.size() * sizeof(float));
+    }
+    is_v2_ = true;
 }
 
 } // namespace NGTAQ
