@@ -211,12 +211,18 @@ class BinaryQuantizer {
     is.read(reinterpret_cast<char*>(&dim_),   sizeof(dim_));
     is.read(reinterpret_cast<char*>(&tau_),   sizeof(tau_));
     is.read(reinterpret_cast<char*>(&sigma_), sizeof(sigma_));
+    if (!is) throw std::runtime_error("BinaryQuantizer::deserialize: stream error");
     words_ = dim_ / 64;
     uint32_t rot_size = 0;
     is.read(reinterpret_cast<char*>(&rot_size), sizeof(rot_size));
     rotation_.resize(rot_size);
     if (rot_size > 0)
       is.read(reinterpret_cast<char*>(rotation_.data()), rot_size * sizeof(float));
+    if (!is) {
+      rotation_.clear();
+      dim_ = 0; words_ = 0; tau_ = 0.0f; sigma_ = 1.0f; rotation_dim_ = 0;
+      throw std::runtime_error("BinaryQuantizer::deserialize: stream error");
+    }
     rotation_dim_ = dim_;
   }
 

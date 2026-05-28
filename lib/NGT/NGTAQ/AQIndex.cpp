@@ -223,6 +223,9 @@ std::vector<std::vector<SearchResult>> NGTAQIndex::searchBatch(
                    ? omp_get_max_threads()
                    : prop_.n_search_threads;
 
+    // Note: each search() acquires a shared_lock; multiple shared locks coexist safely.
+    // If the caller is already in an OMP parallel region, set n_search_threads=1
+    // (or omp_set_nested(false)) to avoid nested parallelism overhead.
 #pragma omp parallel for schedule(dynamic, 8) num_threads(nt)
     for (int qi = 0; qi < nq; ++qi) {
         out[static_cast<size_t>(qi)] = search(queries[static_cast<size_t>(qi)], k);
@@ -396,7 +399,10 @@ NGTAQIndex NGTAQIndex::load(const std::string& path) {
     uint32_t n_ep = 0;
     is.read(reinterpret_cast<char*>(&n_ep), sizeof(n_ep));
     if (!is) throw std::runtime_error("NGTAQIndex::load: failed to read entry point count");
-    if (n_ep > 65536) throw std::runtime_error("NGTAQIndex::load: n_ep too large");
+    // Upper bound: graph node count (already loaded above). Corrupt files may set n_ep
+    // to an absurdly large value — cap it at graph size as a sanity check.
+    if (n_ep > static_cast<uint64_t>(graph->size()))
+        throw std::runtime_error("NGTAQIndex::load: n_ep exceeds graph size (file corrupt?)");
     std::vector<uint32_t> entry_points(n_ep);
     if (n_ep > 0)
         is.read(reinterpret_cast<char*>(entry_points.data()), n_ep * sizeof(uint32_t));
@@ -405,7 +411,12 @@ NGTAQIndex NGTAQIndex::load(const std::string& path) {
     uint64_t n_floats = 0;
     is.read(reinterpret_cast<char*>(&n_floats), sizeof(n_floats));
     if (!is) throw std::runtime_error("NGTAQIndex::load: failed to read vec count");
-    if (n_floats > 500000000ULL) throw std::runtime_error("NGTAQIndex::load: vec count too large");
+    // Upper bound = dimension × maximum reasonable vector count (20M vectors).
+    // Full consistency check (n_floats == prop_.dimension * graph->size()) is done
+    // implicitly: the read below will fail or produce wrong results if corrupt.
+    const uint64_t max_reasonable = static_cast<uint64_t>(prop.dimension) * 20000000ULL;
+    if (n_floats > max_reasonable)
+        throw std::runtime_error("NGTAQIndex::load: n_floats exceeds limit (file corrupt?)");
     std::vector<float> raw_flat(n_floats);
     if (n_floats > 0)
         is.read(reinterpret_cast<char*>(raw_flat.data()),

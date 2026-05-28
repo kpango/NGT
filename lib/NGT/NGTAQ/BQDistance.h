@@ -62,6 +62,8 @@ inline float bqDistance(const uint64_t* __restrict__ p,
 // ---------------------------------------------------------------------------
 // AVX2 path — deinterleave with unpacklo/hi_epi64, then scalar popcount.
 // Processes 4 logical words (8 uint64_t) per iteration.
+// AVX2 path: also activated when NGT_AVX512 is set but __AVX512VPOPCNTDQ__ is unavailable
+// (i.e. CPU has AVX-512 base but not the population-count extension).
 // ---------------------------------------------------------------------------
 #elif defined(NGT_AVX512) || defined(NGT_AVX2)
 

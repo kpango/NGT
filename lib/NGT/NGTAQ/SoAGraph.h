@@ -81,6 +81,10 @@ public:
 
     // Replace neighbor list for node_id. Adjusts all subsequent offsets.
     // Thread-unsafe: caller must hold exclusive lock.
+    //
+    // NOTE: This is O(N) per call (shifts all offsets_). Use resetEdges() + finalizeCSR()
+    // for bulk construction. Incremental inserts calling setNeighbors() per node are O(N²)
+    // in total — acceptable for small graphs, avoid for N > 10k.
     void setNeighbors(uint32_t node_id, std::vector<uint32_t> neighbors) {
         assert(static_cast<size_t>(node_id) + 1 < offsets_.size() && "call finalizeCSR() before setNeighbors()");
         uint32_t begin = offsets_[node_id];
