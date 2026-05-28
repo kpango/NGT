@@ -11,13 +11,13 @@
 
 namespace NGTAQ {
 
-// Three-array SoA graph with CSR edge lists, tombstone-based deletion, and epoch rebuild.
+// SoA graph with CSR edge lists, tombstone-based deletion, and epoch rebuild.
 //
 // Layout:
-//   bq_sign_[node_id * words_ + w]  — sign plane word w for node node_id
-//   bq_mag_[node_id * words_ + w]   — magnitude plane word w for node node_id
+//   bq_data_[node_id * 2 * words_ + i*2]   — sign-plane word i for node node_id
+//   bq_data_[node_id * 2 * words_ + i*2+1] — magnitude-plane word i for node node_id
 //   offsets_[node_id]..offsets_[node_id+1] — range in edge_ids_ for node node_id's neighbors
-//   state_[node_id]                 — ACTIVE or TOMBSTONE
+//   state_[node_id]                         — ACTIVE or TOMBSTONE
 //
 // Usage:
 //   1. addNode() for each node (accumulates offsets_ sentinel per node)
@@ -43,13 +43,13 @@ public:
     explicit SoAGraph(int words) : words_(words) {}
 
     // Add a new node. Returns assigned node ID.
+    // bq must point to 2*words_ uint64_t in interleaved layout:
+    //   bq[i*2] = sign word i, bq[i*2+1] = mag word i
     // Thread-unsafe: caller must hold exclusive lock.
-    uint32_t addNode(const uint64_t* sign, const uint64_t* mag) {
+    uint32_t addNode(const uint64_t* bq) {
         uint32_t id = static_cast<uint32_t>(state_.size());
         state_.push_back(ACTIVE);
-        bq_sign_.insert(bq_sign_.end(), sign, sign + words_);
-        bq_mag_.insert(bq_mag_.end(),   mag,  mag  + words_);
-        // Push start offset for this node (edge_ids_ is empty initially)
+        bq_data_.insert(bq_data_.end(), bq, bq + words_ * 2);
         offsets_.push_back(static_cast<uint32_t>(edge_ids_.size()));
         return id;
     }
@@ -62,7 +62,7 @@ public:
     }
 
     // Rebuild all edge data from a full adjacency list in O(N·k).
-    // Replaces edge_ids_ and offsets_ entirely; state_/bq_sign_/bq_mag_ unchanged.
+    // Replaces edge_ids_ and offsets_ entirely; state_/bq_data_ unchanged.
     // Thread-unsafe: caller must hold exclusive lock.
     void resetEdges(const std::vector<std::vector<uint32_t>>& adj) {
         assert(adj.size() == state_.size());
@@ -109,14 +109,11 @@ public:
         return {edge_ids_.data() + begin, end - begin};
     }
 
-    const uint64_t* getSignPlane(uint32_t node_id) const {
+    // Returns pointer to the interleaved BQ data for node_id.
+    // Layout: [s0, m0, s1, m1, ..., s_{words-1}, m_{words-1}]
+    const uint64_t* getNodeBQ(uint32_t node_id) const {
         assert(node_id < state_.size());
-        return bq_sign_.data() + static_cast<size_t>(node_id) * words_;
-    }
-
-    const uint64_t* getMagPlane(uint32_t node_id) const {
-        assert(node_id < state_.size());
-        return bq_mag_.data() + static_cast<size_t>(node_id) * words_;
+        return bq_data_.data() + static_cast<size_t>(node_id) * words_ * 2;
     }
 
     void removeNode(uint32_t node_id) {
@@ -149,17 +146,14 @@ public:
             if (state_[i] == ACTIVE) old_to_new[i] = new_id++;
 
         SoAGraph fresh(words_);
-        fresh.bq_sign_.reserve(static_cast<size_t>(new_id) * words_);
-        fresh.bq_mag_.reserve(static_cast<size_t>(new_id) * words_);
+        fresh.bq_data_.reserve(static_cast<size_t>(new_id) * words_ * 2);
         fresh.state_.reserve(new_id);
         fresh.offsets_.reserve(static_cast<size_t>(new_id) + 1);
 
         for (uint32_t i = 0; i < static_cast<uint32_t>(N); ++i) {
             if (state_[i] != ACTIVE) continue;
-            const uint64_t* s = getSignPlane(i);
-            const uint64_t* m = getMagPlane(i);
-            fresh.bq_sign_.insert(fresh.bq_sign_.end(), s, s + words_);
-            fresh.bq_mag_.insert(fresh.bq_mag_.end(),   m, m + words_);
+            const uint64_t* bq = getNodeBQ(i);
+            fresh.bq_data_.insert(fresh.bq_data_.end(), bq, bq + words_ * 2);
             fresh.state_.push_back(ACTIVE);
             fresh.offsets_.push_back(static_cast<uint32_t>(fresh.edge_ids_.size()));
 
@@ -177,8 +171,7 @@ public:
         state_    = std::move(fresh.state_);
         offsets_  = std::move(fresh.offsets_);
         edge_ids_ = std::move(fresh.edge_ids_);
-        bq_sign_  = std::move(fresh.bq_sign_);
-        bq_mag_   = std::move(fresh.bq_mag_);
+        bq_data_  = std::move(fresh.bq_data_);
     }
 
     // RW lock for external thread safety
@@ -195,8 +188,9 @@ public:
         os.write(reinterpret_cast<const char*>(state_.data()),    n * sizeof(State));
         os.write(reinterpret_cast<const char*>(offsets_.data()),  (n + 1) * sizeof(uint32_t));
         os.write(reinterpret_cast<const char*>(edge_ids_.data()), edges * sizeof(uint32_t));
-        os.write(reinterpret_cast<const char*>(bq_sign_.data()),  static_cast<size_t>(n) * words_ * sizeof(uint64_t));
-        os.write(reinterpret_cast<const char*>(bq_mag_.data()),   static_cast<size_t>(n) * words_ * sizeof(uint64_t));
+        // Interleaved bq_data_: n * 2 * words_ uint64_t
+        os.write(reinterpret_cast<const char*>(bq_data_.data()),
+                 static_cast<std::streamsize>(static_cast<size_t>(n) * words_ * 2 * sizeof(uint64_t)));
     }
 
     void deserialize(std::istream& is) {
@@ -209,17 +203,16 @@ public:
         state_.resize(n);
         offsets_.resize(static_cast<size_t>(n) + 1);
         edge_ids_.resize(edges);
-        bq_sign_.resize(static_cast<size_t>(n) * words_);
-        bq_mag_.resize(static_cast<size_t>(n) * words_);
+        bq_data_.resize(static_cast<size_t>(n) * words_ * 2);
         is.read(reinterpret_cast<char*>(state_.data()),    n * sizeof(State));
         is.read(reinterpret_cast<char*>(offsets_.data()),  (n + 1) * sizeof(uint32_t));
         is.read(reinterpret_cast<char*>(edge_ids_.data()), edges * sizeof(uint32_t));
-        is.read(reinterpret_cast<char*>(bq_sign_.data()),  static_cast<size_t>(n) * words_ * sizeof(uint64_t));
-        is.read(reinterpret_cast<char*>(bq_mag_.data()),   static_cast<size_t>(n) * words_ * sizeof(uint64_t));
+        is.read(reinterpret_cast<char*>(bq_data_.data()),
+                static_cast<std::streamsize>(static_cast<size_t>(n) * words_ * 2 * sizeof(uint64_t)));
         // Clear on stream failure to avoid partially-initialized state
         if (!is) {
             state_.clear(); offsets_.clear(); edge_ids_.clear();
-            bq_sign_.clear(); bq_mag_.clear();
+            bq_data_.clear();
             words_ = 0;
         }
     }
@@ -229,8 +222,7 @@ private:
     std::vector<State>    state_;
     std::vector<uint32_t> offsets_;    // CSR offsets [N+1], sentinel appended by finalizeCSR()
     std::vector<uint32_t> edge_ids_;   // CSR edge data
-    std::vector<uint64_t> bq_sign_;    // sign planes [N * words_]
-    std::vector<uint64_t> bq_mag_;     // magnitude planes [N * words_]
+    std::vector<uint64_t> bq_data_;    // interleaved BQ [N * 2 * words_]: [s0,m0,s1,m1,...]
     mutable std::shared_mutex mutex_;
 };
 
