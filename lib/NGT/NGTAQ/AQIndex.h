@@ -38,6 +38,14 @@ public:
     // Returns top-k results sorted by exact distance.
     std::vector<SearchResult> search(const std::vector<float>& query, int k) const;
 
+    // Override search-time gamma gates and k_prime_factor (not thread-safe while search() is running).
+    // Used for recall-QPS sweep benchmarks.
+    void setSearchGammas(float gamma_enq, float gamma_term, float k_prime_factor = -1.0f) {
+        searcher_.gamma_enq      = gamma_enq;
+        searcher_.gamma_term     = gamma_term;
+        if (k_prime_factor > 0.0f) searcher_.k_prime_factor = k_prime_factor;
+    }
+
     // Batch search over multiple queries. Returns one result-vector per query.
     // Uses OpenMP with prop_.n_search_threads (0 = all available threads).
     std::vector<std::vector<SearchResult>> searchBatch(
