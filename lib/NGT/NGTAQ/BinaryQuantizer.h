@@ -111,23 +111,24 @@ class BinaryQuantizer {
   float tau()   const { return tau_; }
   float sigma() const { return sigma_; }
 
-  // Encode a raw float vector into BQ signature.
-  // Input:  raw float vector of length dim_ (L2-normalized and PCA-rotated internally).
-  // Output: sign plane and magnitude plane, each `words_` uint64_t words.
-  void encode(const float* raw, uint64_t* out_sign, uint64_t* out_mag) const {
+  // Encode a raw float vector into BQ signature (interleaved layout).
+  // Input:  raw float vector of length dim_.
+  // Output: out_bq must point to 2*words_ uint64_t.
+  //         out_bq[i*2]   = sign-plane word i
+  //         out_bq[i*2+1] = magnitude-plane word i
+  void encode(const float* raw, uint64_t* out_bq) const {
     thread_local std::vector<float> rotated;
     rotated.resize(dim_);
     applyNormalizeAndRotate(raw, rotated.data());
 
     const float tau_raw = tau_ * sigma_;
-    std::memset(out_sign, 0, static_cast<size_t>(words_) * sizeof(uint64_t));
-    std::memset(out_mag,  0, static_cast<size_t>(words_) * sizeof(uint64_t));
+    std::memset(out_bq, 0, static_cast<size_t>(words_) * 2 * sizeof(uint64_t));
     for (int i = 0; i < dim_; i++) {
       float x = rotated[i];
       if (x < 0.0f)
-        out_sign[i / 64] |= (uint64_t(1) << (i % 64));
+        out_bq[i / 64 * 2]     |= (uint64_t(1) << (i % 64));  // sign word
       if (std::abs(x) > tau_raw)
-        out_mag[i / 64]  |= (uint64_t(1) << (i % 64));
+        out_bq[i / 64 * 2 + 1] |= (uint64_t(1) << (i % 64));  // mag word
     }
   }
 
@@ -172,19 +173,18 @@ class BinaryQuantizer {
     std::vector<float> errors;
     errors.reserve(n_sample_pairs);
 
-    std::vector<uint64_t> signP(words_), magP(words_);
-    std::vector<uint64_t> signQ(words_), magQ(words_);
+    std::vector<uint64_t> bqP(static_cast<size_t>(words_) * 2);
+    std::vector<uint64_t> bqQ(static_cast<size_t>(words_) * 2);
 
     for (int s = 0; s < n_sample_pairs; s++) {
       int i = pick(rng);
       int j = pick(rng);
       if (i == j) j = (j + 1) % static_cast<int>(vecs.size());
 
-      encode(vecs[i], signP.data(), magP.data());
-      encode(vecs[j], signQ.data(), magQ.data());
+      encode(vecs[i], bqP.data());
+      encode(vecs[j], bqQ.data());
 
-      float delta_bq   = bqDistance(
-          signP.data(), magP.data(), signQ.data(), magQ.data(), words_, dim_);
+      float delta_bq   = bqDistance(bqP.data(), bqQ.data(), words_, dim_);
       float delta_true = computeNormalizedDistance(vecs[i], vecs[j], dim_, metric);
 
       errors.push_back(std::abs(delta_bq - delta_true));

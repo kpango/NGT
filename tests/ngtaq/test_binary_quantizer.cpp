@@ -35,40 +35,39 @@ std::vector<std::vector<float>> randomUnitVectors(int N, int D, uint32_t seed = 
 }
 
 void testEncodeDecodeDimension() {
-    // Encoded BQ signature must have correct number of words
+    // Encoded BQ buffer must have words*2 entries (interleaved sign+mag)
     const int D = 128;
     NGTAQ::BinaryQuantizer bq;
     bq.init(D);
     auto vecs = randomUnitVectors(10, D);
-    // Set identity rotation (no rotation)
     bq.setIdentityRotation();
 
-    std::vector<uint64_t> sign(bq.words()), mag(bq.words());
-    bq.encode(vecs[0].data(), sign.data(), mag.data());
-    EXPECT_TRUE(static_cast<int>(sign.size()) == bq.words());
-    EXPECT_TRUE(static_cast<int>(mag.size())  == bq.words());
+    std::vector<uint64_t> bq_buf(bq.words() * 2);
+    bq.encode(vecs[0].data(), bq_buf.data());
+    EXPECT_TRUE(static_cast<int>(bq_buf.size()) == bq.words() * 2);
 }
 
 void testSignBitCorrectness() {
     // With identity rotation, sign plane bit i = (vec[i] < 0) ? 1 : 0
+    // In interleaved layout: sign word 0 = bq_buf[0], mag word 0 = bq_buf[1]
     const int D = 64;
     NGTAQ::BinaryQuantizer bq;
     bq.init(D);
     bq.setIdentityRotation();
-    bq.setTau(0.5f);  // tau = 0.5 (normalized), magnitude bit for |x| > 0.5
+    bq.setTau(0.5f);
 
     std::vector<float> v(D, 0.0f);
     v[0] = -1.0f; // bit 0 of sign plane should be 1
     v[1] =  1.0f; // bit 1 of sign plane should be 0
-    // Normalize
     float norm = std::sqrt(2.0f);
     for (auto& x : v) x /= norm;
 
-    std::vector<uint64_t> sign(bq.words()), mag(bq.words());
-    bq.encode(v.data(), sign.data(), mag.data());
+    // words=1 for D=64: bq_buf[0]=sign_word0, bq_buf[1]=mag_word0
+    std::vector<uint64_t> bq_buf(bq.words() * 2);
+    bq.encode(v.data(), bq_buf.data());
 
-    bool bit0 = (sign[0] >> 0) & 1;  // should be 1 (negative)
-    bool bit1 = (sign[0] >> 1) & 1;  // should be 0 (positive)
+    bool bit0 = (bq_buf[0] >> 0) & 1;  // sign word 0, bit 0 — should be 1 (negative)
+    bool bit1 = (bq_buf[0] >> 1) & 1;  // sign word 0, bit 1 — should be 0 (positive)
     EXPECT_TRUE(bit0 == true);
     EXPECT_TRUE(bit1 == false);
 }
@@ -81,7 +80,6 @@ void testTauCalibration() {
     bq.setIdentityRotation();
 
     auto vecs = randomUnitVectors(1000, D, 123);
-    // Flatten for calibration
     std::vector<const float*> ptrs;
     for (auto& v : vecs) ptrs.push_back(v.data());
 
@@ -100,11 +98,10 @@ void testSelfDistanceIsZero() {
     bq.setTau(0.1f);
 
     auto vecs = randomUnitVectors(5, D, 7);
-    std::vector<uint64_t> sign(bq.words()), mag(bq.words());
-    bq.encode(vecs[0].data(), sign.data(), mag.data());
+    std::vector<uint64_t> bq_buf(bq.words() * 2);
+    bq.encode(vecs[0].data(), bq_buf.data());
 
-    float dist = NGTAQ::bqDistance(
-        sign.data(), mag.data(), sign.data(), mag.data(), bq.words(), D);
+    float dist = NGTAQ::bqDistance(bq_buf.data(), bq_buf.data(), bq.words(), D);
     EXPECT_NEAR(dist, 0.0f, 1e-6f);
 }
 
