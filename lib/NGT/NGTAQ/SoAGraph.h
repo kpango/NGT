@@ -241,6 +241,18 @@ public:
         return v2_records_[node_id];
     }
 
+    // Prefetch helpers: issue non-blocking cache hints to hide DRAM latency.
+    // Call PREFETCH_DIST iterations ahead of the actual access.
+    // locality 3=L1, 2=L2, 1=L3, 0=nontemporal
+    void prefetchRecord(uint32_t node_id) const {
+        if (node_id < v2_records_.size())
+            __builtin_prefetch(&v2_records_[node_id], 0, 3);
+    }
+    void prefetchNeighbors(uint32_t node_id) const {
+        if (static_cast<size_t>(node_id) + 1 < offsets_.size())
+            __builtin_prefetch(edge_ids_.data() + offsets_[node_id], 0, 2);
+    }
+
     bool hasV2Records() const { return !v2_records_.empty(); }
 
     void saveV2Records(const std::string& path) const {

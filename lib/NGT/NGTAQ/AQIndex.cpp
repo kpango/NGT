@@ -15,7 +15,7 @@
 #include <random>
 #include <shared_mutex>
 #include <stdexcept>
-#include <unordered_set>
+// unordered_set removed: visited tracking uses flat bitvector (see searchV2)
 
 namespace NGTAQ {
 
@@ -693,10 +693,49 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
     for (int d = 0; d < D; ++d) q_norm_sq += q_res[d] * q_res[d];
     adc.q_norm_sq = q_norm_sq;
     adc.q_norm = std::sqrt(q_norm_sq);
-    NGT::NGTAQ::build_tier1_query(q_res.data(), D, adc.q_int8);
+    adc.q_sum = NGT::NGTAQ::build_tier1_query(q_res.data(), D, adc.q_int8);
 
     std::shared_lock<std::shared_mutex> lock(graph_->mutex());
     const size_t N = graph_->size();
+
+    // Lazy-build cluster inverted list + precomputed cluster neighbors (once per index lifetime).
+    // Done under shared_lock (N stable). call_once provides thread-safe one-shot semantics.
+    std::call_once(*cluster_members_once_, [this, N]() {
+        const uint32_t K = kmeans_v2_->num_clusters();
+        const int Dim    = prop_.dimension;
+
+        // 1. Build inverted list: cluster_id → [node_ids]
+        cluster_members_v2_.resize(K);
+        for (size_t i = 0; i < N; ++i) {
+            if (graph_->isTombstone(static_cast<uint32_t>(i))) continue;
+            uint32_t cid = graph_->getRecord(static_cast<uint32_t>(i)).centroid_id;
+            if (cid < K)
+                cluster_members_v2_[cid].push_back(static_cast<uint32_t>(i));
+        }
+
+        // 2. Precompute top-N_EXTRA_CLUSTERS nearest clusters for each cluster.
+        // Cost: K² × D scalar ops (K=1000, D=128 → 128M ops, ~15ms) — one-time amortized.
+        constexpr int CLUSTER_NBRS = 2;
+        cluster_neighbors_v2_.resize(K);
+        using CD = std::pair<float, uint32_t>;
+        std::vector<CD> dists;
+        dists.reserve(K);
+        for (uint32_t c = 0; c < K; ++c) {
+            const float* cc = kmeans_v2_->centroid(c);
+            dists.clear();
+            for (uint32_t c2 = 0; c2 < K; ++c2) {
+                if (c2 == c) continue;
+                const float* cc2 = kmeans_v2_->centroid(c2);
+                float d2 = NGT::NGTAQ::KMeansCentering::l2sq(cc, cc2, Dim);
+                dists.push_back({d2, c2});
+            }
+            int take = std::min((int)dists.size(), CLUSTER_NBRS);
+            std::partial_sort(dists.begin(), dists.begin() + take, dists.end());
+            cluster_neighbors_v2_[c].resize(static_cast<size_t>(take));
+            for (int i = 0; i < take; ++i)
+                cluster_neighbors_v2_[c][i] = dists[i].second;
+        }
+    });
 
     // 4. DABS search with tier-1 asymmetric ADC + lazy centroid rebuild
     // RaBitQ formula: dist ≈ q_norm_sq + norm_x² - 2*q_norm*norm_x*sqrt(π/2)*t1/(127*sqrt(D))
@@ -706,13 +745,21 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
     std::priority_queue<float> dk_tracker;
     std::vector<std::pair<float, uint32_t>> results;
     results.reserve(static_cast<size_t>(k));
-    std::unordered_set<uint32_t> visited;
-    visited.reserve(entry_points_.size() * 16);
+    // Flat bitvector for visited tracking: N=1M → 15,625 uint64_t = 125KB (fits in L2)
+    // thread_local avoids heap allocation after first query on each thread
+    static thread_local std::vector<uint64_t> t_vis;
+    t_vis.assign((N + 63) / 64, 0ULL);
+    auto is_visited = [&](uint32_t id) -> bool {
+        return (t_vis[id >> 6] >> (id & 63)) & 1ULL;
+    };
+    auto mark_visited = [&](uint32_t id) {
+        t_vis[id >> 6] |= 1ULL << (id & 63);
+    };
     float d_k = std::numeric_limits<float>::infinity();
 
     // Asymmetric RaBitQ tier-1 distance
     auto adc_dist = [&](const NGT::NGTAQ::VectorRecord& rec) -> float {
-        float t1 = NGT::NGTAQ::tier1_adc_fast(adc.q_int8, rec.tier1);
+        float t1 = NGT::NGTAQ::tier1_adc_fast(adc.q_int8, rec.tier1, adc.q_sum);
         float norm_x = NGT::NGTAQ::fp16_to_float(rec.norm_fp16);
         return adc.q_norm_sq + norm_x*norm_x
                - 2.f * adc.q_norm * norm_x * NGT::NGTAQ::RABITQ_SCALE
@@ -728,18 +775,58 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
         for (int d2 = 0; d2 < D; ++d2) q_norm_sq += q_res[d2]*q_res[d2];
         adc.q_norm_sq = q_norm_sq;
         adc.q_norm = std::sqrt(q_norm_sq);
-        NGT::NGTAQ::build_tier1_query(q_res.data(), D, adc.q_int8);
+        adc.q_sum = NGT::NGTAQ::build_tier1_query(q_res.data(), D, adc.q_int8);
     };
 
-    // Seed with entry points
-    for (uint32_t ep : entry_points_) {
-        if (ep >= N || graph_->isTombstone(ep)) continue;
-        if (visited.count(ep)) continue;
-        visited.insert(ep);
-        const auto& rec = graph_->getRecord(ep);
-        maybe_rebuild_adc(rec.centroid_id);
-        float d = adc_dist(rec);
-        cand_q.push({d, ep});
+    // Cluster-aware seeding: use members of the query's nearest cluster as entry points.
+    // This places the search start close to where the true neighbors are, typically
+    // requiring fewer hops to converge → better recall at same gamma_term → higher QPS.
+    // N_CLUSTER_SEEDS controls the breadth; 32 is a good default for K≈1000, N=1M.
+    constexpr int N_CLUSTER_SEEDS = 32;
+    // Neighboring clusters seeded via precomputed cluster_neighbors_v2_ (built in call_once)
+    {
+        // Gather seed IDs from the nearest cluster(s)
+        std::vector<uint32_t> seeds;
+        seeds.reserve(static_cast<size_t>(N_CLUSTER_SEEDS * 4)); // primary + up to 3 neighbor clusters
+
+        // Primary cluster
+        if (active_cid < cluster_members_v2_.size()) {
+            const auto& primary = cluster_members_v2_[active_cid];
+            const size_t take = std::min(primary.size(),
+                                         static_cast<size_t>(N_CLUSTER_SEEDS));
+            for (size_t i = 0; i < take; ++i) seeds.push_back(primary[i]);
+        }
+
+        // Expand to neighboring clusters using precomputed cluster neighbor table (O(1)).
+        // cluster_neighbors_v2_[active_cid] gives the nearest CLUSTER_NBRS clusters,
+        // precomputed offline during call_once — zero per-query centroid scan overhead.
+        if (active_cid < cluster_neighbors_v2_.size()) {
+            for (uint32_t cid2 : cluster_neighbors_v2_[active_cid]) {
+                if (cid2 >= cluster_members_v2_.size()) continue;
+                const auto& nbr_members = cluster_members_v2_[cid2];
+                const size_t take = std::min(nbr_members.size(),
+                                              static_cast<size_t>(N_CLUSTER_SEEDS));
+                for (size_t i = 0; i < take; ++i) seeds.push_back(nbr_members[i]);
+            }
+        }
+
+        // Fall back to static entry points if cluster membership is empty
+        if (seeds.empty()) {
+            for (uint32_t ep : entry_points_) seeds.push_back(ep);
+        }
+
+        // Prefetch all seed records, then evaluate
+        for (uint32_t ep : seeds)
+            if (ep < N) graph_->prefetchRecord(ep);
+        for (uint32_t ep : seeds) {
+            if (ep >= N || graph_->isTombstone(ep)) continue;
+            if (is_visited(ep)) continue;
+            mark_visited(ep);
+            const auto& rec = graph_->getRecord(ep);
+            maybe_rebuild_adc(rec.centroid_id);
+            float d = adc_dist(rec);
+            cand_q.push({d, ep});
+        }
     }
 
     while (!cand_q.empty()) {
@@ -747,6 +834,15 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
 
         if (dk_tracker.size() >= static_cast<size_t>(k) &&
             dist_x > (1.f + gamma_term) * d_k) break;
+
+        // Prefetch next-popped node's data while we process current node
+        if (!cand_q.empty()) {
+            uint32_t nxt = cand_q.top().second;
+            graph_->prefetchRecord(nxt);
+            graph_->prefetchNeighbors(nxt);
+        }
+        // Prefetch current node's neighbor list (hides CSR access latency)
+        graph_->prefetchNeighbors(x);
 
         const auto& rec_x = graph_->getRecord(x);
         maybe_rebuild_adc(rec_x.centroid_id);
@@ -766,11 +862,21 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
         }
 
         auto neighbors = graph_->getNeighbors(x);
-        for (size_t ni = 0; ni < neighbors.size(); ++ni) {
+        const size_t n_nbrs = neighbors.size();
+        // Prime prefetch pipeline: issue record loads for first few neighbors
+        constexpr size_t PFDIST = 4;
+        for (size_t pf = 0; pf < std::min(PFDIST, n_nbrs); ++pf)
+            graph_->prefetchRecord(neighbors[pf]);
+
+        for (size_t ni = 0; ni < n_nbrs; ++ni) {
+            // Prefetch record PFDIST steps ahead to overlap DRAM latency with computation
+            if (ni + PFDIST < n_nbrs)
+                graph_->prefetchRecord(neighbors[ni + PFDIST]);
+
             uint32_t u = neighbors[ni];
             if (u >= N || graph_->isTombstone(u)) continue;
-            if (visited.count(u)) continue;
-            visited.insert(u);
+            if (is_visited(u)) continue;
+            mark_visited(u);
             const auto& rec_u = graph_->getRecord(u);
             maybe_rebuild_adc(rec_u.centroid_id);
             float d_u = adc_dist(rec_u);
@@ -778,9 +884,12 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
         }
     }
 
-    // Exact-distance refinement on results: rerank top k*5 by approx distance
+    // Exact-distance refinement: rerank top k*20 by approx distance.
+    // k*5 is too conservative — ADC sign-bit ranking is noisy enough that true
+    // neighbors often land in positions 51-200. Larger pool costs ~15µs extra
+    // but avoids false misses from coarse approximation ordering.
     std::sort(results.begin(), results.end());
-    const size_t refine_n = static_cast<size_t>(k * 5);
+    const size_t refine_n = static_cast<size_t>(k * 20);
     if (results.size() > refine_n) results.resize(refine_n);
 
     std::vector<SearchResult> final_results;
@@ -788,12 +897,13 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
     for (auto& [approx_d, id] : results) {
         if (static_cast<size_t>(id) * D + D > raw_flat_.size()) continue;
         const float* vec = raw_flat_.data() + static_cast<size_t>(id) * D;
-        float exact = 0.f;
-        for (int j = 0; j < D; ++j) {
-            float diff = query[j] - vec[j];
-            exact += diff * diff;
-        }
-        final_results.push_back({id, std::sqrt(exact), approx_d});
+#if defined(__AVX2__)
+        float exact_sq = NGT::NGTAQ::l2_sq_avx2(query.data(), vec, D);
+#else
+        float exact_sq = 0.f;
+        for (int j = 0; j < D; ++j) { float d = query[j] - vec[j]; exact_sq += d*d; }
+#endif
+        final_results.push_back({id, std::sqrt(exact_sq), approx_d});
     }
     std::sort(final_results.begin(), final_results.end(),
         [](const SearchResult& a, const SearchResult& b) {

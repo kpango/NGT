@@ -10,22 +10,27 @@ struct ADCQueryState {
     int8_t  q_int8[128];        // unit query residual as int8 (scaled by 127)
     float   q_norm_sq;          // ||query - centroid||^2
     float   q_norm;             // sqrt(q_norm_sq) — needed for RaBitQ formula
+    int32_t q_sum;              // sum(q_int8[i]) — precomputed for AVX2 masked-sum formula
     int8_t  tier2_lut[16][16];  // kept for structural compat, not used in hot path
 };
 
 // Build tier-1 query: store proportional int8 of unit residual vector (asymmetric ADC)
 // q_int8[i] ≈ 127 * q_res[i] / ||q_res||
-// This enables proper RaBitQ asymmetric estimate:
-//   <q_res, x_res> ≈ ||x_res|| * sqrt(π/2) * sum_i q_int8[i]*sign(x_i) / (127*sqrt(D))
-inline void build_tier1_query(const float* residual, int D, int8_t* q_int8) {
+// Returns sum(q_int8[i]) for use with AVX2 formula: t1 = 2*sum_pos - q_sum
+// RaBitQ: <q_res, x_res> ≈ ||x_res|| * sqrt(π/2) * sum_i q_int8[i]*sign(x_i) / (127*sqrt(D))
+inline int32_t build_tier1_query(const float* residual, int D, int8_t* q_int8) {
     float norm_sq = 0.f;
     for (int i = 0; i < D; ++i) norm_sq += residual[i] * residual[i];
     float scale = (norm_sq > 1e-10f) ? 127.f / sqrtf(norm_sq) : 0.f;
+    int32_t qsum = 0;
     for (int i = 0; i < D; ++i) {
         float v = residual[i] * scale;
         int vi = (int)(v + (v >= 0.f ? 0.5f : -0.5f));
-        q_int8[i] = (int8_t)(vi < -127 ? -127 : vi > 127 ? 127 : vi);
+        int8_t qv = (int8_t)(vi < -127 ? -127 : vi > 127 ? 127 : vi);
+        q_int8[i] = qv;
+        qsum += qv;
     }
+    return qsum;
 }
 
 // Build tier-2 LUT from float PCA-projected query (32 dims)

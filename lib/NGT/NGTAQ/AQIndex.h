@@ -14,6 +14,7 @@
 
 #include <fstream>
 #include <memory>
+#include <mutex>
 #include <shared_mutex>
 #include <string>
 #include <vector>
@@ -111,6 +112,12 @@ private:
     std::unique_ptr<NGT::NGTAQ::PCAProjector> pca_v2_;
     std::vector<float>                        tier2_codebook_; // [16][32] = 512 floats
     std::vector<uint32_t>                     v2_entry_points_;
+
+    // Lazy-built inverted list + cluster neighbor table for cluster-aware seeding.
+    // Built once on first searchV2 call; unique_ptr keeps NGTAQIndex movable (once_flag is non-movable).
+    mutable std::unique_ptr<std::once_flag>    cluster_members_once_{std::make_unique<std::once_flag>()};
+    mutable std::vector<std::vector<uint32_t>> cluster_members_v2_;  // cluster_id → [node_ids]
+    mutable std::vector<std::vector<uint32_t>> cluster_neighbors_v2_; // cluster_id → [nearest cluster_ids]
 
     // Private constructor used by fromNGT() and load().
     NGTAQIndex(Property prop, BinaryQuantizer bq,

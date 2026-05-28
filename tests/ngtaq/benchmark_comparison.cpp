@@ -297,7 +297,7 @@ static std::vector<BenchRow> sweepNGTAQv2(
     const std::vector<std::vector<int32_t>>& gt,
     int k)
 {
-    static const float GAMMA_TERMS[] = {0.1f, 0.2f, 0.3f, 0.5f, 0.7f, 1.0f};
+    static const float GAMMA_TERMS[] = {0.10f, 0.12f, 0.14f, 0.16f, 0.18f, 0.20f, 0.30f, 0.50f, 0.70f, 1.00f};
     const size_t nq = queries.size();
     std::vector<BenchRow> rows;
 
