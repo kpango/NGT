@@ -18,6 +18,11 @@ foreach(TEST_SRC
     benchmark_sift1m
     build_ngt_sift1m
     benchmark_comparison
+    test_vector_record
+    test_srht
+    test_kmeans
+    test_pca
+    test_adc_distance
 )
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${TEST_SRC}.cpp")
         add_executable(${TEST_SRC} ${TEST_SRC}.cpp)

@@ -687,20 +687,20 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
     std::vector<float> q_res(D);
     kmeans_v2_->get_residual(q_rot.data(), active_cid, q_res.data());
 
-    // 3. Build initial ADC state
+    // 3. Build initial ADC state (tier-1 asymmetric only)
     NGT::NGTAQ::ADCQueryState adc = {};
-    NGT::NGTAQ::build_tier1_query(q_res.data(), D, adc.q_int8);
     float q_norm_sq = 0.f;
     for (int d = 0; d < D; ++d) q_norm_sq += q_res[d] * q_res[d];
     adc.q_norm_sq = q_norm_sq;
-    float pca_proj[32];
-    pca_v2_->project(q_res.data(), pca_proj);
-    NGT::NGTAQ::build_tier2_lut(pca_proj, tier2_codebook_.data(), adc.tier2_lut);
+    adc.q_norm = std::sqrt(q_norm_sq);
+    NGT::NGTAQ::build_tier1_query(q_res.data(), D, adc.q_int8);
 
     std::shared_lock<std::shared_mutex> lock(graph_->mutex());
     const size_t N = graph_->size();
 
-    // 4. DABS search with ADC distances + lazy centroid rebuild
+    // 4. DABS search with tier-1 asymmetric ADC + lazy centroid rebuild
+    // RaBitQ formula: dist ≈ q_norm_sq + norm_x² - 2*q_norm*norm_x*sqrt(π/2)*t1/(127*sqrt(D))
+    const float scale_127 = 1.f / 127.f;
     using Entry = std::pair<float, uint32_t>;
     std::priority_queue<Entry, std::vector<Entry>, std::greater<Entry>> cand_q;
     std::priority_queue<float> dk_tracker;
@@ -710,23 +710,25 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
     visited.reserve(entry_points_.size() * 16);
     float d_k = std::numeric_limits<float>::infinity();
 
+    // Asymmetric RaBitQ tier-1 distance
     auto adc_dist = [&](const NGT::NGTAQ::VectorRecord& rec) -> float {
-        float t2 = NGT::NGTAQ::tier2_adc_fast(adc.tier2_lut, rec.tier2);
+        float t1 = NGT::NGTAQ::tier1_adc_fast(adc.q_int8, rec.tier1);
         float norm_x = NGT::NGTAQ::fp16_to_float(rec.norm_fp16);
         return adc.q_norm_sq + norm_x*norm_x
-               - 2.f * norm_x * NGT::NGTAQ::RABITQ_SCALE * t2 * inv_sqrt_D;
+               - 2.f * adc.q_norm * norm_x * NGT::NGTAQ::RABITQ_SCALE
+                 * t1 * scale_127 * inv_sqrt_D;
     };
 
+    // Rebuild ADC tables when visiting a node from a different cluster
     auto maybe_rebuild_adc = [&](uint32_t cid) {
         if (cid == active_cid) return;
         active_cid = cid;
         kmeans_v2_->get_residual(q_rot.data(), active_cid, q_res.data());
-        NGT::NGTAQ::build_tier1_query(q_res.data(), D, adc.q_int8);
         q_norm_sq = 0.f;
         for (int d2 = 0; d2 < D; ++d2) q_norm_sq += q_res[d2]*q_res[d2];
         adc.q_norm_sq = q_norm_sq;
-        pca_v2_->project(q_res.data(), pca_proj);
-        NGT::NGTAQ::build_tier2_lut(pca_proj, tier2_codebook_.data(), adc.tier2_lut);
+        adc.q_norm = std::sqrt(q_norm_sq);
+        NGT::NGTAQ::build_tier1_query(q_res.data(), D, adc.q_int8);
     };
 
     // Seed with entry points
@@ -749,25 +751,18 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
         const auto& rec_x = graph_->getRecord(x);
         maybe_rebuild_adc(rec_x.centroid_id);
 
-        // Tier-1 pre-filter gate; tier-2 refinement
-        float t1 = NGT::NGTAQ::tier1_adc_fast(adc.q_int8, rec_x.tier1);
-        float norm_x = NGT::NGTAQ::fp16_to_float(rec_x.norm_fp16);
-        float dist_t1 = adc.q_norm_sq + norm_x*norm_x
-                       - 2.f * norm_x * NGT::NGTAQ::RABITQ_SCALE * t1 * inv_sqrt_D;
-        bool skip_t2 = (dk_tracker.size() >= static_cast<size_t>(k) &&
-                        dist_t1 > (1.f + gamma_enq * 1.5f) * d_k);
-        if (!skip_t2) {
-            float d_t2 = adc_dist(rec_x);
-            if (dk_tracker.size() < static_cast<size_t>(k) || d_t2 < d_k) {
-                results.push_back({d_t2, x});
-                dk_tracker.push(d_t2);
-                if (static_cast<int>(dk_tracker.size()) > k) {
-                    dk_tracker.pop();
-                    d_k = dk_tracker.top();
-                } else if (static_cast<int>(dk_tracker.size()) == k) {
-                    d_k = dk_tracker.top();
-                }
-            }
+        // Tier-1 asymmetric ADC distance
+        float d_approx = adc_dist(rec_x);
+
+        // Add ALL popped candidates to results for exact reranking.
+        // We only use d_k for ROUTING termination, not for result filtering.
+        results.push_back({d_approx, x});
+        dk_tracker.push(d_approx);
+        if (static_cast<int>(dk_tracker.size()) > k) {
+            dk_tracker.pop();
+            d_k = dk_tracker.top();
+        } else if (static_cast<int>(dk_tracker.size()) == k) {
+            d_k = dk_tracker.top();
         }
 
         auto neighbors = graph_->getNeighbors(x);
@@ -783,9 +778,10 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
         }
     }
 
-    // Exact-distance refinement on results
+    // Exact-distance refinement on results: rerank top k*5 by approx distance
     std::sort(results.begin(), results.end());
-    if (static_cast<int>(results.size()) > k * 2) results.resize(static_cast<size_t>(k * 2));
+    const size_t refine_n = static_cast<size_t>(k * 5);
+    if (results.size() > refine_n) results.resize(refine_n);
 
     std::vector<SearchResult> final_results;
     final_results.reserve(results.size());

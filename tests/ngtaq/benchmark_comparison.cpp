@@ -12,7 +12,9 @@
 // SIFT-1M ground truth IDs are 0-indexed.
 // NGTAQ returns 0-indexed IDs. QBG returns 1-indexed IDs (subtract 1 before GT lookup).
 #include "NGT/NGTAQ/AQIndex.h"
+#ifndef NGT_QBG_DISABLED
 #include "NGT/NGTQ/QuantizedBlobGraph.h"
+#endif
 #include "fvecs_io.h"
 
 #include <algorithm>
@@ -215,6 +217,7 @@ static void sweepNGTAQKprime(
 // --------------------------------------------------------------------------
 // QBG recall-QPS sweep over graphExplorationSize values
 // --------------------------------------------------------------------------
+#ifndef NGT_QBG_DISABLED
 static std::vector<BenchRow> sweepQBG(
     QBG::Index& qbg,
     const std::vector<std::vector<float>>& queries,
@@ -283,6 +286,61 @@ static std::vector<BenchRow> sweepQBG(
     }
     return rows;
 }
+#endif // NGT_QBG_DISABLED
+
+// --------------------------------------------------------------------------
+// sweepNGTAQv2: gamma_term sweep for NGTAQv2 (ADC search)
+// --------------------------------------------------------------------------
+static std::vector<BenchRow> sweepNGTAQv2(
+    NGTAQ::NGTAQIndex& idx,
+    const std::vector<std::vector<float>>& queries,
+    const std::vector<std::vector<int32_t>>& gt,
+    int k)
+{
+    static const float GAMMA_TERMS[] = {0.1f, 0.2f, 0.3f, 0.5f, 0.7f, 1.0f};
+    const size_t nq = queries.size();
+    std::vector<BenchRow> rows;
+
+    for (float gt_val : GAMMA_TERMS) {
+        std::vector<double> lats(nq);
+        double total_recall = 0.0;
+
+        for (size_t i = 0; i < nq; ++i) {
+            const auto t0 = std::chrono::high_resolution_clock::now();
+            auto res = idx.searchV2(queries[i], k, 0.2f, gt_val);
+            const auto t1 = std::chrono::high_resolution_clock::now();
+            lats[i] = std::chrono::duration<double, std::micro>(t1 - t0).count();
+
+            std::vector<uint32_t> ids;
+            ids.reserve(res.size());
+            for (auto& r : res) ids.push_back(r.id);
+            total_recall += computeRecall(ids, gt[i], k);
+        }
+
+        double total_us = std::accumulate(lats.begin(), lats.end(), 0.0);
+        std::sort(lats.begin(), lats.end());
+
+        BenchRow row;
+        {
+            std::ostringstream oss;
+            oss << std::fixed << std::setprecision(3) << gt_val;
+            row.param_label = oss.str();
+        }
+        row.param_val = gt_val;
+        row.recall    = total_recall / static_cast<double>(nq);
+        row.qps       = static_cast<double>(nq) / (total_us / 1e6);
+        row.p50_us    = pct(lats, 50.0);
+        row.p99_us    = pct(lats, 99.0);
+        rows.push_back(row);
+
+        std::cout << "  NGTAQv2 gamma_term=" << std::fixed << std::setprecision(3) << gt_val
+                  << "  recall=" << std::setprecision(4) << row.recall
+                  << "  QPS=" << std::setprecision(0) << row.qps << "\n";
+        std::cout.flush();
+    }
+
+    return rows;
+}
 
 // --------------------------------------------------------------------------
 // Find the BenchRow closest to a target recall
@@ -323,7 +381,9 @@ int main(int argc, char** argv) {
     const std::string gt_path    = argv[4];
     const int k          = (argc > 5) ? std::stoi(argv[5]) : 10;
     const std::string ngtaq_cache = (argc > 6) ? argv[6] : "";
+#ifndef NGT_QBG_DISABLED
     const std::string qbg_dir     = (argc > 7) ? argv[7] : "/tmp/qbg_bench";
+#endif
 
     // ---- Load shared data ----
     std::cout << "[Load] base vectors: " << base_path << "\n"; std::cout.flush();
@@ -347,6 +407,7 @@ int main(int argc, char** argv) {
     std::cout << "  " << nq << " queries  k=" << k << "\n\n";
 
     // ==================== QBG ====================
+#ifndef NGT_QBG_DISABLED
     std::cout << "========================================\n";
     std::cout << " QBG Index: " << qbg_dir << "\n";
     std::cout << "========================================\n";
@@ -437,6 +498,7 @@ int main(int argc, char** argv) {
     std::cout << "[QBG] Opening prebuilt index...\n"; std::cout.flush();
     QBG::Index qbg(qbg_dir, true);
     std::cout << "[QBG] Ready.\n\n";
+#endif // NGT_QBG_DISABLED
 
     // ==================== NGTAQ ====================
     std::cout << "========================================\n";
@@ -487,6 +549,46 @@ int main(int argc, char** argv) {
     }();
     std::cout << "\n";
 
+    // ==================== NGTAQv2 ====================
+    const std::string v2_cache = ngtaq_cache.empty() ? std::string("") : ngtaq_cache + "_v2";
+    NGTAQ::NGTAQIndex aq_v2 = [&]() -> NGTAQ::NGTAQIndex {
+        if (!v2_cache.empty()) {
+            std::ifstream probe(v2_cache + "/v2_records.bin");
+            if (probe.good()) {
+                probe.close();
+                std::cout << "[NGTAQv2] Loading cache: " << v2_cache << "\n"; std::cout.flush();
+                try {
+                    auto idx = NGTAQ::NGTAQIndex::load(v2_cache + "/aqindex");
+                    idx.loadV2(v2_cache);
+                    std::cout << "[NGTAQv2] Loaded.\n"; std::cout.flush();
+                    return idx;
+                } catch (const std::exception& e) {
+                    std::cerr << "[NGTAQv2] Cache load failed (" << e.what() << "), rebuilding...\n";
+                }
+            }
+        }
+        std::cout << "[NGTAQv2] Building from NGT: " << ngt_path << " ...\n"; std::cout.flush();
+        NGTAQ::NGTAQIndex::Property v2_prop;
+        v2_prop.dimension = D;
+        const auto t0 = std::chrono::steady_clock::now();
+        auto idx = NGTAQ::NGTAQIndex::fromNGTv2(ngt_path, v2_prop);
+        const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::steady_clock::now() - t0).count();
+        std::cout << "[NGTAQv2] Built in " << elapsed << "s\n"; std::cout.flush();
+        if (!v2_cache.empty()) {
+            try {
+                std::filesystem::create_directories(v2_cache);
+                idx.save(v2_cache + "/aqindex");
+                idx.saveV2(v2_cache);
+                std::cout << "[NGTAQv2] Saved to cache: " << v2_cache << "\n"; std::cout.flush();
+            } catch (const std::exception& e) {
+                std::cerr << "[NGTAQv2] Save failed: " << e.what() << "\n";
+            }
+        }
+        return idx;
+    }();
+    std::cout << "\n";
+
     // ==================== Sweeps ====================
     // Diagnostic: k_prime_factor sweep to distinguish BQ quality vs graph bottleneck
     sweepNGTAQKprime(aq, queries, ground_truth, k);
@@ -494,8 +596,13 @@ int main(int argc, char** argv) {
     std::cout << "\n=== NGTAQ sweep (gamma_term) ===\n"; std::cout.flush();
     auto ngtaq_rows = sweepNGTAQ(aq, queries, ground_truth, k);
 
+    std::cout << "\n=== NGTAQv2 sweep (gamma_term) ===\n"; std::cout.flush();
+    auto v2_rows = sweepNGTAQv2(aq_v2, queries, ground_truth, k);
+
+#ifndef NGT_QBG_DISABLED
     std::cout << "\n=== QBG sweep (graphExplorationSize) ===\n"; std::cout.flush();
     auto qbg_rows = sweepQBG(qbg, queries, ground_truth, k);
+#endif
 
     // ==================== Summary ====================
     std::cout << "\n\n";
@@ -505,12 +612,15 @@ int main(int argc, char** argv) {
     std::cout << "================================================================\n";
 
     printTable("--- NGTAQ (AQ-DABS Binary Quantization) ---", "gamma_term", ngtaq_rows, k);
+    printTable("--- NGTAQv2 (ADC Quantization) ---",          "gamma_term", v2_rows,    k);
+#ifndef NGT_QBG_DISABLED
     printTable("--- QBG (Quantized Blob Graph, PQ4) ---",     "graphExp",   qbg_rows,   k);
+#endif
 
     // Find crossover near recall = 0.90
     std::cout << "\n--- Comparison at recall ~0.90 ---\n" << std::fixed;
-    const auto* n90 = nearest(ngtaq_rows, 0.90);
-    const auto* q90 = nearest(qbg_rows,   0.90);
+    const auto* n90  = nearest(ngtaq_rows, 0.90);
+    const auto* v290 = nearest(v2_rows,    0.90);
     if (n90) {
         std::cout << "  NGTAQ (gamma_term=" << std::setprecision(3) << n90->param_val << "):"
                   << "  recall=" << std::setprecision(4) << n90->recall
@@ -518,6 +628,25 @@ int main(int argc, char** argv) {
                   << "  P50="    << std::setprecision(1) << n90->p50_us << "us"
                   << "  P99="    << n90->p99_us << "us\n";
     }
+    if (v290) {
+        std::cout << "  NGTAQv2 (gamma_term=" << std::setprecision(3) << v290->param_val << "):"
+                  << "  recall=" << std::setprecision(4) << v290->recall
+                  << "  QPS="    << std::setprecision(0) << v290->qps
+                  << "  P50="    << std::setprecision(1) << v290->p50_us << "us"
+                  << "  P99="    << v290->p99_us << "us\n";
+    }
+    if (n90 && v290 && v290->qps > 0 && n90->qps > 0) {
+        const double ratio = v290->qps / n90->qps;
+        std::cout << "  NGTAQv2 vs NGTAQ at recall~0.90: ";
+        if (ratio > 1.05)
+            std::cout << "NGTAQv2 is " << std::setprecision(2) << ratio << "x faster\n";
+        else if (ratio < 0.95)
+            std::cout << "NGTAQ is " << std::setprecision(2) << (1.0/ratio) << "x faster\n";
+        else
+            std::cout << "Roughly equivalent (" << std::setprecision(2) << ratio << "x)\n";
+    }
+#ifndef NGT_QBG_DISABLED
+    const auto* q90  = nearest(qbg_rows,   0.90);
     if (q90) {
         std::cout << "  QBG (graphExp=" << static_cast<size_t>(q90->param_val) << "):"
                   << "  recall=" << std::setprecision(4) << q90->recall
@@ -527,7 +656,7 @@ int main(int argc, char** argv) {
     }
     if (n90 && q90 && q90->qps > 0) {
         const double ratio = n90->qps / q90->qps;
-        std::cout << "  At recall~0.90: ";
+        std::cout << "  NGTAQ vs QBG at recall~0.90: ";
         if (ratio > 1.05)
             std::cout << "NGTAQ is " << std::setprecision(2) << ratio << "x faster\n";
         else if (ratio < 0.95)
@@ -535,6 +664,17 @@ int main(int argc, char** argv) {
         else
             std::cout << "Roughly equivalent (" << std::setprecision(2) << ratio << "x)\n";
     }
+    if (v290 && q90 && q90->qps > 0) {
+        const double ratio = v290->qps / q90->qps;
+        std::cout << "  NGTAQv2 vs QBG at recall~0.90: ";
+        if (ratio > 1.05)
+            std::cout << "NGTAQv2 is " << std::setprecision(2) << ratio << "x faster\n";
+        else if (ratio < 0.95)
+            std::cout << "QBG is " << std::setprecision(2) << (1.0/ratio) << "x faster than NGTAQv2\n";
+        else
+            std::cout << "Roughly equivalent (" << std::setprecision(2) << ratio << "x)\n";
+    }
+#endif // NGT_QBG_DISABLED
 
     return 0;
 }
