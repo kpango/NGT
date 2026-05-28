@@ -310,7 +310,7 @@ int main(int argc, char** argv) {
         std::cout << "[QBG] Creating index skeleton (D=" << D
                   << ", dimensionOfSubvector=2)...\n";
         std::cout.flush();
-        std::filesystem::create_directories(qbg_dir);
+        // QBG::Index::create() creates the directory itself — do NOT mkdir first.
         try {
             QBG::Index::create(qbg_dir, bp);
         } catch (const std::exception& e) {
@@ -332,19 +332,47 @@ int main(int argc, char** argv) {
             qbg.save();
         }
 
-        // Build (phases 1-3: hierarchical clustering, optimization, blob graph)
-        std::cout << "[QBG] Building (phases 1-3; may take 15-60 min for 1M vecs)...\n";
+        // Build phase 1/3: hierarchical k-means clustering → creates ws/hkc_* files
+        std::cout << "[QBG] Phase 1/3: Hierarchical K-means clustering (may take ~10 min)...\n";
         std::cout.flush();
         const auto t0 = std::chrono::steady_clock::now();
         try {
+            QBG::HierarchicalKmeans hkm(bp);
+            hkm.clustering(qbg_dir);
+        } catch (const std::exception& e) {
+            std::cerr << "QBG Phase 1 (clustering) failed: " << e.what() << "\n";
+            return 1;
+        }
+        std::cout << "[QBG] Phase 1 done in "
+                  << std::chrono::duration_cast<std::chrono::seconds>(
+                         std::chrono::steady_clock::now() - t0).count()
+                  << "s\n"; std::cout.flush();
+
+        // Build phase 2/3: PQ codebook rotation optimization → creates rotation/codebook files
+        std::cout << "[QBG] Phase 2/3: Optimizer...\n"; std::cout.flush();
+        try {
+            QBG::Optimizer opt(bp);
+            opt.optimize(qbg_dir, 0 /*all available threads*/);
+        } catch (const std::exception& e) {
+            std::cerr << "QBG Phase 2 (optimizer) failed: " << e.what() << "\n";
+            return 1;
+        }
+        std::cout << "[QBG] Phase 2 done (total "
+                  << std::chrono::duration_cast<std::chrono::seconds>(
+                         std::chrono::steady_clock::now() - t0).count()
+                  << "s)\n"; std::cout.flush();
+
+        // Build phase 3/3: load workspace files + build NGTQ + build QBG blob graph
+        std::cout << "[QBG] Phase 3/3: Build blob graph...\n"; std::cout.flush();
+        try {
             QBG::Index::build(qbg_dir, /*verbose=*/false);
         } catch (const std::exception& e) {
-            std::cerr << "QBG build failed: " << e.what() << "\n";
+            std::cerr << "QBG Phase 3 (build) failed: " << e.what() << "\n";
             return 1;
         }
         const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
             std::chrono::steady_clock::now() - t0).count();
-        std::cout << "[QBG] Build done in " << elapsed << "s\n\n";
+        std::cout << "[QBG] Build complete in " << elapsed << "s\n\n";
         std::cout.flush();
     } else {
         std::cout << "[QBG] Reusing prebuilt index.\n\n";
