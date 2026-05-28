@@ -1,12 +1,16 @@
 // lib/NGT/NGTAQ/SoAGraph.h
 #pragma once
 
+#include "NGT/NGTAQ/VectorRecord.h"
 #include <algorithm>
 #include <cassert>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <iostream>
 #include <shared_mutex>
+#include <stdexcept>
+#include <string>
 #include <vector>
 
 namespace NGTAQ {
@@ -221,6 +225,45 @@ public:
         }
     }
 
+    // ---- v2 VectorRecord storage (optional, empty if not built) ----
+
+    void reserveV2(size_t n) {
+        v2_records_.resize(n);
+    }
+
+    void setRecord(uint32_t node_id, const NGT::NGTAQ::VectorRecord& rec) {
+        if (static_cast<size_t>(node_id) >= v2_records_.size())
+            v2_records_.resize(node_id + 1);
+        v2_records_[node_id] = rec;
+    }
+
+    const NGT::NGTAQ::VectorRecord& getRecord(uint32_t node_id) const {
+        return v2_records_[node_id];
+    }
+
+    bool hasV2Records() const { return !v2_records_.empty(); }
+
+    void saveV2Records(const std::string& path) const {
+        FILE* f = fopen(path.c_str(), "wb");
+        if (!f) throw std::runtime_error("SoAGraph::saveV2Records: cannot open " + path);
+        uint64_t n = v2_records_.size();
+        fwrite(&n, sizeof(n), 1, f);
+        if (n > 0)
+            fwrite(v2_records_.data(), sizeof(NGT::NGTAQ::VectorRecord), n, f);
+        fclose(f);
+    }
+
+    void loadV2Records(const std::string& path) {
+        FILE* f = fopen(path.c_str(), "rb");
+        if (!f) throw std::runtime_error("SoAGraph::loadV2Records: cannot open " + path);
+        uint64_t n = 0;
+        fread(&n, sizeof(n), 1, f);
+        v2_records_.resize(n);
+        if (n > 0)
+            fread(v2_records_.data(), sizeof(NGT::NGTAQ::VectorRecord), n, f);
+        fclose(f);
+    }
+
 private:
     int                   words_;
     std::vector<State>    state_;
@@ -228,6 +271,7 @@ private:
     std::vector<uint32_t> edge_ids_;   // CSR edge data
     std::vector<uint64_t> bq_data_;    // interleaved BQ [N * 2 * words_]: [s0,m0,s1,m1,...]
     mutable std::shared_mutex mutex_;
+    std::vector<NGT::NGTAQ::VectorRecord> v2_records_;
 };
 
 } // namespace NGTAQ
