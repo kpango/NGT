@@ -3,7 +3,7 @@
 // DABS (Dual-Adaptive Beam Search) searcher for AQ-DABS.
 //
 // Algorithm:
-//   1. Encode query to BQ (caller's responsibility).
+//   1. Encode query to interleaved BQ buffer query_bq[words*2] (caller's responsibility).
 //   2. Initialize candidate min-heap with entry points.
 //   3. Pop closest unvisited x:
 //      - if k results found AND δ_BQ(q,x) > (1+γ_term)*d_k → TERMINATE
@@ -56,8 +56,7 @@ public:
     // Callers must hold at least a shared lock on graph.mutex() for the duration
     // of this call.
     std::vector<uint32_t> route(
-        const uint64_t* query_sign,
-        const uint64_t* query_mag,
+        const uint64_t* query_bq,
         int k,
         const SoAGraph& graph,
         const std::vector<uint32_t>& entry_points,
@@ -102,10 +101,7 @@ public:
             if (ep >= static_cast<uint32_t>(graph.size()) || graph.isTombstone(ep))
                 continue;
             if (visited.count(ep)) continue;
-            float d = bqDistance(
-                query_sign, query_mag,
-                graph.getSignPlane(ep), graph.getMagPlane(ep),
-                words, D);
+            float d = bqDistance(query_bq, graph.getNodeBQ(ep), words, D);
             if (stats) ++stats->bq_calls;
             cand_q.push({d, ep});
             visited.insert(ep);
@@ -133,18 +129,18 @@ public:
             }
 
             // Explore neighbors
-            // Prefetch sign+mag planes PREFETCH_DIST nodes ahead so the cache
+            // Prefetch interleaved BQ data PREFETCH_DIST nodes ahead so the cache
             // line arrives before bqDistance() needs it.  16 chosen for DDR4:
             // ~300-cycle miss / ~15-cycle bqDistance(D=128,AVX2) ≈ 20 ideal;
             // 16 is conservative to avoid over-prefetch on L3-resident graphs.
+            // D=128: sign+mag fit in 1 interleaved cache line (was 2 separate prefetches).
             auto neighbors = graph.getNeighbors(x);
             constexpr int PREFETCH_DIST = 16;
             for (size_t ni = 0; ni < neighbors.size(); ++ni) {
                 uint32_t u = neighbors[ni];
                 if (ni + PREFETCH_DIST < neighbors.size()) {
                     uint32_t nxt = neighbors[ni + PREFETCH_DIST];
-                    __builtin_prefetch(graph.getSignPlane(nxt), 0, 1);
-                    __builtin_prefetch(graph.getMagPlane(nxt),  0, 1);
+                    __builtin_prefetch(graph.getNodeBQ(nxt), 0, 1);
                 }
                 if (graph.isTombstone(u)) continue;
                 // Mark visited immediately to prevent redundant BQ distance
@@ -153,10 +149,7 @@ public:
                 if (visited.count(u)) continue;
                 visited.insert(u);
 
-                float d_qu = bqDistance(
-                    query_sign, query_mag,
-                    graph.getSignPlane(u), graph.getMagPlane(u),
-                    words, D);
+                float d_qu = bqDistance(query_bq, graph.getNodeBQ(u), words, D);
                 if (stats) ++stats->bq_calls;
 
                 // Enqueue gate: skip if clearly too far (only after k results found).

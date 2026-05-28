@@ -1,7 +1,6 @@
 // tests/ngtaq/test_dabs.cpp
 #include "NGT/NGTAQ/DABSSearcher.h"
 #include "NGT/NGTAQ/SoAGraph.h"
-#include "NGT/NGTAQ/BinaryQuantizer.h"
 #include <cassert>
 #include <iostream>
 #include <memory>
@@ -27,7 +26,12 @@ std::unique_ptr<NGTAQ::SoAGraph> buildFullyConnectedBQGraph(int N, int D) {
     for (int i = 0; i < N; i++) {
         for (auto& x : s) x = ud(rng);
         for (auto& x : m) x = ud(rng);
-        g.addNode(s.data(), m.data());
+        std::vector<uint64_t> bq(words * 2);
+        for (int w = 0; w < words; ++w) {
+            bq[w * 2]     = s[w];
+            bq[w * 2 + 1] = m[w];
+        }
+        g.addNode(bq.data());
     }
     g.finalizeCSR();
     // Connect each node to all others
@@ -47,11 +51,10 @@ void testRouteReturnsKResults() {
     searcher.gamma_enq  = 0.15f;
     searcher.gamma_term = 0.35f;
 
-    std::vector<uint64_t> query_sign(1, 0xAAAAAAAAAAAAAAAAULL);
-    std::vector<uint64_t> query_mag(1, 0xFFFFFFFFFFFFFFFFULL);
+    // words=1: interleaved query_bq = [sign_word_0, mag_word_0]
+    std::vector<uint64_t> query_bq = {0xAAAAAAAAAAAAAAAAULL, 0xFFFFFFFFFFFFFFFFULL};
 
-    auto candidates = searcher.route(
-        query_sign.data(), query_mag.data(), k, *gp, {0} /* entry points */);
+    auto candidates = searcher.route(query_bq.data(), k, *gp, {0} /* entry points */);
 
     // Should return at least k candidates for refinement (k' = 2k)
     EXPECT_TRUE(candidates.size() >= static_cast<size_t>(k));
@@ -71,8 +74,8 @@ void testRouteNoDuplicates() {
     searcher.gamma_enq  = 0.1f;
     searcher.gamma_term = 0.3f;
 
-    std::vector<uint64_t> qs(1, 0), qm(1, 0xFFFFFFFFFFFFFFFFULL);
-    auto cands = searcher.route(qs.data(), qm.data(), k, *gp, {0});
+    std::vector<uint64_t> query_bq = {0ULL, 0xFFFFFFFFFFFFFFFFULL};
+    auto cands = searcher.route(query_bq.data(), k, *gp, {0});
 
     std::sort(cands.begin(), cands.end());
     auto uniq_end = std::unique(cands.begin(), cands.end());
@@ -92,8 +95,8 @@ void testColdStartExploresAll() {
         searcher.gamma_enq  = 1000.0f;
         searcher.gamma_term = 1000.0f;
 
-        std::vector<uint64_t> qs(1, 0), qm(1, 0xFFFFFFFFFFFFFFFFULL);
-        auto cands = searcher.route(qs.data(), qm.data(), k, *gp, {0});
+        std::vector<uint64_t> query_bq = {0ULL, 0xFFFFFFFFFFFFFFFFULL};
+        auto cands = searcher.route(query_bq.data(), k, *gp, {0});
 
         // All N=5 nodes fit in k_prime=6 slots; verify count and membership.
         EXPECT_EQ(cands.size(), static_cast<size_t>(N));
@@ -115,8 +118,8 @@ void testColdStartExploresAll() {
         searcher.gamma_enq  = 1000.0f;
         searcher.gamma_term = 1000.0f;
 
-        std::vector<uint64_t> qs(1, 0), qm(1, 0xFFFFFFFFFFFFFFFFULL);
-        auto cands = searcher.route(qs.data(), qm.data(), k, *gp, {0});
+        std::vector<uint64_t> query_bq = {0ULL, 0xFFFFFFFFFFFFFFFFULL};
+        auto cands = searcher.route(query_bq.data(), k, *gp, {0});
 
         // k_prime = 8, N = 20 → exactly k_prime results (cap applies)
         const int k_prime = k * 2;
@@ -143,10 +146,10 @@ void testRouteStatsCounters() {
     searcher.gamma_enq  = 1000.0f;
     searcher.gamma_term = 1000.0f;
 
-    std::vector<uint64_t> qs(1, 0), qm(1, 0xFFFFFFFFFFFFFFFFULL);
+    std::vector<uint64_t> query_bq = {0ULL, 0xFFFFFFFFFFFFFFFFULL};
 
     NGTAQ::RouteStats stats;
-    auto cands = searcher.route(qs.data(), qm.data(), k, *gp, {0}, &stats);
+    auto cands = searcher.route(query_bq.data(), k, *gp, {0}, &stats);
 
     // hop_count: popped from cand_q — at least 1 (entry point) up to N
     EXPECT_TRUE(stats.hop_count >= 1);
