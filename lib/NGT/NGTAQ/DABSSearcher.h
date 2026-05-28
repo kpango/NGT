@@ -133,8 +133,19 @@ public:
             }
 
             // Explore neighbors
+            // Prefetch sign+mag planes PREFETCH_DIST nodes ahead so the cache
+            // line arrives before bqDistance() needs it.  16 chosen for DDR4:
+            // ~300-cycle miss / ~15-cycle bqDistance(D=128,AVX2) ≈ 20 ideal;
+            // 16 is conservative to avoid over-prefetch on L3-resident graphs.
             auto neighbors = graph.getNeighbors(x);
-            for (uint32_t u : neighbors) {
+            constexpr int PREFETCH_DIST = 16;
+            for (size_t ni = 0; ni < neighbors.size(); ++ni) {
+                uint32_t u = neighbors[ni];
+                if (ni + PREFETCH_DIST < neighbors.size()) {
+                    uint32_t nxt = neighbors[ni + PREFETCH_DIST];
+                    __builtin_prefetch(graph.getSignPlane(nxt), 0, 1);
+                    __builtin_prefetch(graph.getMagPlane(nxt),  0, 1);
+                }
                 if (graph.isTombstone(u)) continue;
                 // Mark visited immediately to prevent redundant BQ distance
                 // computations when the same node appears as a neighbor of
