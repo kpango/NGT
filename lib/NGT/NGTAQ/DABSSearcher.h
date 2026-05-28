@@ -24,7 +24,7 @@
 #include <cstdint>
 #include <limits>
 #include <queue>
-#include <unordered_set>
+#include "NGT/NGTAQ/unordered_dense.h"
 #include <vector>
 
 namespace NGTAQ {
@@ -78,7 +78,7 @@ public:
         // result_q grows to k_prime, so result_q.top() tracks the k_prime-th best,
         // which is too loose for early termination gates.
         std::priority_queue<float> dk_tracker;
-        std::unordered_set<uint32_t> visited;
+        ankerl::unordered_dense::set<uint32_t> visited;
         visited.reserve(entry_points.size() * 16);  // reduce rehash for typical fan-out
 
         // d_k: true k-th best BQ distance; gates don't fire until k results found
