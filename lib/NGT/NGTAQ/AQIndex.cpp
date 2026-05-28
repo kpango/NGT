@@ -7,6 +7,7 @@
 #include <cmath>
 #include <limits>
 #include <mutex>
+#include <omp.h>
 #include <random>
 #include <shared_mutex>
 #include <stdexcept>
@@ -19,13 +20,13 @@ namespace NGTAQ {
 NGTAQIndex::NGTAQIndex(Property prop, BinaryQuantizer bq,
                        std::unique_ptr<SoAGraph> graph,
                        std::vector<uint32_t> eps,
-                       std::vector<std::vector<float>> raw_vecs)
+                       std::vector<float> raw_flat)
     : prop_(prop)
     , bq_(std::move(bq))
     , graph_(std::move(graph))
     , pruner_(prop.alpha, prop.kappa)
     , entry_points_(std::move(eps))
-    , raw_vecs_(std::move(raw_vecs))
+    , raw_flat_(std::move(raw_flat))
 {
     searcher_.gamma_enq      = prop_.gamma_enq;
     searcher_.gamma_term     = prop_.gamma_term;
@@ -41,69 +42,61 @@ NGTAQIndex NGTAQIndex::fromNGT(const std::string& ngt_path, const Property& prop
 
     NGT::Index ngt(ngt_path);
     NGT::ObjectSpace& objspace = ngt.getObjectSpace();
-    // NGT object IDs are 1-based; slot 0 is a null/dummy entry.
     const size_t repo_size = objspace.getRepository().size();
-    // Count valid (non-null) objects: IDs 1 .. repo_size-1
     const size_t N = repo_size - 1;
     const int D = prop.dimension;
     const int words = D / 64;
 
-    // Load all float vectors (NGT uses 1-based IDs)
-    std::vector<std::vector<float>> raw_vecs(N, std::vector<float>(D));
+    // Load all float vectors into flat array: raw_flat[i*D .. i*D+D-1] = vec i
+    std::vector<float> raw_flat(N * static_cast<size_t>(D), 0.0f);
     std::vector<bool> is_hole(N, false);
+    std::vector<float> tmp(D);
     for (size_t i = 1; i <= N; i++) {
         try {
-            objspace.getObject(static_cast<NGT::ObjectID>(i), raw_vecs[i - 1]);
+            objspace.getObject(static_cast<NGT::ObjectID>(i), tmp);
+            std::copy(tmp.begin(), tmp.end(), raw_flat.begin() + static_cast<ptrdiff_t>((i - 1) * D));
         } catch (...) {
-            // NGT may have holes (deleted objects); leave slot as zero-initialized.
-            raw_vecs[i - 1].assign(D, 0.0f);
             is_hole[i - 1] = true;
         }
     }
 
-    // Pre-normalize for cosine metric so that dot(q_norm, v_norm) == cosine sim.
+    // Pre-normalize for cosine metric
     if (prop.metric == NGT::ObjectSpace::DistanceTypeAngle ||
         prop.metric == NGT::ObjectSpace::DistanceTypeCosine) {
-        for (auto& v : raw_vecs) {
+        for (size_t i = 0; i < N; ++i) {
+            float* v = raw_flat.data() + i * D;
             float norm_sq = 0.0f;
-            for (float x : v) norm_sq += x * x;
+            for (int j = 0; j < D; ++j) norm_sq += v[j] * v[j];
             if (norm_sq > 0.0f) {
                 float inv_norm = 1.0f / std::sqrt(norm_sq);
-                for (float& x : v) x *= inv_norm;
+                for (int j = 0; j < D; ++j) v[j] *= inv_norm;
             }
         }
     }
 
-    // Random orthogonal rotation via Gram-Schmidt on a Gaussian random matrix.
-    // Mixes all dimensions so sign bits are informative even for non-negative
-    // inputs such as SIFT histograms (identity/diagonal rotations leave sign bits
-    // all-zero after L2 normalization, making BQ distance trivially 0).
     BinaryQuantizer bq;
     bq.init(D);
     bq.setRandomRotation();
 
-    // Calibrate tau (NO D param)
     std::vector<const float*> ptrs(N);
-    for (size_t i = 0; i < N; i++) ptrs[i] = raw_vecs[i].data();
+    for (size_t i = 0; i < N; i++) ptrs[i] = raw_flat.data() + i * D;
     bq.calibrateTau(ptrs, prop.n_tau_samples, prop.metric);
 
-    // Encode all vectors to BQ
+    // Encode all vectors and build SoAGraph
     auto graph = std::make_unique<SoAGraph>(words);
-    std::vector<uint64_t> sign_buf(words), mag_buf(words);
+    std::vector<uint64_t> bq_buf(static_cast<size_t>(words) * 2);
     for (size_t i = 0; i < N; i++) {
-        bq.encode(raw_vecs[i].data(), sign_buf.data(), mag_buf.data());
-        graph->addNode(sign_buf.data(), mag_buf.data());
+        bq.encode(raw_flat.data() + i * D, bq_buf.data());
+        graph->addNode(bq_buf.data());
     }
     graph->finalizeCSR();
 
-    // Tombstone ghost nodes (holes in the NGT object repository).
+    // Tombstone ghost nodes
     for (size_t i = 0; i < N; ++i) {
         if (is_hole[i]) graph->removeNode(static_cast<uint32_t>(i));
     }
 
-    // Build alpha-CG graph from NGT edges.
-    // Collect all pruned adjacency lists first, then call resetEdges() in one
-    // O(N·k) pass. Sequential setNeighbors() would be O(N²) due to CSR shifts.
+    // Build alpha-CG graph from NGT edges (O(N·k) via resetEdges)
     AlphaCGPruner pruner(prop.alpha, prop.kappa);
     const float tau = bq.tau();
     NGT::GraphIndex& gi = static_cast<NGT::GraphIndex&>(ngt.getIndex());
@@ -124,10 +117,7 @@ NGTAQIndex NGTAQIndex::fromNGT(const std::string& ngt_path, const Property& prop
         for (auto& edge : *node) {
             if (edge.id == 0 || edge.id > static_cast<unsigned int>(N)) continue;
             uint32_t nbr = static_cast<uint32_t>(edge.id - 1);
-            float d = bqDistance(
-                graph->getSignPlane(aq_id), graph->getMagPlane(aq_id),
-                graph->getSignPlane(nbr),   graph->getMagPlane(nbr),
-                words, D);
+            float d = bqDistance(graph->getNodeBQ(aq_id), graph->getNodeBQ(nbr), words, D);
             candidates.push_back({nbr, d});
         }
         std::sort(candidates.begin(), candidates.end(),
@@ -136,21 +126,17 @@ NGTAQIndex NGTAQIndex::fromNGT(const std::string& ngt_path, const Property& prop
             candidates.resize(static_cast<size_t>(prop.max_edges));
 
         auto dist_fn = [&](uint32_t v, uint32_t u) -> float {
-            return bqDistance(
-                graph->getSignPlane(v), graph->getMagPlane(v),
-                graph->getSignPlane(u), graph->getMagPlane(u),
-                words, D);
+            return bqDistance(graph->getNodeBQ(v), graph->getNodeBQ(u), words, D);
         };
         adj[aq_id] = pruner.prune(candidates, tau, dist_fn);
     }
     graph->resetEdges(adj);
 
-    // Select entry points
     int n_ep = std::min(prop.n_entry_points, static_cast<int>(N));
     auto entry_points = selectEntryPoints(*graph, n_ep);
 
     return NGTAQIndex(prop, std::move(bq), std::move(graph),
-                      std::move(entry_points), std::move(raw_vecs));
+                      std::move(entry_points), std::move(raw_flat));
 }
 
 // ---------------------------------------------------------------------------
@@ -164,24 +150,32 @@ std::vector<SearchResult> NGTAQIndex::search(
     const int D = prop_.dimension;
     const int words = D / 64;
 
-    // Encode query
-    std::vector<uint64_t> q_sign(words), q_mag(words);
-    bq_.encode(query.data(), q_sign.data(), q_mag.data());
+    // Encode query to interleaved BQ
+    std::vector<uint64_t> q_bq(static_cast<size_t>(words) * 2);
+    bq_.encode(query.data(), q_bq.data());
 
-    // Acquire shared lock once, covering both routing and refinement.
-    // insert() holds unique_lock when pushing to raw_vecs_, so shared_lock
-    // here prevents concurrent raw_vecs_ modification during refinement.
     std::shared_lock<std::shared_mutex> lock(graph_->mutex());
 
-    auto cand_ids = searcher_.route(q_sign.data(), q_mag.data(),
-                                    k, *graph_, entry_points_);
+    auto cand_ids = searcher_.route(q_bq.data(), k, *graph_, entry_points_);
 
-    // Refine with exact distances (raw_vecs_ is protected by the shared_lock above)
+    // Prefetch raw float vectors for refinement (PREFETCH_AHEAD=8 candidates)
+    constexpr int PREFETCH_AHEAD = 8;
+    const int n_cands = static_cast<int>(cand_ids.size());
+    for (int ci = 0; ci < n_cands; ++ci) {
+        if (ci + PREFETCH_AHEAD < n_cands) {
+            uint32_t nxt = cand_ids[static_cast<size_t>(ci + PREFETCH_AHEAD)];
+            if (nxt * static_cast<size_t>(D) < raw_flat_.size()) {
+                __builtin_prefetch(raw_flat_.data() + nxt * static_cast<size_t>(D), 0, 1);
+            }
+        }
+    }
+
+    // Exact-distance refinement
     std::vector<SearchResult> results;
     results.reserve(cand_ids.size());
     for (uint32_t id : cand_ids) {
-        if (id >= static_cast<uint32_t>(raw_vecs_.size())) continue;
-        const auto& vec = raw_vecs_[id];
+        if (static_cast<size_t>(id) * D + D > raw_flat_.size()) continue;
+        const float* vec = raw_flat_.data() + static_cast<size_t>(id) * D;
         float exact_dist = 0.0f;
         if (prop_.metric == NGT::ObjectSpace::DistanceTypeL2) {
             float sq = 0.0f;
@@ -191,7 +185,7 @@ std::vector<SearchResult> NGTAQIndex::search(
             }
             exact_dist = std::sqrt(sq);
         } else {
-            // Cosine: raw_vecs_ stores pre-normalized vectors; normalize query too.
+            // Cosine: raw_flat_ stores pre-normalized vectors; normalize query too.
             std::vector<float> qn(query.data(), query.data() + D);
             float norm_sq = 0.0f;
             for (float x : qn) norm_sq += x * x;
@@ -203,13 +197,10 @@ std::vector<SearchResult> NGTAQIndex::search(
             for (int j = 0; j < D; ++j) dot += qn[j] * vec[j];
             exact_dist = 1.0f - dot;
         }
-        float bq_dist = bqDistance(q_sign.data(), q_mag.data(),
-                                    graph_->getSignPlane(id), graph_->getMagPlane(id),
-                                    words, D);
+        float bq_dist = bqDistance(q_bq.data(), graph_->getNodeBQ(id), words, D);
         results.push_back({id, exact_dist, bq_dist});
     }
 
-    // Sort by exact distance, keep top-k
     std::sort(results.begin(), results.end(),
         [](const SearchResult& a, const SearchResult& b) {
             return a.distance < b.distance;
@@ -217,6 +208,26 @@ std::vector<SearchResult> NGTAQIndex::search(
     if (static_cast<int>(results.size()) > k)
         results.resize(static_cast<size_t>(k));
     return results;
+}
+
+// ---------------------------------------------------------------------------
+// searchBatch
+// ---------------------------------------------------------------------------
+std::vector<std::vector<SearchResult>> NGTAQIndex::searchBatch(
+    const std::vector<std::vector<float>>& queries, int k) const
+{
+    const int nq = static_cast<int>(queries.size());
+    std::vector<std::vector<SearchResult>> out(static_cast<size_t>(nq));
+
+    const int nt = (prop_.n_search_threads <= 0)
+                   ? omp_get_max_threads()
+                   : prop_.n_search_threads;
+
+#pragma omp parallel for schedule(dynamic, 8) num_threads(nt)
+    for (int qi = 0; qi < nq; ++qi) {
+        out[static_cast<size_t>(qi)] = search(queries[static_cast<size_t>(qi)], k);
+    }
+    return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -228,28 +239,30 @@ uint32_t NGTAQIndex::insert(const std::vector<float>& vec) {
     const int D = prop_.dimension;
     const int words = D / 64;
 
-    std::vector<uint64_t> sign(words), mag(words);
-    bq_.encode(vec.data(), sign.data(), mag.data());
+    std::vector<uint64_t> bq_buf(static_cast<size_t>(words) * 2);
+    bq_.encode(vec.data(), bq_buf.data());
 
     std::unique_lock<std::shared_mutex> lock(graph_->mutex());
-    uint32_t new_id = graph_->addNode(sign.data(), mag.data());
-    raw_vecs_.push_back(std::vector<float>(vec.begin(), vec.begin() + D));
+    uint32_t new_id = graph_->addNode(bq_buf.data());
+
+    // Append raw float vector to flat array
+    raw_flat_.insert(raw_flat_.end(), vec.begin(), vec.begin() + D);
+    // Normalize in-place for cosine metric
     if (prop_.metric == NGT::ObjectSpace::DistanceTypeAngle ||
         prop_.metric == NGT::ObjectSpace::DistanceTypeCosine) {
-        auto& v = raw_vecs_.back();
+        float* v = raw_flat_.data() + static_cast<size_t>(new_id) * D;
         float norm_sq = 0.0f;
-        for (float x : v) norm_sq += x * x;
+        for (int j = 0; j < D; ++j) norm_sq += v[j] * v[j];
         if (norm_sq > 0.0f) {
             float inv_norm = 1.0f / std::sqrt(norm_sq);
-            for (float& x : v) x *= inv_norm;
+            for (int j = 0; j < D; ++j) v[j] *= inv_norm;
         }
     }
 
     if (graph_->size() > 1) {
-        // finalizeCSR() to create the slot for new_id before routing/setNeighbors
         graph_->finalizeCSR();
 
-        auto cand_ids = searcher_.route(sign.data(), mag.data(),
+        auto cand_ids = searcher_.route(bq_buf.data(),
             std::min(prop_.max_edges, static_cast<int>(graph_->size()) - 1),
             *graph_, entry_points_);
 
@@ -257,25 +270,18 @@ uint32_t NGTAQIndex::insert(const std::vector<float>& vec) {
         candidates.reserve(cand_ids.size());
         for (uint32_t cid : cand_ids) {
             if (cid == new_id) continue;
-            float d = bqDistance(
-                graph_->getSignPlane(new_id), graph_->getMagPlane(new_id),
-                graph_->getSignPlane(cid),    graph_->getMagPlane(cid),
-                words, D);
+            float d = bqDistance(graph_->getNodeBQ(new_id), graph_->getNodeBQ(cid), words, D);
             candidates.push_back({cid, d});
         }
         std::sort(candidates.begin(), candidates.end(),
             [](const auto& a, const auto& b) { return a.second < b.second; });
 
         auto dist_fn = [&](uint32_t v, uint32_t u) -> float {
-            return bqDistance(
-                graph_->getSignPlane(v), graph_->getMagPlane(v),
-                graph_->getSignPlane(u), graph_->getMagPlane(u),
-                words, D);
+            return bqDistance(graph_->getNodeBQ(v), graph_->getNodeBQ(u), words, D);
         };
         auto pruned = pruner_.prune(candidates, bq_.tau(), dist_fn);
         graph_->setNeighbors(new_id, pruned);
     } else {
-        // Only one node: just finalize
         graph_->finalizeCSR();
     }
     return new_id;
@@ -295,33 +301,30 @@ void NGTAQIndex::remove(uint32_t id) {
 void NGTAQIndex::rebuild() {
     std::unique_lock<std::shared_mutex> lock(graph_->mutex());
 
-    // Compute old_to_new mapping from current tombstone state.
-    // SoAGraph::rebuild() applies the same logic internally.
-    // By holding the unique_lock throughout, both scans see identical state.
     const size_t N = graph_->size();
+    const int D = prop_.dimension;
     std::vector<uint32_t> old_to_new(N, static_cast<uint32_t>(-1));
     uint32_t next_id = 0;
     for (uint32_t i = 0; i < static_cast<uint32_t>(N); ++i) {
         if (!graph_->isTombstone(i)) old_to_new[i] = next_id++;
     }
 
-    // Reorder raw_vecs_ to match the post-rebuild node ordering.
-    std::vector<std::vector<float>> new_vecs(next_id);
+    // Reorder raw_flat_ to match post-rebuild node ordering
+    std::vector<float> new_flat(static_cast<size_t>(next_id) * D);
     for (uint32_t i = 0; i < static_cast<uint32_t>(N); ++i) {
-        if (old_to_new[i] != static_cast<uint32_t>(-1)) {
-            if (i < static_cast<uint32_t>(raw_vecs_.size())) {
-                new_vecs[old_to_new[i]] = std::move(raw_vecs_[i]);
-            }
+        if (old_to_new[i] == static_cast<uint32_t>(-1)) continue;
+        size_t src_off = static_cast<size_t>(i) * D;
+        size_t dst_off = static_cast<size_t>(old_to_new[i]) * D;
+        if (src_off + D <= raw_flat_.size()) {
+            std::copy(raw_flat_.begin() + static_cast<ptrdiff_t>(src_off),
+                      raw_flat_.begin() + static_cast<ptrdiff_t>(src_off + D),
+                      new_flat.begin() + static_cast<ptrdiff_t>(dst_off));
         }
     }
-    raw_vecs_ = std::move(new_vecs);
+    raw_flat_ = std::move(new_flat);
 
-    // SoAGraph::rebuild() compacts active nodes using the same isTombstone
-    // scan; since we hold the unique_lock, no concurrent modifications can
-    // cause the two mappings to diverge.
     graph_->rebuild();
 
-    // Re-select entry points after compaction.
     int n_ep = std::min(prop_.n_entry_points, static_cast<int>(graph_->size()));
     entry_points_ = selectEntryPoints(*graph_, n_ep);
 }
@@ -356,15 +359,13 @@ void NGTAQIndex::save(const std::string& path) const {
         os.write(reinterpret_cast<const char*>(entry_points_.data()),
                  n_ep * sizeof(uint32_t));
 
-    // 5. Raw vecs: uint64_t n_vecs, then for each: uint64_t dim + float array
-    uint64_t n_vecs = static_cast<uint64_t>(raw_vecs_.size());
-    os.write(reinterpret_cast<const char*>(&n_vecs), sizeof(n_vecs));
-    for (const auto& v : raw_vecs_) {
-        uint64_t dim = static_cast<uint64_t>(v.size());
-        os.write(reinterpret_cast<const char*>(&dim), sizeof(dim));
-        if (dim > 0)
-            os.write(reinterpret_cast<const char*>(v.data()), dim * sizeof(float));
-    }
+    // 5. Raw flat vectors: uint64_t n_floats, then float array
+    uint64_t n_floats = static_cast<uint64_t>(raw_flat_.size());
+    os.write(reinterpret_cast<const char*>(&n_floats), sizeof(n_floats));
+    if (n_floats > 0)
+        os.write(reinterpret_cast<const char*>(raw_flat_.data()),
+                 static_cast<std::streamsize>(n_floats * sizeof(float)));
+
     os.flush();
     if (!os) throw std::runtime_error("NGTAQIndex::save: write error on " + path);
 }
@@ -395,30 +396,26 @@ NGTAQIndex NGTAQIndex::load(const std::string& path) {
     uint32_t n_ep = 0;
     is.read(reinterpret_cast<char*>(&n_ep), sizeof(n_ep));
     if (!is) throw std::runtime_error("NGTAQIndex::load: failed to read entry point count");
-    if (n_ep > 65536) throw std::runtime_error("NGTAQIndex::load: n_ep too large, file may be corrupt");
+    if (n_ep > 65536) throw std::runtime_error("NGTAQIndex::load: n_ep too large");
     std::vector<uint32_t> entry_points(n_ep);
     if (n_ep > 0)
         is.read(reinterpret_cast<char*>(entry_points.data()), n_ep * sizeof(uint32_t));
 
-    // 5. Raw vecs
-    uint64_t n_vecs = 0;
-    is.read(reinterpret_cast<char*>(&n_vecs), sizeof(n_vecs));
+    // 5. Raw flat vectors
+    uint64_t n_floats = 0;
+    is.read(reinterpret_cast<char*>(&n_floats), sizeof(n_floats));
     if (!is) throw std::runtime_error("NGTAQIndex::load: failed to read vec count");
-    if (n_vecs > 100000000ULL) throw std::runtime_error("NGTAQIndex::load: vec count too large");
-    std::vector<std::vector<float>> raw_vecs(n_vecs);
-    for (uint64_t i = 0; i < n_vecs; ++i) {
-        uint64_t dim = 0;
-        is.read(reinterpret_cast<char*>(&dim), sizeof(dim));
-        raw_vecs[i].resize(dim);
-        if (dim > 0)
-            is.read(reinterpret_cast<char*>(raw_vecs[i].data()), dim * sizeof(float));
-    }
+    if (n_floats > 500000000ULL) throw std::runtime_error("NGTAQIndex::load: vec count too large");
+    std::vector<float> raw_flat(n_floats);
+    if (n_floats > 0)
+        is.read(reinterpret_cast<char*>(raw_flat.data()),
+                static_cast<std::streamsize>(n_floats * sizeof(float)));
 
     if (!is)
         throw std::runtime_error("NGTAQIndex::load: stream error reading " + path);
 
     return NGTAQIndex(prop, std::move(bq), std::move(graph),
-                      std::move(entry_points), std::move(raw_vecs));
+                      std::move(entry_points), std::move(raw_flat));
 }
 
 // ---------------------------------------------------------------------------
@@ -438,7 +435,6 @@ std::vector<uint32_t> NGTAQIndex::selectEntryPoints(
     std::vector<uint32_t> selected;
     selected.reserve(static_cast<size_t>(n));
 
-    // Find first active node
     for (int attempt = 0; attempt < 1000 && selected.empty(); ++attempt) {
         uint32_t c = pick(rng);
         if (!graph.isTombstone(c)) selected.push_back(c);
@@ -446,7 +442,6 @@ std::vector<uint32_t> NGTAQIndex::selectEntryPoints(
     if (selected.empty()) return {};
 
     while (static_cast<int>(selected.size()) < n) {
-        // Use activeCount so we don't waste all samples on tombstones.
         const int cand_size = std::min(200, static_cast<int>(graph.activeCount()));
         if (cand_size == 0) break;
         float best_min_dist = -1.0f;
@@ -464,10 +459,7 @@ std::vector<uint32_t> NGTAQIndex::selectEntryPoints(
 
             float min_d = std::numeric_limits<float>::infinity();
             for (uint32_t s : selected) {
-                float d = bqDistance(
-                    graph.getSignPlane(s), graph.getMagPlane(s),
-                    graph.getSignPlane(c), graph.getMagPlane(c),
-                    words, D);
+                float d = bqDistance(graph.getNodeBQ(s), graph.getNodeBQ(c), words, D);
                 if (d < min_d) min_d = d;
             }
             if (min_d > best_min_dist) {
