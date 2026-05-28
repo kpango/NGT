@@ -158,6 +158,61 @@ static std::vector<BenchRow> sweepNGTAQ(
 }
 
 // --------------------------------------------------------------------------
+// NGTAQ k_prime_factor sweep (fixed gamma) — diagnoses BQ vs graph quality
+// A rapidly saturating recall curve means the graph is the bottleneck.
+// A slowly increasing recall means BQ is too lossy.
+// --------------------------------------------------------------------------
+static void sweepNGTAQKprime(
+    NGTAQ::NGTAQIndex& aq,
+    const std::vector<std::vector<float>>& queries,
+    const std::vector<std::vector<int32_t>>& gt,
+    int k)
+{
+    static const float KPF_VALS[] = {2.f, 5.f, 10.f, 20.f, 50.f, 100.f};
+    const size_t nq = queries.size();
+
+    std::cout << "\n=== NGTAQ k_prime_factor sweep (gamma_term=0.50, k=" << k << ") ===\n";
+    std::cout << std::left  << std::setw(12) << "k_prime"
+              << std::right << std::setw(12) << ("recall@" + std::to_string(k))
+              << std::setw(12) << "candidates"
+              << std::setw(12) << "QPS" << "\n";
+    std::cout << std::string(48, '-') << "\n";
+
+    for (float kpf : KPF_VALS) {
+        aq.setSearchGammas(0.50f * 0.43f, 0.50f, kpf);  // gamma_term=0.50
+
+        double total_recall = 0.0;
+        double total_us = 0.0;
+
+        for (size_t i = 0; i < nq; ++i) {
+            const auto t0 = std::chrono::high_resolution_clock::now();
+            auto res = aq.search(queries[i], k);
+            const auto t1 = std::chrono::high_resolution_clock::now();
+            total_us += std::chrono::duration<double, std::micro>(t1 - t0).count();
+
+            std::vector<uint32_t> ids;
+            ids.reserve(res.size());
+            for (auto& r : res) ids.push_back(r.id);
+            total_recall += computeRecall(ids, gt[i], k);
+        }
+
+        double recall = total_recall / static_cast<double>(nq);
+        double qps    = static_cast<double>(nq) / (total_us / 1e6);
+        int    k_prime = static_cast<int>(k * kpf);
+
+        std::cout << std::left  << std::fixed
+                  << std::setw(12) << kpf
+                  << std::right
+                  << std::setw(12) << std::setprecision(4) << recall
+                  << std::setw(12) << k_prime
+                  << std::setw(12) << std::setprecision(0) << qps << "\n";
+        std::cout.flush();
+    }
+    // Restore defaults
+    aq.setSearchGammas(0.15f, 0.35f, 2.0f);
+}
+
+// --------------------------------------------------------------------------
 // QBG recall-QPS sweep over graphExplorationSize values
 // --------------------------------------------------------------------------
 static std::vector<BenchRow> sweepQBG(
@@ -297,7 +352,8 @@ int main(int argc, char** argv) {
     std::cout << "========================================\n";
     std::cout.flush();
 
-    const bool qbg_prebuilt = std::filesystem::exists(qbg_dir + "/Blobs");
+    // grp = QBG graph file, created only after Phase 3 (full build) completes.
+    const bool qbg_prebuilt = std::filesystem::exists(qbg_dir + "/grp");
 
     if (!qbg_prebuilt) {
         // Create index skeleton
@@ -432,7 +488,10 @@ int main(int argc, char** argv) {
     std::cout << "\n";
 
     // ==================== Sweeps ====================
-    std::cout << "=== NGTAQ sweep (gamma_term) ===\n"; std::cout.flush();
+    // Diagnostic: k_prime_factor sweep to distinguish BQ quality vs graph bottleneck
+    sweepNGTAQKprime(aq, queries, ground_truth, k);
+
+    std::cout << "\n=== NGTAQ sweep (gamma_term) ===\n"; std::cout.flush();
     auto ngtaq_rows = sweepNGTAQ(aq, queries, ground_truth, k);
 
     std::cout << "\n=== QBG sweep (graphExplorationSize) ===\n"; std::cout.flush();
