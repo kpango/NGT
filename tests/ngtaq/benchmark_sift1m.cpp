@@ -18,6 +18,7 @@
 #include <string>
 #include <unordered_set>
 #include <vector>
+#include <omp.h>
 
 int main(int argc, char** argv) {
     if (argc < 4) {
@@ -204,6 +205,51 @@ int main(int argc, char** argv) {
     std::cout << "  P99       = " << p99 << " µs\n";
     std::cout << std::setprecision(4);
     std::cout << "  recall@" << k << "  = " << recall << "\n";
+
+    // --- Batch search benchmark ---
+    const int batch_threads = omp_get_max_threads();
+    std::cout << "\n=== Batch Search (n_threads=" << batch_threads << ") ===\n";
+    std::cout.flush();
+
+    // Warm up batch search
+    {
+        NGTAQ::NGTAQIndex::Property bp = prop;
+        bp.n_search_threads = batch_threads;
+        // Just measure against current aq object (n_search_threads=0 → max threads)
+    }
+
+    const auto batch_t0 = std::chrono::high_resolution_clock::now();
+    auto batch_results = aq.searchBatch(queries, k);
+    const auto batch_t1 = std::chrono::high_resolution_clock::now();
+
+    const double batch_total_us =
+        std::chrono::duration<double, std::micro>(batch_t1 - batch_t0).count();
+    const double batch_qps = static_cast<double>(nq) / (batch_total_us / 1e6);
+
+    // Sanity-check recall for batch results
+    double batch_recall = 0.0;
+    for (size_t i = 0; i < nq; ++i) {
+        const auto& gt  = ground_truth[i];
+        const auto& res = batch_results[i];
+        const int gt_k  = std::min(static_cast<int>(gt.size()), k);
+        std::unordered_set<int32_t> gt_set(gt.begin(), gt.begin() + gt_k);
+        int hits = 0;
+        const int res_k = std::min(static_cast<int>(res.size()), k);
+        for (int j = 0; j < res_k; ++j) {
+            if (gt_set.count(static_cast<int32_t>(res[j].id))) ++hits;
+        }
+        batch_recall += static_cast<double>(hits) / static_cast<double>(gt_k);
+    }
+    batch_recall /= static_cast<double>(nq);
+
+    std::cout << std::fixed << std::setprecision(2);
+    std::cout << "  Batch QPS   = " << batch_qps << "\n";
+    std::cout << "  Total time  = " << batch_total_us / 1e6 << " s\n";
+    std::cout << std::setprecision(4);
+    std::cout << "  recall@" << k << "    = " << batch_recall << "\n";
+    std::cout << "  Speedup vs single-thread = "
+              << std::fixed << std::setprecision(2)
+              << (batch_qps / qps) << "x\n";
 
     return 0;
 }
