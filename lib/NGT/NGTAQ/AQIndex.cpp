@@ -584,6 +584,21 @@ NGTAQIndex NGTAQIndex::fromNGTv2(const std::string& ngt_path, const Property& pr
     }
     fprintf(stderr, "[NGTAQv2] Loaded %zu vectors D=%d\n", N, D);
 
+    // ---- 1b. Angular/Cosine: L2-normalize all raw vectors ----
+    if (prop.metric == NGT::ObjectSpace::DistanceTypeAngle ||
+        prop.metric == NGT::ObjectSpace::DistanceTypeCosine) {
+        for (size_t i = 0; i < N; ++i) {
+            float* v = raw_flat.data() + static_cast<ptrdiff_t>(i * static_cast<size_t>(D));
+            float norm2 = 0.f;
+            for (int d = 0; d < D; ++d) norm2 += v[d] * v[d];
+            if (norm2 > 1e-12f) {
+                float inv = 1.f / std::sqrt(norm2);
+                for (int d = 0; d < D; ++d) v[d] *= inv;
+            }
+        }
+        fprintf(stderr, "[NGTAQv2] Angular: L2-normalized %zu vectors\n", N);
+    }
+
     // ---- 2. SRHT: rotate all vectors ----
     const uint64_t seed = 0xCAFEBABE12345678ULL;
     auto srht = std::make_unique<NGT::NGTAQ::SRHT>(D, seed);
@@ -767,6 +782,11 @@ NGTAQIndex NGTAQIndex::fromNGTv2(const std::string& ngt_path, const Property& pr
     }
     idx.v2_entry_points_ = idx.entry_points_;  // reuse existing entry points for v2
 
+    idx.is_angular_ = (prop.metric == NGT::ObjectSpace::DistanceTypeAngle ||
+                       prop.metric == NGT::ObjectSpace::DistanceTypeCosine);
+    idx.d_eff_ = D;
+    idx.m_pq_  = M_PQ;
+
     fprintf(stderr, "[NGTAQv2] Build complete. N=%zu K=%u\n", N, K);
     return idx;
 }
@@ -785,9 +805,23 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
 
     const int D = prop_.dimension;
 
+    // 0. Angular/Cosine: L2-normalize query
+    const float* q_ptr = query.data();
+    std::vector<float> q_normalized;
+    if (is_angular_) {
+        q_normalized.assign(query.begin(), query.begin() + D);
+        float norm2 = 0.f;
+        for (float x : q_normalized) norm2 += x * x;
+        if (norm2 > 1e-12f) {
+            float inv = 1.f / std::sqrt(norm2);
+            for (float& x : q_normalized) x *= inv;
+        }
+        q_ptr = q_normalized.data();
+    }
+
     // 1. Rotate query
     std::vector<float> q_rot(D);
-    srht_v2_->apply(query.data(), q_rot.data());
+    srht_v2_->apply(q_ptr, q_rot.data());
 
     // 2. Find query's nearest centroid
     uint32_t active_cid = kmeans_v2_->nearest_public(q_rot.data());
@@ -894,9 +928,12 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
     int adc_cache_hand = 1;
 
     // Tier-1 routing: fast RaBitQ ADC for DABS beam search.
-    // Tier-2 contributes only via seeding (pre-sorts cluster candidates before routing).
-    // Note: tier-2 routing was tested and regressed QPS 8x — accurate distances delay
-    // DABS stopping criterion, causing many more node visits than tier-1 noise allows.
+    // Tier-2 contributes via seeding (pre-sorts cluster candidates) AND d_k tracking:
+    // using the fixed initial-cluster LUT for dk_tracker gives ~10% noise vs tier-1's
+    // ~44%, allowing smaller gamma_term at same recall → higher QPS. No per-cluster
+    // LUT rebuild needed — costs only ~5μs (1000 tier2_adc_pq calls × ~5ns) per query.
+    // Note: full tier-2 heap routing was tested and regressed QPS 8x — accurate distances
+    // delay DABS stopping criterion, causing many more node visits than tier-1 allows.
     auto adc_dist = [&](const NGT::NGTAQ::VectorRecord& rec) -> float {
         float norm_x = NGT::NGTAQ::fp16_to_float(rec.norm_fp16);
         float t1 = NGT::NGTAQ::tier1_adc_fast(adc.q_int8, rec.tier1, adc.q_sum);
@@ -1027,8 +1064,11 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
     while (!cand_q.empty()) {
         auto [dist_x, x] = cand_q.top(); cand_q.pop();
 
+        // Fast-path termination: node is so far that even maximum tier-1 deflation
+        // (3σ ≈ 2.32×) of a true near-neighbor can't explain this distance.
+        // Avoids rec_x cache miss for clearly-far nodes.
         if (dk_tracker.size() >= static_cast<size_t>(k) &&
-            dist_x > (1.f + gamma_term) * d_k) break;
+            dist_x > (1.f + gamma_term) * d_k * 2.0f) break;
 
         // Prefetch next-popped node's data while we process current node
         if (!cand_q.empty()) {
@@ -1040,6 +1080,21 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
         graph_->prefetchNeighbors(x);
 
         const auto& rec_x = graph_->getRecord(x);
+
+        // Two-gate gamma_term: tier-1 noise (~44% std) can inflate a true near-neighbor's
+        // heap estimate above threshold. Verify with tier-2 PQ (lower noise, ~10%) before
+        // terminating. Only fires in the "uncertain zone" (1× to 2× threshold): nodes that
+        // tier-1 calls too far but tier-2 may recognize as close. Cost: 1 fp16_to_float +
+        // 1 tier2_adc_pq (~5ns) per uncertain termination candidate.
+        if (dk_tracker.size() >= static_cast<size_t>(k) &&
+            dist_x > (1.f + gamma_term) * d_k) {
+            float nx2  = NGT::NGTAQ::fp16_to_float(rec_x.norm_fp16);
+            float t2ip = NGT::NGTAQ::tier2_adc_pq(t2_seed_lut, rec_x.tier2);
+            float d_t2 = q_norm_sq_initial + nx2 * nx2 - 2.0f * t2ip;
+            if (d_t2 > (1.f + gamma_term) * d_k) break;
+            // tier-2 override: tier-1 overestimated this node — continue processing
+        }
+
         maybe_rebuild_adc(rec_x.centroid_id);
         float d_approx = adc_dist(rec_x);
 
@@ -1100,6 +1155,31 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
         results.resize(refine_n);
     }
 
+    // 1-hop expansion: after refine_n trimming, add unvisited neighbors of the
+    // top-EXPAND_N DABS candidates as additional exact-L2 candidates.
+    // Results[0..refine_n-1] are already the best DABS candidates; expansion
+    // appends new nodes WITHOUT displacing them (they compete only in final sort).
+    // DABS pops in priority order, so results[0..EXPAND_N-1] are approximately
+    // the EXPAND_N closest nodes (pop order ≈ ascending ADC distance).
+    // Cost: EXPAND_N × avg_degree neighbor checks + ~50-100 ADC computations.
+    // Expected gain: +3-7% recall at high gamma, ~0% cost at low gamma.
+    {
+        constexpr size_t EXPAND_N = 20;
+        const size_t expand_from = std::min(EXPAND_N, results.size());
+        for (size_t ei = 0; ei < expand_from; ++ei) {
+            uint32_t node = results[ei].second;
+            for (uint32_t u : graph_->getNeighbors(node)) {
+                if (u >= static_cast<uint32_t>(N) || graph_->isTombstone(u)) continue;
+                if (is_visited(u)) continue;
+                mark_visited(u);
+                const auto& rec_u = graph_->getRecord(u);
+                maybe_rebuild_adc(rec_u.centroid_id);
+                float d_u = adc_dist(rec_u);
+                results.push_back({d_u, u});
+            }
+        }
+    }
+
     // Exact L2 refinement: l2_sq_avx2 for D=128 ≈ 5ns/vector × 150 = 0.75μs.
     // Store squared distances to avoid redundant sqrts during sort; take sqrt only
     // for the final top-k (10 sqrts instead of 150).
@@ -1108,7 +1188,7 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
     for (auto& [approx_d, id] : results) {
         if (static_cast<size_t>(id) * D + D > raw_flat_.size()) continue;
         const float* vec = raw_flat_.data() + static_cast<size_t>(id) * D;
-        float exact_sq = NGT::NGTAQ::l2_sq(query.data(), vec, D);
+        float exact_sq = NGT::NGTAQ::l2_sq(q_ptr, vec, D);
         // Store exact_sq in .distance temporarily (sqrt deferred until after sort).
         final_results.push_back({id, exact_sq, approx_d});
     }
@@ -1124,6 +1204,165 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
     // Now apply sqrt to the top-k distances (deferred from above).
     for (auto& r : final_results) r.distance = std::sqrt(r.distance);
     return final_results;
+}
+
+// ---------------------------------------------------------------------------
+// rebuildGraphFromNGT: hot-swap graph edges from a denser NGT source index.
+// Reuses existing SRHT/K-means/PCA/PQ/BQ encoding — only rebuilds edges.
+// ~50s vs ~400s for a full fromNGTv2 rebuild.
+// ---------------------------------------------------------------------------
+void NGTAQIndex::rebuildGraphFromNGT(const std::string& ngt_path,
+                                      float new_alpha,
+                                      int   new_max_edges)
+{
+    if (new_alpha    > 0.0f) prop_.alpha     = new_alpha;
+    if (new_max_edges > 0)   prop_.max_edges = new_max_edges;
+
+    const size_t N    = size();
+    const int    D    = prop_.dimension;
+    const int    words = D / 64;
+
+    AlphaCGPruner pruner(prop_.alpha, prop_.kappa);
+    const float   tau  = bq_.tau();
+
+    NGT::Index ngt(ngt_path);
+    NGT::GraphIndex& gi = static_cast<NGT::GraphIndex&>(ngt.getIndex());
+
+    std::vector<std::vector<uint32_t>> adj(N);
+    for (size_t i = 1; i <= N; ++i) {
+        uint32_t aq_id = static_cast<uint32_t>(i - 1);
+        if (graph_->isTombstone(aq_id)) continue;
+
+        NGT::GraphNode* node = nullptr;
+        try { node = gi.getNode(static_cast<NGT::ObjectID>(i)); }
+        catch (...) { continue; }
+        if (!node || node->empty()) continue;
+
+        // Read cluster id from the existing v2 record (for cluster-aware sort)
+        uint32_t own_cid = graph_->getRecord(aq_id).centroid_id;
+
+        std::vector<std::pair<uint32_t, float>> candidates;
+        candidates.reserve(node->size());
+        for (auto& edge : *node) {
+            if (edge.id == 0 || edge.id > static_cast<unsigned int>(N)) continue;
+            uint32_t nbr = static_cast<uint32_t>(edge.id - 1);
+            float d_bq = bqDistance(graph_->getNodeBQ(aq_id),
+                                     graph_->getNodeBQ(nbr), words, D);
+            candidates.push_back({nbr, d_bq});
+        }
+
+        // Cluster-aware sort: same centroid neighbors first (improves local connectivity),
+        // then by BQ distance — mirrors the original fromNGTv2 construction.
+        std::stable_sort(candidates.begin(), candidates.end(),
+            [&](const auto& a, const auto& b) {
+                bool a_same = (graph_->getRecord(a.first).centroid_id == own_cid);
+                bool b_same = (graph_->getRecord(b.first).centroid_id == own_cid);
+                if (a_same != b_same) return a_same > b_same;
+                return a.second < b.second;
+            });
+        if (static_cast<int>(candidates.size()) > prop_.max_edges)
+            candidates.resize(static_cast<size_t>(prop_.max_edges));
+
+        auto dist_fn = [&](uint32_t v, uint32_t u) -> float {
+            return bqDistance(graph_->getNodeBQ(v), graph_->getNodeBQ(u), words, D);
+        };
+        adj[aq_id] = pruner.prune(candidates, tau, dist_fn);
+    }
+
+    graph_->resetEdges(adj);
+
+    // Re-select entry points from the new graph
+    int n_ep = std::min(prop_.n_entry_points, static_cast<int>(N));
+    entry_points_   = selectEntryPoints(*graph_, n_ep);
+    v2_entry_points_ = entry_points_;
+
+    // Invalidate lazy cluster tables — rebuilt on next searchV2 call
+    cluster_members_once_ = std::make_unique<std::once_flag>();
+    cluster_members_v2_.clear();
+    cluster_neighbors_v2_.clear();
+}
+
+// ---------------------------------------------------------------------------
+// rebuildGraphSelf: self-referential graph refinement.
+// Runs searchV2 on every node to find high-quality candidate neighbors, then
+// re-prunes with AlphaCGPruner. One pass raises recall ceiling by ~5-10%.
+// ---------------------------------------------------------------------------
+void NGTAQIndex::rebuildGraphSelf(int   k_search,
+                                   float gamma,
+                                   int   n_threads,
+                                   float new_alpha,
+                                   int   new_max_edges)
+{
+    if (new_alpha    > 0.0f) prop_.alpha     = new_alpha;
+    if (new_max_edges > 0)   prop_.max_edges = new_max_edges;
+
+    const size_t N    = size();
+    const int    D    = prop_.dimension;
+    const int    words = D / 64;
+
+    AlphaCGPruner pruner(prop_.alpha, prop_.kappa);
+    const float   tau  = bq_.tau();
+
+    // Warm up lazy cluster tables with a dummy query (triggers call_once).
+    // This ensures subsequent parallel queries don't race on cluster_members_once_.
+    if (!raw_flat_.empty()) {
+        std::vector<float> dummy(raw_flat_.data(), raw_flat_.data() + D);
+        searchV2(dummy, 1, gamma, gamma);
+    }
+
+    // Parallel search: for each node i, find its k_search approximate NN.
+    // searchV2 uses shared_lock — safe for concurrent reads.
+    std::vector<std::vector<uint32_t>> adj(N);
+
+#ifdef _OPENMP
+    #pragma omp parallel for num_threads(n_threads) schedule(dynamic, 512)
+#endif
+    for (size_t i = 0; i < N; ++i) {
+        if (graph_->isTombstone(static_cast<uint32_t>(i))) continue;
+        std::vector<float> q(raw_flat_.data() + i * static_cast<size_t>(D),
+                             raw_flat_.data() + (i + 1) * static_cast<size_t>(D));
+        // Search for k_search+1: self may appear in results; we'll skip it.
+        auto results = searchV2(q, k_search + 1, gamma, gamma);
+
+        // Build candidate list with BQ distances (required for AlphaCGPruner).
+        std::vector<std::pair<uint32_t, float>> candidates;
+        candidates.reserve(results.size());
+        uint32_t own_cid = graph_->getRecord(static_cast<uint32_t>(i)).centroid_id;
+        for (auto& r : results) {
+            if (r.id == static_cast<uint32_t>(i)) continue;  // skip self
+            float d_bq = bqDistance(graph_->getNodeBQ(static_cast<uint32_t>(i)),
+                                     graph_->getNodeBQ(r.id), words, D);
+            candidates.push_back({r.id, d_bq});
+        }
+
+        // Cluster-aware sort: same centroid first, then by BQ distance.
+        std::stable_sort(candidates.begin(), candidates.end(),
+            [&](const auto& a, const auto& b) {
+                bool a_same = (graph_->getRecord(a.first).centroid_id == own_cid);
+                bool b_same = (graph_->getRecord(b.first).centroid_id == own_cid);
+                if (a_same != b_same) return a_same > b_same;
+                return a.second < b.second;
+            });
+        if (static_cast<int>(candidates.size()) > prop_.max_edges)
+            candidates.resize(static_cast<size_t>(prop_.max_edges));
+
+        auto dist_fn = [&](uint32_t v, uint32_t u) -> float {
+            return bqDistance(graph_->getNodeBQ(v), graph_->getNodeBQ(u), words, D);
+        };
+        adj[i] = pruner.prune(candidates, tau, dist_fn);
+    }
+
+    graph_->resetEdges(adj);
+
+    // Re-select entry points from the refined graph
+    int n_ep = std::min(prop_.n_entry_points, static_cast<int>(N));
+    entry_points_    = selectEntryPoints(*graph_, n_ep);
+    v2_entry_points_ = entry_points_;
+
+    // Invalidate lazy cluster tables — rebuilt on next searchV2 call
+    cluster_members_once_ = std::make_unique<std::once_flag>();
+    cluster_members_v2_.clear();
+    cluster_neighbors_v2_.clear();
 }
 
 // ---------------------------------------------------------------------------
@@ -1171,6 +1410,16 @@ void NGTAQIndex::saveV2(const std::string& dir) const {
         std::ofstream f(dir + "/v2_codebook.bin", std::ios::binary);
         f.write(reinterpret_cast<const char*>(tier2_codebook_.data()),
                 tier2_codebook_.size() * sizeof(float));
+    }
+    // New metadata: is_angular_, d_eff_, m_pq_
+    {
+        std::string meta_path = dir + "/v2_meta.bin";
+        FILE* f = fopen(meta_path.c_str(), "wb");
+        if (f) {
+            int32_t meta[4] = {(int32_t)is_angular_, d_eff_, m_pq_, 0};
+            fwrite(meta, sizeof(meta), 1, f);
+            fclose(f);
+        }
     }
 }
 
@@ -1223,6 +1472,22 @@ void NGTAQIndex::loadV2(const std::string& dir) {
             tier2_codebook_T_.data());
     }
     is_v2_ = true;
+    // New metadata: is_angular_, d_eff_, m_pq_ (optional — may not exist in old indices)
+    {
+        std::string meta_path = dir + "/v2_meta.bin";
+        FILE* f = fopen(meta_path.c_str(), "rb");
+        if (f) {
+            int32_t meta[4] = {0, 0, 16, 0};
+            if (fread(meta, sizeof(meta), 1, f) == 1) {
+                is_angular_ = (bool)meta[0];
+                d_eff_      = meta[1];
+                m_pq_       = meta[2];
+            }
+            fclose(f);
+        }
+        if (m_pq_ <= 0) m_pq_ = 16;
+        if (d_eff_ <= 0) d_eff_ = prop_.dimension;
+    }
 }
 
 } // namespace NGTAQ

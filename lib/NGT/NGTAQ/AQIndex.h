@@ -92,11 +92,34 @@ public:
     void saveV2(const std::string& dir) const;
     void loadV2(const std::string& dir);
 
-    bool isV2() const { return is_v2_; }
+    bool isV2()      const { return is_v2_; }
+    bool isAngular() const { return is_angular_; }
+    int  dEff()      const { return d_eff_ > 0 ? d_eff_ : prop_.dimension; }
+    int  mPQ()       const { return m_pq_; }
 
     // Accessors for raw float vectors and dimension (used by standalone benchmarks)
     const float* rawFlat() const { return raw_flat_.empty() ? nullptr : raw_flat_.data(); }
     int dim() const { return prop_.dimension; }
+
+    // Rebuild v2 graph edges from a (denser) NGT source index without re-training
+    // SRHT/K-means/PCA/PQ (those are reused from the existing index).
+    // Only the graph construction + entry point selection are re-run.
+    // ~50s vs ~400s for a full fromNGTv2 rebuild.
+    // new_alpha=-1 keeps existing prop_.alpha; new_max_edges=-1 keeps existing prop_.max_edges.
+    void rebuildGraphFromNGT(const std::string& ngt_path,
+                              float new_alpha    = -1.0f,
+                              int   new_max_edges = -1);
+
+    // Rebuild v2 graph edges using the index's own searchV2 to find high-quality
+    // candidate neighbors for each node. Avoids needing a denser NGT source.
+    // Runs k_search searchV2 calls per node (parallelized with n_threads).
+    // gamma controls the search-time recall-QPS tradeoff for candidate generation.
+    // ~30s with n_threads=16 at gamma=0.30 on N=1M SIFT-1M.
+    void rebuildGraphSelf(int   k_search   = 40,
+                          float gamma      = 0.30f,
+                          int   n_threads  = 16,
+                          float new_alpha  = -1.0f,
+                          int   new_max_edges = -1);
 
 private:
     // Concurrency model:
@@ -115,7 +138,10 @@ private:
     std::vector<float>              raw_flat_;     // flat [N*D] exact float vectors
 
     // v2 ADC state (null/empty if not built via fromNGTv2)
-    bool                                      is_v2_ = false;
+    bool                                      is_v2_      = false;
+    bool                                      is_angular_ = false;  // true when metric is Angle or Cosine
+    int                                       d_eff_      = 0;      // effective dimension (0 = prop_.dimension)
+    int                                       m_pq_       = 16;     // PQ sub-codebook count
     std::unique_ptr<NGT::NGTAQ::SRHT>         srht_v2_;
     std::unique_ptr<NGT::NGTAQ::KMeansCentering> kmeans_v2_;
     std::unique_ptr<NGT::NGTAQ::PCAProjector> pca_v2_;
