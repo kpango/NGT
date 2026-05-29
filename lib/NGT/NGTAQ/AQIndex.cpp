@@ -347,12 +347,21 @@ size_t NGTAQIndex::size() const {
 // ---------------------------------------------------------------------------
 // save
 // ---------------------------------------------------------------------------
+// Magic number identifying the versioned binary format.
+// Old format: first 4 bytes = prop_.dimension (small positive int, typically 128).
+// New format: first 4 bytes = kPropMagic, followed by uint32_t prop_size, then prop bytes.
+static constexpr uint32_t kPropMagic = 0xAE17AE17u;
+
 void NGTAQIndex::save(const std::string& path) const {
     std::ofstream os(path, std::ios::binary);
     if (!os) throw std::runtime_error("NGTAQIndex::save: cannot open " + path);
 
-    // 1. Property (raw bytes)
-    os.write(reinterpret_cast<const char*>(&prop_), sizeof(prop_));
+    // 1. Property — versioned format: [magic][prop_size][prop_bytes]
+    //    Backward-compat: old files start with prop_.dimension; new files with kPropMagic.
+    const uint32_t prop_size = sizeof(prop_);
+    os.write(reinterpret_cast<const char*>(&kPropMagic), 4);
+    os.write(reinterpret_cast<const char*>(&prop_size),  4);
+    os.write(reinterpret_cast<const char*>(&prop_), prop_size);
 
     // 2. BinaryQuantizer
     bq_.serialize(os);
@@ -385,10 +394,65 @@ NGTAQIndex NGTAQIndex::load(const std::string& path) {
     std::ifstream is(path, std::ios::binary);
     if (!is) throw std::runtime_error("NGTAQIndex::load: cannot open " + path);
 
-    // 1. Property
+    // 1. Property — detect format by magic number.
+    //    Old format (pre-k_clusters/n_cluster_seeds): first 4 bytes = dimension (e.g. 128).
+    //    New format: first 4 bytes = kPropMagic (0xAE17AE17), then uint32_t prop_size, then prop bytes.
     Property prop;
-    is.read(reinterpret_cast<char*>(&prop), sizeof(prop));
-    if (!is) throw std::runtime_error("NGTAQIndex::load: failed to read property from " + path);
+    memset(&prop, 0, sizeof(prop));
+    prop.k_clusters      = 0;   // default: use select_k(N)
+    prop.n_cluster_seeds = 32;  // default
+
+    uint32_t maybe_magic;
+    is.read(reinterpret_cast<char*>(&maybe_magic), 4);
+    if (!is) throw std::runtime_error("NGTAQIndex::load: failed to read header from " + path);
+
+    if (maybe_magic == kPropMagic) {
+        // New versioned format: [magic(4)][prop_size(4)][prop_bytes(prop_size)]
+        uint32_t stored_size;
+        is.read(reinterpret_cast<char*>(&stored_size), 4);
+        if (!is) throw std::runtime_error("NGTAQIndex::load: failed to read prop_size from " + path);
+        const uint32_t read_size = std::min(stored_size, static_cast<uint32_t>(sizeof(prop)));
+        is.read(reinterpret_cast<char*>(&prop), read_size);
+        if (!is) throw std::runtime_error("NGTAQIndex::load: failed to read property from " + path);
+        // Skip unknown future fields (forward compatibility)
+        if (stored_size > static_cast<uint32_t>(sizeof(prop)))
+            is.seekg(static_cast<std::streamoff>(stored_size - sizeof(prop)), std::ios::cur);
+    } else {
+        // Old format: first 4 bytes = dimension. Property had 11 fields (44 bytes total),
+        // without k_clusters or n_cluster_seeds. Use a local layout-compatible struct.
+        struct OldProperty {
+            int     dimension;
+            float   alpha;
+            float   kappa;
+            float   gamma_enq;
+            float   gamma_term;
+            float   k_prime_factor;
+            int     n_tau_samples;
+            int     n_entry_points;
+            int     max_edges;
+            int     n_search_threads;
+            int32_t metric;  // NGT::ObjectSpace::DistanceType, int-sized enum
+        };
+        static_assert(sizeof(OldProperty) == 44, "OldProperty layout mismatch");
+        OldProperty old{};
+        old.dimension = static_cast<int>(maybe_magic);  // first 4 bytes already consumed
+        is.read(reinterpret_cast<char*>(&old.alpha),
+                static_cast<std::streamsize>(sizeof(OldProperty) - sizeof(int)));
+        if (!is) throw std::runtime_error("NGTAQIndex::load: failed to read old-format property from " + path);
+        prop.dimension        = old.dimension;
+        prop.alpha            = old.alpha;
+        prop.kappa            = old.kappa;
+        prop.gamma_enq        = old.gamma_enq;
+        prop.gamma_term       = old.gamma_term;
+        prop.k_prime_factor   = old.k_prime_factor;
+        prop.n_tau_samples    = old.n_tau_samples;
+        prop.n_entry_points   = old.n_entry_points;
+        prop.max_edges        = old.max_edges;
+        prop.n_search_threads = old.n_search_threads;
+        // k_clusters / n_cluster_seeds retain defaults set above
+        prop.metric = static_cast<NGT::ObjectSpace::DistanceType>(old.metric);
+    }
+
     if (prop.dimension <= 0 || prop.dimension > 65536)
         throw std::runtime_error("NGTAQIndex::load: invalid dimension in file");
 

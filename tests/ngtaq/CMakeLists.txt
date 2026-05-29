@@ -20,6 +20,8 @@ foreach(TEST_SRC
     benchmark_comparison
     benchmark_v2_fast
     benchmark_v2_clean
+    benchmark_single_gamma
+    build_ngtaqv2
     test_vector_record
     test_srht
     test_kmeans
