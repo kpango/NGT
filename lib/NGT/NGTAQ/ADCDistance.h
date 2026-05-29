@@ -1,5 +1,6 @@
 #pragma once
 #include "ADCTable.h"
+#include "SIMDUtils.h"
 #include "VectorRecord.h"
 #include <cstdint>
 #include <cmath>
@@ -28,6 +29,34 @@ inline float tier1_adc_scalar(const int8_t* q_int8, const uint8_t* tier1) {
     }
     return (float)acc;
 }
+
+#if defined(__AVX512VNNI__)
+// AVX-512VNNI tier-1 ADC (D=128, 2 zmm iterations):
+//   Expand 64 tier1 bits → 64 uint8 (0 or 1) via _mm512_maskz_set1_epi8
+//   Accumulate: acc[i] += expanded[i]*q_int8[i] via _mm512_dpbusd_epi32
+//   sum_pos = horizontal_reduce(acc); result = 2*sum_pos - q_sum
+// Requires: __AVX512BW__ (implied by __AVX512VNNI__ on all practical hardware)
+inline float tier1_adc_vnni(const int8_t* __restrict__ q_int8,
+                             const uint8_t* __restrict__ tier1,
+                             int32_t q_sum) {
+    // Load all 128 tier1 bits (16 bytes) as two 64-bit masks
+    uint64_t lo64, hi64;
+    memcpy(&lo64, tier1,     8);
+    memcpy(&hi64, tier1 + 8, 8);
+
+    // Expand: bit=1 → 0x01, bit=0 → 0x00 (unsigned int8 for dpbusd)
+    __m512i exp0 = _mm512_maskz_set1_epi8((__mmask64)lo64, (int8_t)1);
+    __m512i exp1 = _mm512_maskz_set1_epi8((__mmask64)hi64, (int8_t)1);
+
+    // VNNI dot product: acc[i] += a_unsigned[4i..4i+3] * b_signed[4i..4i+3]
+    __m512i acc = _mm512_setzero_si512();
+    acc = _mm512_dpbusd_epi32(acc, exp0, _mm512_loadu_si512(q_int8));
+    acc = _mm512_dpbusd_epi32(acc, exp1, _mm512_loadu_si512(q_int8 + 64));
+
+    int32_t sum_pos = _mm512_reduce_add_epi32(acc);
+    return (float)(2 * sum_pos - q_sum);
+}
+#endif // __AVX512VNNI__
 
 #if defined(__AVX2__)
 // AVX2 tier-1 ADC using masked-sum decomposition:
@@ -102,9 +131,11 @@ inline float tier1_adc_avx2(const int8_t* __restrict__ q_int8,
 #endif // __AVX2__
 
 // Runtime-dispatched tier-1 ADC
-// q_sum = sum(q_int8[i]), precomputed by build_tier1_query; used only by AVX2 path
+// q_sum = sum(q_int8[i]), precomputed by build_tier1_query; used by VNNI and AVX2 paths
 inline float tier1_adc_fast(const int8_t* q_int8, const uint8_t* tier1, int32_t q_sum = 0) {
-#if defined(__AVX2__)
+#if defined(__AVX512VNNI__)
+    return tier1_adc_vnni(q_int8, tier1, q_sum);
+#elif defined(__AVX2__)
     return tier1_adc_avx2(q_int8, tier1, q_sum);
 #else
     (void)q_sum;
@@ -139,6 +170,21 @@ inline float tier2_adc_fast(const int8_t lut[16][16], const uint8_t* tier2) {
 // M=16, K=256, D_sub=8: 8× better quantization than M=32 K=16.
 // ============================================================
 
+#if defined(__AVX512F__)
+// AVX-512F version: all 16 subs in one _mm512_i32gather_ps.
+// codes[0..15] each 0..255, STRIDE512[sub] = sub*256 → index = sub*256 + code[sub]
+inline float tier2_adc_pq_avx512(const float lut[16][256], const uint8_t* tier2) {
+    const float* base = &lut[0][0];
+    static const __m512i STRIDE512 = _mm512_set_epi32(
+        15*256, 14*256, 13*256, 12*256, 11*256, 10*256, 9*256, 8*256,
+         7*256,  6*256,  5*256,  4*256,  3*256,  2*256,   256,    0);
+    __m512i codes = _mm512_cvtepu8_epi32(_mm_loadu_si128((const __m128i*)tier2));
+    __m512i idx   = _mm512_add_epi32(STRIDE512, codes);
+    __m512  v     = _mm512_i32gather_ps(idx, base, 4);
+    return _mm512_reduce_add_ps(v);
+}
+#endif // __AVX512F__
+
 #if defined(__AVX2__)
 // AVX2 version: 8-wide gather over K=256 LUT.
 // tier2[0..7] → 8 codes → gather from lut[0..7][code]
@@ -168,7 +214,9 @@ inline float tier2_adc_pq_avx2(const float lut[16][256], const uint8_t* tier2) {
 #endif // __AVX2__
 
 inline float tier2_adc_pq(const float lut[16][256], const uint8_t* tier2) {
-#if defined(__AVX2__)
+#if defined(__AVX512F__)
+    return tier2_adc_pq_avx512(lut, tier2);
+#elif defined(__AVX2__)
     return tier2_adc_pq_avx2(lut, tier2);
 #else
     float acc = 0.f;
@@ -179,40 +227,13 @@ inline float tier2_adc_pq(const float lut[16][256], const uint8_t* tier2) {
 }
 
 // ============================================================
-// Vectorized squared L2 distance (exact reranking)
-// Handles arbitrary D; loops are unrolled 4× with 8-float AVX2 registers
+// Squared L2 distance for exact reranking — delegates to SIMDUtils
+// Kept as thin wrapper so existing call sites compile without change.
+// AQIndex.cpp should call NGT::NGTAQ::l2_sq() directly (Task 6).
 // ============================================================
-#if defined(__AVX2__)
 inline float l2_sq_avx2(const float* __restrict__ a, const float* __restrict__ b, int D) {
-    __m256 s0 = _mm256_setzero_ps(), s1 = _mm256_setzero_ps();
-    __m256 s2 = _mm256_setzero_ps(), s3 = _mm256_setzero_ps();
-    int i = 0;
-    for (; i + 32 <= D; i += 32) {
-        __m256 d0 = _mm256_sub_ps(_mm256_loadu_ps(a+i),    _mm256_loadu_ps(b+i));
-        __m256 d1 = _mm256_sub_ps(_mm256_loadu_ps(a+i+8),  _mm256_loadu_ps(b+i+8));
-        __m256 d2 = _mm256_sub_ps(_mm256_loadu_ps(a+i+16), _mm256_loadu_ps(b+i+16));
-        __m256 d3 = _mm256_sub_ps(_mm256_loadu_ps(a+i+24), _mm256_loadu_ps(b+i+24));
-        s0 = _mm256_add_ps(s0, _mm256_mul_ps(d0, d0));
-        s1 = _mm256_add_ps(s1, _mm256_mul_ps(d1, d1));
-        s2 = _mm256_add_ps(s2, _mm256_mul_ps(d2, d2));
-        s3 = _mm256_add_ps(s3, _mm256_mul_ps(d3, d3));
-    }
-    for (; i + 8 <= D; i += 8) {
-        __m256 d = _mm256_sub_ps(_mm256_loadu_ps(a+i), _mm256_loadu_ps(b+i));
-        s0 = _mm256_add_ps(s0, _mm256_mul_ps(d, d));
-    }
-    float tail = 0.f;
-    for (; i < D; ++i) { float d = a[i] - b[i]; tail += d*d; }
-    // Horizontal sum of 8-wide accumulators
-    __m256 acc = _mm256_add_ps(_mm256_add_ps(s0, s1), _mm256_add_ps(s2, s3));
-    __m128 lo  = _mm256_castps256_ps128(acc);
-    __m128 hi  = _mm256_extractf128_ps(acc, 1);
-    __m128 s   = _mm_add_ps(lo, hi);
-    s = _mm_add_ps(s, _mm_movehl_ps(s, s));
-    s = _mm_add_ss(s, _mm_shuffle_ps(s, s, 1));
-    return _mm_cvtss_f32(s) + tail;
+    return NGT::NGTAQ::l2_sq(a, b, D);
 }
-#endif
 
 // ============================================================
 // Full RaBitQ-style distance

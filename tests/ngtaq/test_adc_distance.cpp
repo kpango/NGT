@@ -30,10 +30,15 @@ static void test_tier1_adc_random_consistency() {
     int8_t q[128];
     uint8_t tier1[16];
     for (int trial = 0; trial < 100; ++trial) {
-        for (int i = 0; i < 128; ++i) q[i] = (int8_t)((rng() % 254) - 127);
+        int32_t q_sum = 0;
+        for (int i = 0; i < 128; ++i) {
+            q[i] = (int8_t)((rng() % 254) - 127);
+            q_sum += q[i];
+        }
         for (int i = 0; i < 16; ++i) tier1[i] = (uint8_t)(rng() & 0xFF);
         float scalar_val = NGT::NGTAQ::tier1_adc_scalar(q, tier1);
-        float fast_val   = NGT::NGTAQ::tier1_adc_fast(q, tier1);
+        // tier1_adc_fast requires precomputed q_sum = sum(q[i]) for VNNI/AVX2 paths
+        float fast_val   = NGT::NGTAQ::tier1_adc_fast(q, tier1, q_sum);
         EXPECT_NEAR(scalar_val, fast_val, 2.f);
     }
 }
