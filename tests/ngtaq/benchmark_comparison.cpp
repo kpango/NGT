@@ -572,8 +572,9 @@ int main(int argc, char** argv) {
                 probe.close();
                 std::cout << "[NGTAQ] Loading cache: " << ngtaq_cache << "\n"; std::cout.flush();
                 try {
-                    auto idx = NGTAQ::NGTAQIndex::load(ngtaq_cache);
-                    std::cout << "[NGTAQ] Loaded. size=" << idx.size() << "\n\n"; std::cout.flush();
+                    auto idx = NGTAQ::NGTAQIndex::load(ngtaq_cache + "/aqindex");
+                    idx.loadV2(ngtaq_cache);
+                    std::cout << "[NGTAQ] Loaded (v2). size=" << idx.size() << "\n\n"; std::cout.flush();
                     return idx;
                 } catch (const std::exception& e) {
                     std::cerr << "[NGTAQ] Cache load failed (" << e.what() << "), rebuilding...\n";
