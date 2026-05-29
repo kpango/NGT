@@ -21,9 +21,9 @@ static constexpr float RABITQ_SCALE = 1.2533141373f;
 // result = sum_i q_int8[i] * (sign_bit_i ? +1 : -1)
 // ============================================================
 
-inline float tier1_adc_scalar(const int8_t* q_int8, const uint8_t* tier1) {
+inline float tier1_adc_scalar(const int8_t* q_int8, const uint8_t* tier1, int D = 128) {
     int32_t acc = 0;
-    for (int i = 0; i < 128; ++i) {
+    for (int i = 0; i < D; ++i) {
         int bit = (tier1[i>>3] >> (i&7)) & 1;
         acc += (int32_t)q_int8[i] * (bit ? 1 : -1);
     }
@@ -130,7 +130,7 @@ inline float tier1_adc_avx2(const int8_t* __restrict__ q_int8,
 }
 #endif // __AVX2__
 
-// Runtime-dispatched tier-1 ADC
+// Runtime-dispatched tier-1 ADC (D=128 optimized path)
 // q_sum = sum(q_int8[i]), precomputed by build_tier1_query; used by VNNI and AVX2 paths
 inline float tier1_adc_fast(const int8_t* q_int8, const uint8_t* tier1, int32_t q_sum = 0) {
 #if defined(__AVX512VNNI__)
@@ -139,8 +139,19 @@ inline float tier1_adc_fast(const int8_t* q_int8, const uint8_t* tier1, int32_t 
     return tier1_adc_avx2(q_int8, tier1, q_sum);
 #else
     (void)q_sum;
-    return tier1_adc_scalar(q_int8, tier1);
+    return tier1_adc_scalar(q_int8, tier1, 128);
 #endif
+}
+
+/// Dispatch tier-1 ADC for arbitrary D (power-of-2, divisible by 64).
+/// For D=128 uses the optimized VNNI/AVX2 path; other D uses the scalar loop.
+inline float tier1_adc_fast_d(const int8_t* q_int8, const uint8_t* tier1,
+                               int32_t q_sum, int D) {
+    if (D == 128) {
+        return tier1_adc_fast(q_int8, tier1, q_sum);
+    }
+    (void)q_sum;
+    return tier1_adc_scalar(q_int8, tier1, D);
 }
 
 // ============================================================

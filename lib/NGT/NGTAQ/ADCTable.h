@@ -2,6 +2,7 @@
 #include <cstdint>
 #include <cstring>
 #include <cmath>
+#include <vector>
 
 #if defined(__AVX512F__) || defined(__AVX2__) || defined(__AVX__)
 #  include <immintrin.h>
@@ -14,10 +15,16 @@ namespace NGT { namespace NGTAQ {
 
 // Per-query ADC state, rebuilt when active centroid changes
 struct ADCQueryState {
-    int8_t  q_int8[128];         // unit query residual as int8 (scaled by 127)
-    float   q_norm_sq;           // ||query - centroid||^2
-    float   q_norm;              // sqrt(q_norm_sq) — needed for RaBitQ formula
-    int32_t q_sum;               // sum(q_int8[i]) — precomputed for AVX2 masked-sum formula
+    std::vector<int8_t> q_int8;  // unit query residual as int8 (scaled by 127)
+    float   q_norm_sq = 0.f;     // ||query - centroid||^2
+    float   q_norm    = 0.f;     // sqrt(q_norm_sq) — needed for RaBitQ formula
+    int32_t q_sum     = 0;       // sum(q_int8[i]) — precomputed for AVX2 masked-sum formula
+
+    explicit ADCQueryState(int D = 128) : q_int8(D, 0) {}
+
+    int8_t*       data()       { return q_int8.data(); }
+    const int8_t* data() const { return q_int8.data(); }
+    int dim() const { return (int)q_int8.size(); }
 };
 
 // Build tier-1 query: store proportional int8 of unit residual vector (asymmetric ADC)
@@ -347,6 +354,70 @@ inline void build_tier2_lut_fast(const float* q_res, int D,
         }
     }
 #endif
+}
+
+/// Variable-M tier-2 LUT build. M = D_eff/8, D_sub = 8 (fixed), K = 256.
+/// lut must point to M * 256 floats pre-allocated by the caller.
+/// cb_T layout: [M][D_sub][K] (transposed, same convention as build_tier2_codebook_T).
+inline void build_tier2_lut_fast_m(const float* q_res, int M,
+                                    const float* cb_T,
+                                    float* lut)
+{
+    const int K     = 256;
+    const int D_sub = 8;
+
+#if defined(__AVX512F__)
+    const int K16 = K / 16;
+    for (int sub = 0; sub < M; ++sub) {
+        const float* q_sub  = q_res + sub * D_sub;
+        const float* cb_sub = cb_T + sub * D_sub * K;
+        float*       out    = lut + sub * K;
+        __m512 acc[16];
+        for (int g = 0; g < K16; ++g) acc[g] = _mm512_setzero_ps();
+        for (int d = 0; d < D_sub; ++d) {
+            __m512 qd = _mm512_set1_ps(q_sub[d]);
+            const float* c = cb_sub + d * K;
+            for (int g = 0; g < K16; ++g)
+                acc[g] = _mm512_fmadd_ps(qd, _mm512_loadu_ps(c + g * 16), acc[g]);
+        }
+        for (int g = 0; g < K16; ++g) _mm512_storeu_ps(out + g * 16, acc[g]);
+    }
+#elif defined(__AVX2__) && defined(__FMA__)
+    const int K8 = K / 8;
+    for (int sub = 0; sub < M; ++sub) {
+        const float* q_sub  = q_res + sub * D_sub;
+        const float* cb_sub = cb_T + sub * D_sub * K;
+        float*       out    = lut + sub * K;
+        __m256 acc[32];
+        for (int g = 0; g < K8; ++g) acc[g] = _mm256_setzero_ps();
+        for (int d = 0; d < D_sub; ++d) {
+            __m256 qd = _mm256_set1_ps(q_sub[d]);
+            const float* c = cb_sub + d * K;
+            for (int g = 0; g < K8; ++g)
+                acc[g] = _mm256_fmadd_ps(qd, _mm256_loadu_ps(c + g * 8), acc[g]);
+        }
+        for (int g = 0; g < K8; ++g) _mm256_storeu_ps(out + g * 8, acc[g]);
+    }
+#else
+    for (int sub = 0; sub < M; ++sub) {
+        const float* q_sub  = q_res + sub * D_sub;
+        const float* cb_sub = cb_T + sub * D_sub * K;
+        float*       out    = lut + sub * K;
+        for (int code = 0; code < K; ++code) {
+            float dot = 0.f;
+            for (int d = 0; d < D_sub; ++d) dot += q_sub[d] * cb_sub[d * K + code];
+            out[code] = dot;
+        }
+    }
+#endif
+}
+
+/// Variable-M tier-2 PQ ADC score. lut[M * 256], tier2[M].
+inline float tier2_adc_pq_m(const float* lut, const uint8_t* tier2, int M) {
+    float sum = 0.f;
+    for (int sub = 0; sub < M; ++sub)
+        sum += lut[(size_t)sub * 256 + tier2[sub]];
+    return sum;
 }
 
 }} // NGT::NGTAQ

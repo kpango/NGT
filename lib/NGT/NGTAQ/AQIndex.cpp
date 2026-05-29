@@ -796,12 +796,19 @@ NGTAQIndex NGTAQIndex::fromNGTv2(const std::string& ngt_path, const Property& pr
 // ---------------------------------------------------------------------------
 std::vector<SearchResult> NGTAQIndex::searchV2(
     const std::vector<float>& query, int k,
-    float gamma_enq, float gamma_term) const
+    float gamma_enq, float gamma_term,
+    int rerank_factor) const
 {
     if (!is_v2_)
         throw std::runtime_error("searchV2: call fromNGTv2() first");
     if (static_cast<int>(query.size()) < prop_.dimension)
         throw std::invalid_argument("searchV2: query dimension mismatch");
+
+    // rerank_factor: widen beam by searching for k_beam candidates, return top k_out.
+    // rerank_factor <= 1: standard behavior (k_beam == k).
+    // rerank_factor >  1: search k*rerank_factor internally, trim to k at output.
+    const int k_beam = (rerank_factor > 1) ? k * rerank_factor : k;
+    const int k_out  = k;
 
     const int D = prop_.dimension;
 
@@ -828,11 +835,11 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
     std::vector<float> q_res(D);
 
     // 3. Build initial ADC state (tier-1 + tier-2 PQ on SRHT residuals)
-    NGT::NGTAQ::ADCQueryState adc = {};
+    NGT::NGTAQ::ADCQueryState adc(D);
     float q_norm_sq = 0.f;
     NGT::NGTAQ::compute_residual_and_tier1(
         q_rot.data(), kmeans_v2_->centroid(active_cid), D,
-        q_res.data(), adc.q_norm_sq, adc.q_int8, adc.q_sum);
+        q_res.data(), adc.q_norm_sq, adc.q_int8.data(), adc.q_sum);
     adc.q_norm = std::sqrt(adc.q_norm_sq);
     q_norm_sq = adc.q_norm_sq;
     const float inv_sqrt_D = 1.f / std::sqrt((float)D);
@@ -892,7 +899,7 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
     std::vector<std::pair<float, uint32_t>> results;
     // Reserve 30× k upfront to avoid repeated reallocations during DABS routing.
     // At γ=0.18 ~200-300 candidates are popped; 30×10=300 covers the common case.
-    results.reserve(static_cast<size_t>(k * 30));
+    results.reserve(static_cast<size_t>(k_beam * 30));
     // Flat bitvector for visited tracking: N=1M → 15,625 uint64_t = 125KB (fits in L2)
     // thread_local avoids heap allocation after first query on each thread
     static thread_local std::vector<uint64_t> t_vis;
@@ -923,7 +930,7 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
     adc_cache[0].q_norm_sq = adc.q_norm_sq;
     adc_cache[0].q_norm    = adc.q_norm;
     adc_cache[0].q_sum     = adc.q_sum;
-    std::memcpy(adc_cache[0].q_int8, adc.q_int8, sizeof(adc.q_int8));
+    std::memcpy(adc_cache[0].q_int8, adc.q_int8.data(), 128);
     for (int s = 1; s < ADC_SLOTS; ++s) adc_cache[s].cid = UINT32_MAX;
     int adc_cache_hand = 1;
 
@@ -936,7 +943,7 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
     // delay DABS stopping criterion, causing many more node visits than tier-1 allows.
     auto adc_dist = [&](const NGT::NGTAQ::VectorRecord& rec) -> float {
         float norm_x = NGT::NGTAQ::fp16_to_float(rec.norm_fp16);
-        float t1 = NGT::NGTAQ::tier1_adc_fast(adc.q_int8, rec.tier1, adc.q_sum);
+        float t1 = NGT::NGTAQ::tier1_adc_fast(adc.q_int8.data(), rec.tier1, adc.q_sum);
         float t1_ip = adc.q_norm * norm_x * NGT::NGTAQ::RABITQ_SCALE * t1 * inv_sqrt_D / 127.f;
         return adc.q_norm_sq + norm_x * norm_x - 2.0f * t1_ip;
     };
@@ -953,7 +960,7 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
                 adc.q_norm_sq = adc_cache[s].q_norm_sq;
                 adc.q_norm    = adc_cache[s].q_norm;
                 adc.q_sum     = adc_cache[s].q_sum;
-                std::memcpy(adc.q_int8, adc_cache[s].q_int8, sizeof(adc.q_int8));
+                std::memcpy(adc.q_int8.data(), adc_cache[s].q_int8, 128);
                 return;
             }
         }
@@ -961,7 +968,7 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
         active_cid = cid;
         NGT::NGTAQ::compute_residual_and_tier1(
             q_rot.data(), kmeans_v2_->centroid(active_cid), D,
-            q_res.data(), adc.q_norm_sq, adc.q_int8, adc.q_sum);
+            q_res.data(), adc.q_norm_sq, adc.q_int8.data(), adc.q_sum);
         adc.q_norm = std::sqrt(adc.q_norm_sq);
         q_norm_sq = adc.q_norm_sq;
         // Store in cache (round-robin eviction)
@@ -971,7 +978,7 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
         adc_cache[slot].q_norm_sq = adc.q_norm_sq;
         adc_cache[slot].q_norm    = adc.q_norm;
         adc_cache[slot].q_sum     = adc.q_sum;
-        std::memcpy(adc_cache[slot].q_int8, adc.q_int8, sizeof(adc.q_int8));
+        std::memcpy(adc_cache[slot].q_int8, adc.q_int8.data(), 128);
     };
 
     // Tier-2 seed scoring: build LUT from initial cluster, pre-sort all cluster seeds
@@ -1067,7 +1074,7 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
         // Fast-path termination: node is so far that even maximum tier-1 deflation
         // (3σ ≈ 2.32×) of a true near-neighbor can't explain this distance.
         // Avoids rec_x cache miss for clearly-far nodes.
-        if (dk_tracker.size() >= static_cast<size_t>(k) &&
+        if (dk_tracker.size() >= static_cast<size_t>(k_beam) &&
             dist_x > (1.f + gamma_term) * d_k * 2.0f) break;
 
         // Prefetch next-popped node's data while we process current node
@@ -1086,7 +1093,7 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
         // terminating. Only fires in the "uncertain zone" (1× to 2× threshold): nodes that
         // tier-1 calls too far but tier-2 may recognize as close. Cost: 1 fp16_to_float +
         // 1 tier2_adc_pq (~5ns) per uncertain termination candidate.
-        if (dk_tracker.size() >= static_cast<size_t>(k) &&
+        if (dk_tracker.size() >= static_cast<size_t>(k_beam) &&
             dist_x > (1.f + gamma_term) * d_k) {
             float nx2  = NGT::NGTAQ::fp16_to_float(rec_x.norm_fp16);
             float t2ip = NGT::NGTAQ::tier2_adc_pq(t2_seed_lut, rec_x.tier2);
@@ -1102,10 +1109,10 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
         // We only use d_k for ROUTING termination, not for result filtering.
         results.push_back({d_approx, x});
         dk_tracker.push(d_approx);
-        if (static_cast<int>(dk_tracker.size()) > k) {
+        if (static_cast<int>(dk_tracker.size()) > k_beam) {
             dk_tracker.pop();
             d_k = dk_tracker.top();
-        } else if (static_cast<int>(dk_tracker.size()) == k) {
+        } else if (static_cast<int>(dk_tracker.size()) == k_beam) {
             d_k = dk_tracker.top();
         }
 
@@ -1134,7 +1141,7 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
             // d_u > (1+gamma)*d_k would trigger the outer-loop termination as
             // soon as it's popped — it can never contribute to the top-k result.
             // Skipping the push avoids a wasted heap insertion+extraction.
-            if (static_cast<int>(dk_tracker.size()) >= k &&
+            if (static_cast<int>(dk_tracker.size()) >= k_beam &&
                 d_u > (1.f + gamma_enq) * d_k)
                 continue;
             cand_q.push({d_u, u});
@@ -1149,7 +1156,7 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
     // Select top k*15 candidates by approximate score for exact L2 reranking.
     // nth_element (O(n)) is faster than sort (O(n log n)) when n >> refine_n.
     // tier-1 has ~0.5bit noise but good rank correlation for initial filtering.
-    const size_t refine_n = static_cast<size_t>(k * 15);
+    const size_t refine_n = static_cast<size_t>(k_beam * 15);
     if (results.size() > refine_n) {
         std::nth_element(results.begin(), results.begin() + refine_n, results.end());
         results.resize(refine_n);
@@ -1194,7 +1201,7 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
     }
     // partial_sort: O(n log k) ≈ 500 comparisons vs std::sort O(n log n) ≈ 1080.
     // We only need the top-k; the rest are discarded.
-    const size_t out_n = std::min(static_cast<size_t>(k), final_results.size());
+    const size_t out_n = std::min(static_cast<size_t>(k_out), final_results.size());
     std::partial_sort(final_results.begin(), final_results.begin() + out_n,
         final_results.end(),
         [](const SearchResult& a, const SearchResult& b) {
