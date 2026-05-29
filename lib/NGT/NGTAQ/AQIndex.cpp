@@ -1,5 +1,6 @@
 // lib/NGT/NGTAQ/AQIndex.cpp
 #include "NGT/NGTAQ/AQIndex.h"
+#include "NGT/NGTAQ/DimUtils.h"
 
 #include "NGT/Graph.h"
 
@@ -557,11 +558,10 @@ std::vector<uint32_t> NGTAQIndex::selectEntryPoints(
 // fromNGTv2: SRHT + K-means + PCA + VectorRecord + cluster-aware graph
 // ---------------------------------------------------------------------------
 NGTAQIndex NGTAQIndex::fromNGTv2(const std::string& ngt_path, const Property& prop) {
-    const int D = prop.dimension;
-    if ((D & (D - 1)) != 0)
-        throw std::invalid_argument("fromNGTv2: dimension must be a power of 2");
-    if (D % 64 != 0)
-        throw std::invalid_argument("fromNGTv2: dimension must be divisible by 64");
+    const int D_orig = prop.dimension;
+    const int D = NGT::NGTAQ::pad_dim_for_v2(D_orig);  // pad to next power-of-2 divisible by 64
+    // D_orig may differ from D (e.g., D_orig=100 → D=128, D_orig=960 → D=1024);
+    // raw vectors are zero-padded when loaded.
 
     // ---- 1. Load all float vectors from NGT ----
     NGT::Index ngt(ngt_path);
@@ -570,19 +570,20 @@ NGTAQIndex NGTAQIndex::fromNGTv2(const std::string& ngt_path, const Property& pr
     const size_t N = repo_size - 1;
     const int words = D / 64;
 
-    std::vector<float> raw_flat(N * static_cast<size_t>(D), 0.f);
+    std::vector<float> raw_flat(N * static_cast<size_t>(D), 0.f);  // zero-padded to D
     std::vector<bool> is_hole(N, false);
-    std::vector<float> tmp(D);
+    std::vector<float> tmp(D_orig);  // NGT stores D_orig dims; extras stay zero
     for (size_t i = 1; i <= N; i++) {
         try {
             objspace.getObject(static_cast<NGT::ObjectID>(i), tmp);
+            // Copy D_orig dims into the D-padded slot; padding dims remain 0
             std::copy(tmp.begin(), tmp.end(),
                       raw_flat.begin() + static_cast<ptrdiff_t>((i - 1) * D));
         } catch (...) {
             is_hole[i - 1] = true;
         }
     }
-    fprintf(stderr, "[NGTAQv2] Loaded %zu vectors D=%d\n", N, D);
+    fprintf(stderr, "[NGTAQv2] Loaded %zu vectors D_orig=%d D_eff=%d\n", N, D_orig, D);
 
     // ---- 1b. Angular/Cosine: L2-normalize all raw vectors ----
     if (prop.metric == NGT::ObjectSpace::DistanceTypeAngle ||
@@ -632,15 +633,15 @@ NGTAQIndex NGTAQIndex::fromNGTv2(const std::string& ngt_path, const Property& pr
     for (size_t i = 0; i < N; ++i)
         pca->project(residuals.data() + i*D, pca_residuals.data() + i*32);
 
-    // ---- 7. Tier-2 PQ: 16 sub-codebooks on SRHT residuals (all D dims) ----
-    // M=16 sub-spaces × D/16 dims each (D_sub=8 for D=128). K=256 centroids (8 bit/sub).
+    // ---- 7. Tier-2 PQ: M_PQ sub-codebooks on SRHT residuals (all D dims) ----
+    // M_PQ = D/8 sub-spaces × D_sub=8 dims each. K=256 centroids (8 bit/sub).
     // Layout: tier2_cb[(sub*256 + code)*D_sub + dim]
-    // 16 sub-spaces × 8 bits = 128 bits → uses all 16 bytes of tier2[16].
+    // M_PQ sub-spaces × 8 bits → uses all M_PQ bytes of tier2 storage.
     // SRHT isotropizes data → equal per-sub-space variance → balanced PQ.
-    // 8× more centroids than previous M=32 K=16 → much higher quantization precision.
-    const int M_PQ  = 16;
+    // D=128: M_PQ=16, D=256: M_PQ=32, D=1024: M_PQ=128.
+    const int M_PQ  = D / 8;   // D_sub = 8 fixed; M_PQ scales with D
     const int K_PQ  = 256;
-    const int D_sub = D / M_PQ;  // = 8 for D=128
+    const int D_sub = 8;       // always 8 dims per sub-space
     std::vector<float> tier2_cb((size_t)M_PQ * K_PQ * D_sub, 0.f);
     fprintf(stderr, "[NGTAQv2] Training %d PQ sub-codebooks (K=%d, D_sub=%d) on SRHT residuals...\n",
             M_PQ, K_PQ, D_sub);
@@ -681,24 +682,24 @@ NGTAQIndex NGTAQIndex::fromNGTv2(const std::string& ngt_path, const Property& pr
     for (size_t i = 0; i < N; ++i)
         if (is_hole[i]) graph->removeNode(static_cast<uint32_t>(i));
 
-    // Fill v2 VectorRecords
-    graph->reserveV2(N);
+    // Fill v2 VectorRecords using VectorRecordView (variable-D safe)
+    graph->reserveV2(N, D/8, D/8);  // tier1_n = D/8, tier2_n = D/8
     for (size_t i = 0; i < N; ++i) {
         if (is_hole[i]) continue;
-        NGT::NGTAQ::VectorRecord rec = {};
-        rec.centroid_id = centroid_ids[i];
+        auto view = graph->getRecordView(static_cast<uint32_t>(i));
+        view.set_centroid_id(centroid_ids[i]);
 
-        // tier-1: sign bits of SRHT residual (128 bits → 16 bytes)
+        // tier-1: sign bits of SRHT residual (D bits → D/8 bytes)
         const float* res = residuals.data() + i*D;
         for (int b = 0; b < D; ++b)
-            NGT::NGTAQ::set_tier1_bit(rec, b, res[b] >= 0.f);
+            view.set_tier1_bit(b, res[b] >= 0.f);
 
         // norm_fp16: L2 norm of residual
         float norm2 = 0.f;
         for (int d = 0; d < D; ++d) norm2 += res[d] * res[d];
-        rec.norm_fp16 = NGT::NGTAQ::float_to_fp16(std::sqrt(norm2));
+        view.set_norm_fp16(NGT::NGTAQ::float_to_fp16(std::sqrt(norm2)));
 
-        // tier-2: 16 independent PQ codes (bytes 0..15 of tier2[16])
+        // tier-2: M_PQ independent PQ codes (M_PQ bytes, 8-bit each)
         // Each byte encodes nearest centroid (0-255) for D_sub-dim sub-vector of SRHT residual
         const float* sv_base = residuals.data() + i * D;
         for (int sub = 0; sub < M_PQ; ++sub) {
@@ -713,10 +714,8 @@ NGTAQIndex NGTAQIndex::fromNGTv2(const std::string& ngt_path, const Property& pr
                 }
                 if (dist < best_d) { best_d = dist; best_code = (uint8_t)code; }
             }
-            NGT::NGTAQ::set_tier2_byte(rec, sub, best_code);
+            view.set_tier2_byte(sub, best_code);
         }
-
-        graph->setRecord(static_cast<uint32_t>(i), rec);
     }
 
     // ---- 9. Build cluster-aware graph from NGT edges ----
@@ -810,21 +809,28 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
     const int k_beam = (rerank_factor > 1) ? k * rerank_factor : k;
     const int k_out  = k;
 
-    const int D = prop_.dimension;
+    const int D     = (d_eff_ > 0) ? d_eff_ : prop_.dimension;
+    const int M_PQ  = (m_pq_ > 0) ? m_pq_ : 16;
+    const int D_orig = (int)query.size();
 
-    // 0. Angular/Cosine: L2-normalize query
-    const float* q_ptr = query.data();
+    // 0. Angular/Cosine: L2-normalize query (over D_orig dims)
     std::vector<float> q_normalized;
+    const float* q_src = query.data();
     if (is_angular_) {
-        q_normalized.assign(query.begin(), query.begin() + D);
+        q_normalized.assign(query.begin(), query.begin() + std::min(D_orig, D));
         float norm2 = 0.f;
         for (float x : q_normalized) norm2 += x * x;
         if (norm2 > 1e-12f) {
             float inv = 1.f / std::sqrt(norm2);
             for (float& x : q_normalized) x *= inv;
         }
-        q_ptr = q_normalized.data();
+        q_src = q_normalized.data();
     }
+
+    // Query padding: zero-pad to D (for D_orig < D, e.g., GloVe-100 → D=128)
+    std::vector<float> q_padded(D, 0.f);
+    std::copy(q_src, q_src + std::min(D_orig, D), q_padded.begin());
+    const float* q_ptr = q_padded.data();
 
     // 1. Rotate query
     std::vector<float> q_rot(D);
@@ -863,7 +869,7 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
         cluster_members_v2_.resize(K);
         for (size_t i = 0; i < N; ++i) {
             if (graph_->isTombstone(static_cast<uint32_t>(i))) continue;
-            uint32_t cid = graph_->getRecord(static_cast<uint32_t>(i)).centroid_id;
+            uint32_t cid = graph_->getRecordConstView(static_cast<uint32_t>(i)).centroid_id();
             if (cid < K)
                 cluster_members_v2_[cid].push_back(static_cast<uint32_t>(i));
         }
@@ -914,23 +920,25 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
 
     // ADC state cache: skip get_residual + q_norm_sq loop + build_tier1_query on
     // repeated visits to the same cluster.
-    // 8 slots × 144 bytes = 1152 bytes (fits in L1). DABS visits 3-15 unique clusters
+    // Dynamic q_int8 supports variable D. DABS visits 3-15 unique clusters
     // per query; 8 slots eliminate evictions for typical cases, reducing tail latency.
     constexpr int ADC_SLOTS = 8;
-    struct ADCSlot {
-        uint32_t cid;
-        float    q_norm_sq;
-        float    q_norm;
-        int32_t  q_sum;
-        int8_t   q_int8[128];
+    struct ADCSlotDyn {
+        uint32_t cid      = UINT32_MAX;
+        float    q_norm_sq = 0.f;
+        float    q_norm    = 0.f;
+        int32_t  q_sum     = 0;
+        std::vector<int8_t> q_int8;
+        explicit ADCSlotDyn(int dim) : q_int8(dim, 0) {}
+        ADCSlotDyn() : q_int8() {}
     };
-    ADCSlot adc_cache[ADC_SLOTS];
+    std::vector<ADCSlotDyn> adc_cache(ADC_SLOTS, ADCSlotDyn(D));
     // Slot 0 = initial cluster (ADC state already computed above)
     adc_cache[0].cid       = active_cid;
     adc_cache[0].q_norm_sq = adc.q_norm_sq;
     adc_cache[0].q_norm    = adc.q_norm;
     adc_cache[0].q_sum     = adc.q_sum;
-    std::memcpy(adc_cache[0].q_int8, adc.q_int8.data(), 128);
+    std::memcpy(adc_cache[0].q_int8.data(), adc.q_int8.data(), (size_t)D);
     for (int s = 1; s < ADC_SLOTS; ++s) adc_cache[s].cid = UINT32_MAX;
     int adc_cache_hand = 1;
 
@@ -941,9 +949,9 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
     // LUT rebuild needed — costs only ~5μs (1000 tier2_adc_pq calls × ~5ns) per query.
     // Note: full tier-2 heap routing was tested and regressed QPS 8x — accurate distances
     // delay DABS stopping criterion, causing many more node visits than tier-1 allows.
-    auto adc_dist = [&](const NGT::NGTAQ::VectorRecord& rec) -> float {
-        float norm_x = NGT::NGTAQ::fp16_to_float(rec.norm_fp16);
-        float t1 = NGT::NGTAQ::tier1_adc_fast(adc.q_int8.data(), rec.tier1, adc.q_sum);
+    auto adc_dist = [&](const NGT::NGTAQ::VectorRecordConstView& rec) -> float {
+        float norm_x = NGT::NGTAQ::fp16_to_float(rec.norm_fp16());
+        float t1 = NGT::NGTAQ::tier1_adc_fast_d(adc.q_int8.data(), rec.tier1(), adc.q_sum, D);
         float t1_ip = adc.q_norm * norm_x * NGT::NGTAQ::RABITQ_SCALE * t1 * inv_sqrt_D / 127.f;
         return adc.q_norm_sq + norm_x * norm_x - 2.0f * t1_ip;
     };
@@ -960,7 +968,7 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
                 adc.q_norm_sq = adc_cache[s].q_norm_sq;
                 adc.q_norm    = adc_cache[s].q_norm;
                 adc.q_sum     = adc_cache[s].q_sum;
-                std::memcpy(adc.q_int8.data(), adc_cache[s].q_int8, 128);
+                std::memcpy(adc.q_int8.data(), adc_cache[s].q_int8.data(), (size_t)D);
                 return;
             }
         }
@@ -978,17 +986,18 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
         adc_cache[slot].q_norm_sq = adc.q_norm_sq;
         adc_cache[slot].q_norm    = adc.q_norm;
         adc_cache[slot].q_sum     = adc.q_sum;
-        std::memcpy(adc_cache[slot].q_int8, adc.q_int8.data(), 128);
+        std::memcpy(adc_cache[slot].q_int8.data(), adc.q_int8.data(), (size_t)D);
     };
 
     // Tier-2 seed scoring: build LUT from initial cluster, pre-sort all cluster seeds
     // by tier-2 distance. Better seeds → routing converges faster → higher recall at
     // same gamma_term. Cost: 1 LUT build (~0.5μs AVX2) + N_seeds × 10ns ADC.
     // LUT built from q_res_initial (saved before routing modifies q_res).
-    float t2_seed_lut[16][256];
-    NGT::NGTAQ::build_tier2_lut_fast(q_res_initial.data(), D,
-                                      tier2_codebook_T_.data(),
-                                      t2_seed_lut);
+    static thread_local std::vector<float> t2_lut_tl;
+    t2_lut_tl.resize(static_cast<size_t>(M_PQ) * 256);
+    NGT::NGTAQ::build_tier2_lut_fast_m(q_res_initial.data(), M_PQ,
+                                        tier2_codebook_T_.data(),
+                                        t2_lut_tl.data());
 
     // Cluster-aware seeding: use members of the query's nearest cluster as entry points.
     // This places the search start close to where the true neighbors are, typically
@@ -1046,9 +1055,9 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
             scored.reserve(seeds.size());
             for (uint32_t ep : seeds) {
                 if (ep >= N || graph_->isTombstone(ep)) continue;
-                const auto& rec = graph_->getRecord(ep);
-                float norm_x = NGT::NGTAQ::fp16_to_float(rec.norm_fp16);
-                float t2_ip = NGT::NGTAQ::tier2_adc_pq(t2_seed_lut, rec.tier2);
+                auto rec = graph_->getRecordConstView(ep);
+                float norm_x = NGT::NGTAQ::fp16_to_float(rec.norm_fp16());
+                float t2_ip = NGT::NGTAQ::tier2_adc_pq_m(t2_lut_tl.data(), rec.tier2(), M_PQ);
                 // Use initial-cluster residual norm for L2 estimate
                 float d_approx = q_norm_sq_initial + norm_x * norm_x - 2.0f * t2_ip;
                 scored.push_back({d_approx, ep});
@@ -1059,8 +1068,8 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
             for (const auto& s : scored) {
                 if (is_visited(s.id)) continue;
                 mark_visited(s.id);
-                const auto& rec = graph_->getRecord(s.id);
-                maybe_rebuild_adc(rec.centroid_id);
+                auto rec = graph_->getRecordConstView(s.id);
+                maybe_rebuild_adc(rec.centroid_id());
                 float d = adc_dist(rec);
                 cand_q.push({d, s.id});
                 graph_->prefetchOffset(s.id);
@@ -1086,7 +1095,7 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
         // Prefetch current node's neighbor list (hides CSR access latency)
         graph_->prefetchNeighbors(x);
 
-        const auto& rec_x = graph_->getRecord(x);
+        auto rec_x = graph_->getRecordConstView(x);
 
         // Two-gate gamma_term: tier-1 noise (~44% std) can inflate a true near-neighbor's
         // heap estimate above threshold. Verify with tier-2 PQ (lower noise, ~10%) before
@@ -1095,14 +1104,14 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
         // 1 tier2_adc_pq (~5ns) per uncertain termination candidate.
         if (dk_tracker.size() >= static_cast<size_t>(k_beam) &&
             dist_x > (1.f + gamma_term) * d_k) {
-            float nx2  = NGT::NGTAQ::fp16_to_float(rec_x.norm_fp16);
-            float t2ip = NGT::NGTAQ::tier2_adc_pq(t2_seed_lut, rec_x.tier2);
+            float nx2  = NGT::NGTAQ::fp16_to_float(rec_x.norm_fp16());
+            float t2ip = NGT::NGTAQ::tier2_adc_pq_m(t2_lut_tl.data(), rec_x.tier2(), M_PQ);
             float d_t2 = q_norm_sq_initial + nx2 * nx2 - 2.0f * t2ip;
             if (d_t2 > (1.f + gamma_term) * d_k) break;
             // tier-2 override: tier-1 overestimated this node — continue processing
         }
 
-        maybe_rebuild_adc(rec_x.centroid_id);
+        maybe_rebuild_adc(rec_x.centroid_id());
         float d_approx = adc_dist(rec_x);
 
         // Add ALL popped candidates to results for exact reranking.
@@ -1134,8 +1143,8 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
             if (u >= N || graph_->isTombstone(u)) continue;
             if (is_visited(u)) continue;
             mark_visited(u);
-            const auto& rec_u = graph_->getRecord(u);
-            maybe_rebuild_adc(rec_u.centroid_id);
+            auto rec_u = graph_->getRecordConstView(u);
+            maybe_rebuild_adc(rec_u.centroid_id());
             float d_u = adc_dist(rec_u);
             // Skip hopeless candidates: when d_k is initialized, a node with
             // d_u > (1+gamma)*d_k would trigger the outer-loop termination as
@@ -1179,8 +1188,8 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
                 if (u >= static_cast<uint32_t>(N) || graph_->isTombstone(u)) continue;
                 if (is_visited(u)) continue;
                 mark_visited(u);
-                const auto& rec_u = graph_->getRecord(u);
-                maybe_rebuild_adc(rec_u.centroid_id);
+                auto rec_u = graph_->getRecordConstView(u);
+                maybe_rebuild_adc(rec_u.centroid_id());
                 float d_u = adc_dist(rec_u);
                 results.push_back({d_u, u});
             }
@@ -1465,21 +1474,8 @@ void NGTAQIndex::loadV2(const std::string& dir) {
         f.read(reinterpret_cast<char*>(eig.data()),  eig.size()  * sizeof(float));
         pca_v2_->set_state(std::move(comp), std::move(mean), std::move(eig));
     }
-    // Tier-2 codebook: M=16 sub-spaces × K=256 codes × D_sub dims
-    {
-        std::ifstream f(dir + "/v2_codebook.bin", std::ios::binary);
-        const int D_sub = prop_.dimension / 16;
-        tier2_codebook_.resize((size_t)16 * 256 * D_sub);
-        f.read(reinterpret_cast<char*>(tier2_codebook_.data()),
-               tier2_codebook_.size() * sizeof(float));
-        // Build transposed codebook [M][D_sub][K] for AVX2 FMA LUT build
-        tier2_codebook_T_.resize(tier2_codebook_.size());
-        NGT::NGTAQ::build_tier2_codebook_T(
-            tier2_codebook_.data(), 16, 256, D_sub,
-            tier2_codebook_T_.data());
-    }
-    is_v2_ = true;
     // New metadata: is_angular_, d_eff_, m_pq_ (optional — may not exist in old indices)
+    // Must be read BEFORE codebook so M_cb and D_sub are known.
     {
         std::string meta_path = dir + "/v2_meta.bin";
         FILE* f = fopen(meta_path.c_str(), "rb");
@@ -1495,6 +1491,21 @@ void NGTAQIndex::loadV2(const std::string& dir) {
         if (m_pq_ <= 0) m_pq_ = 16;
         if (d_eff_ <= 0) d_eff_ = prop_.dimension;
     }
+    // Tier-2 codebook: M_cb sub-spaces × K=256 codes × D_sub=8 dims
+    {
+        std::ifstream f(dir + "/v2_codebook.bin", std::ios::binary);
+        const int M_cb  = m_pq_;   // derived from metadata
+        const int D_sub = 8;       // always 8 dims per sub-space
+        tier2_codebook_.resize((size_t)M_cb * 256 * D_sub);
+        f.read(reinterpret_cast<char*>(tier2_codebook_.data()),
+               tier2_codebook_.size() * sizeof(float));
+        // Build transposed codebook [M][D_sub][K] for AVX2 FMA LUT build
+        tier2_codebook_T_.resize(tier2_codebook_.size());
+        NGT::NGTAQ::build_tier2_codebook_T(
+            tier2_codebook_.data(), M_cb, 256, D_sub,
+            tier2_codebook_T_.data());
+    }
+    is_v2_ = true;
 }
 
 } // namespace NGTAQ

@@ -385,13 +385,17 @@ public:
             v2_records_flat_.resize((size_t)hdr[0] * v2_rec_stride_);
             fread(v2_records_flat_.data(), 1, v2_records_flat_.size(), f);
         } else {
-            // Old format: raw VectorRecord[] without header — stride=38
+            // Old format: raw VectorRecord[] — stride=38, possibly with a small legacy header.
+            // Detect header size by computing sz % 38: any header bytes are not multiples of 38.
             fseek(f, 0, SEEK_END);
             long sz = ftell(f);
-            fseek(f, 0, SEEK_SET);
             v2_tier1_n_ = 16; v2_tier2_n_ = 16; v2_rec_stride_ = 38;
-            v2_records_flat_.resize(sz);
-            fread(v2_records_flat_.data(), 1, sz, f);
+            // Skip any legacy header bytes (sz % 38 bytes at front of file)
+            long header_bytes = sz % 38;
+            fseek(f, header_bytes, SEEK_SET);
+            long data_bytes = sz - header_bytes;
+            v2_records_flat_.resize(static_cast<size_t>(data_bytes));
+            fread(v2_records_flat_.data(), 1, static_cast<size_t>(data_bytes), f);
         }
         fclose(f);
     }

@@ -1,7 +1,9 @@
 if( ${UNIX} )
 	option(NGT_SHARED_MEMORY_ALLOCATOR "enable shared memory" OFF)
 	configure_file(${CMAKE_CURRENT_SOURCE_DIR}/defines.h.in ${CMAKE_CURRENT_BINARY_DIR}/defines.h)
-	include_directories("${CMAKE_CURRENT_BINARY_DIR}" "${PROJECT_SOURCE_DIR}/lib" "${PROJECT_BINARY_DIR}/lib/")
+	# Build-dir paths come first so the generated defines.h (with correct cmake-set flags)
+	# takes precedence over the source-tree defines.h fallback.
+	include_directories("${CMAKE_CURRENT_BINARY_DIR}" "${PROJECT_BINARY_DIR}/lib/" "${PROJECT_SOURCE_DIR}/lib")
 
 	if(${NGT_QBG_DISABLED})
 		file(GLOB NGT_SOURCES *.cpp NGTAQ/*.cpp)
