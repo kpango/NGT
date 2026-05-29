@@ -72,6 +72,8 @@ int main(int argc, char** argv) {
                 float inv = 1.f / std::sqrt(norm2);
                 for (int d = 0; d < D_eff; ++d) dst[d] *= inv;
             }
+            // Zero/degenerate vectors (norm<=1e-12) remain as zero — fromNGTv2
+            // treats them as holes (is_hole=true) and excludes them from the index.
         }
     }
     fprintf(stderr, "[Prep] %d vectors padded%s (%.1fs)\n",
@@ -84,6 +86,8 @@ int main(int argc, char** argv) {
     NGT::Property ngt_prop;
     ngt_prop.dimension           = D_eff;
     ngt_prop.objectType          = NGT::ObjectSpace::ObjectType::Float;
+    // For angular/cosine: use L2 on already-normalized vectors (equivalent to cosine),
+    // which produces better ANNG connectivity than DistanceTypeAngle on pre-normalized data.
     ngt_prop.distanceType        = NGT::ObjectSpace::DistanceType::DistanceTypeL2;
     ngt_prop.edgeSizeForCreation = edge_size;
 

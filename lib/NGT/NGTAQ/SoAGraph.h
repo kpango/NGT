@@ -373,29 +373,34 @@ public:
 
     void loadV2Records(const std::string& path) {
         FILE* f = fopen(path.c_str(), "rb");
-        if (!f) throw std::runtime_error("SoAGraph::loadV2Records: cannot open " + path);
-        // Try to read new 4-uint32 header; if file is old format (just raw VectorRecord data), fall back
+        if (!f) throw std::runtime_error("loadV2Records: cannot open " + path);
+        // Get total file size
+        fseek(f, 0, SEEK_END);
+        long sz = ftell(f);
+        fseek(f, 0, SEEK_SET);
+        // Try reading a 4×uint32 header
         uint32_t hdr[4] = {0, 16, 16, 38};
-        size_t nr = fread(hdr, sizeof(hdr), 1, f);
-        if (nr == 1 && hdr[1] >= 8 && hdr[2] >= 8 && hdr[3] >= 38) {
-            // New format: hdr[0]=n_recs, hdr[1]=tier1_n, hdr[2]=tier2_n, hdr[3]=stride
+        bool got_hdr = (fread(hdr, sizeof(hdr), 1, f) == 1);
+        // Validate new format: tier1_n == tier2_n, both powers-of-2 in [8,128],
+        // stride == tier1_n + tier2_n + 6, file size == n_recs*stride + 16(header)
+        bool new_fmt = got_hdr
+            && hdr[1] == hdr[2]
+            && hdr[3] == (uint32_t)(hdr[1] + hdr[2] + 6)
+            && hdr[1] >= 8 && hdr[1] <= 128
+            && (hdr[1] & (hdr[1] - 1)) == 0  // power of 2
+            && sz == (long)(16 + (uint64_t)hdr[0] * hdr[3]);
+        if (new_fmt) {
             v2_tier1_n_    = (int)hdr[1];
             v2_tier2_n_    = (int)hdr[2];
             v2_rec_stride_ = (int)hdr[3];
             v2_records_flat_.resize((size_t)hdr[0] * v2_rec_stride_);
             fread(v2_records_flat_.data(), 1, v2_records_flat_.size(), f);
         } else {
-            // Old format: raw VectorRecord[] — stride=38, possibly with a small legacy header.
-            // Detect header size by computing sz % 38: any header bytes are not multiples of 38.
-            fseek(f, 0, SEEK_END);
-            long sz = ftell(f);
+            // Old format: raw VectorRecord[N] without header (stride=38, D=128 only)
+            fseek(f, 0, SEEK_SET);
             v2_tier1_n_ = 16; v2_tier2_n_ = 16; v2_rec_stride_ = 38;
-            // Skip any legacy header bytes (sz % 38 bytes at front of file)
-            long header_bytes = sz % 38;
-            fseek(f, header_bytes, SEEK_SET);
-            long data_bytes = sz - header_bytes;
-            v2_records_flat_.resize(static_cast<size_t>(data_bytes));
-            fread(v2_records_flat_.data(), 1, static_cast<size_t>(data_bytes), f);
+            v2_records_flat_.resize(sz);
+            fread(v2_records_flat_.data(), 1, sz, f);
         }
         fclose(f);
     }

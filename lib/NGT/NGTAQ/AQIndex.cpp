@@ -586,6 +586,10 @@ NGTAQIndex NGTAQIndex::fromNGTv2(const std::string& ngt_path, const Property& pr
     fprintf(stderr, "[NGTAQv2] Loaded %zu vectors D_orig=%d D_eff=%d\n", N, D_orig, D);
 
     // ---- 1b. Angular/Cosine: L2-normalize all raw vectors ----
+    // Zero/degenerate vectors (norm <= 1e-6) are marked as holes: they cannot be
+    // meaningfully normalized and would pollute cluster centroids and graph edges,
+    // causing probe queries to become trapped in zero-vector clusters with distance=q_norm_sq.
+    int n_zero = 0;
     if (prop.metric == NGT::ObjectSpace::DistanceTypeAngle ||
         prop.metric == NGT::ObjectSpace::DistanceTypeCosine) {
         for (size_t i = 0; i < N; ++i) {
@@ -595,9 +599,14 @@ NGTAQIndex NGTAQIndex::fromNGTv2(const std::string& ngt_path, const Property& pr
             if (norm2 > 1e-12f) {
                 float inv = 1.f / std::sqrt(norm2);
                 for (int d = 0; d < D; ++d) v[d] *= inv;
+            } else {
+                // Degenerate vector: mark as hole so it is excluded from the graph
+                is_hole[i] = true;
+                ++n_zero;
             }
         }
-        fprintf(stderr, "[NGTAQv2] Angular: L2-normalized %zu vectors\n", N);
+        fprintf(stderr, "[NGTAQv2] Angular: L2-normalized %zu vectors (%d degenerate holes)\n",
+                N, n_zero);
     }
 
     // ---- 2. SRHT: rotate all vectors ----
