@@ -1,10 +1,13 @@
 // tests/ngtaq/build_ngt_sift1m.cpp
 // Build a persistent NGT index from SIFT-1M sift_base.fvecs.
 //
-// Usage: ./build_ngt_sift1m <sift_base.fvecs> <output_ngt_path> [batch_size=50000]
+// Usage: ./build_ngt_sift1m <sift_base.fvecs> <output_ngt_path> [batch_size=50000] [edge_size=10]
 //
-// Example:
+// Example (default k=10):
 //   ./build_ngt_sift1m data/sift1m/sift/sift_base.fvecs /tmp/sift1m_ngt
+//
+// Example (denser k=30):
+//   ./build_ngt_sift1m data/sift1m/sift/sift_base.fvecs /tmp/sift1m_ngt_k30 50000 30
 #include "NGT/Index.h"
 #include "fvecs_io.h"
 #include <chrono>
@@ -14,12 +17,13 @@
 int main(int argc, char** argv) {
     if (argc < 3) {
         std::cerr << "Usage: " << argv[0]
-                  << " <sift_base.fvecs> <output_ngt_path> [batch_size=50000]\n";
+                  << " <sift_base.fvecs> <output_ngt_path> [batch_size=50000] [edge_size=10]\n";
         return 1;
     }
     const std::string fvecs_path = argv[1];
     const std::string ngt_path   = argv[2];
     size_t batch_size = 50000;
+    int    edge_size  = 10;
     if (argc > 3) {
         try {
             int bs = std::stoi(argv[3]);
@@ -27,6 +31,15 @@ int main(int argc, char** argv) {
             batch_size = static_cast<size_t>(bs);
         } catch (const std::exception&) {
             std::cerr << "Invalid batch_size: " << argv[3] << "\n";
+            return 1;
+        }
+    }
+    if (argc > 4) {
+        try {
+            edge_size = std::stoi(argv[4]);
+            if (edge_size <= 0) { std::cerr << "edge_size must be positive\n"; return 1; }
+        } catch (const std::exception&) {
+            std::cerr << "Invalid edge_size: " << argv[4] << "\n";
             return 1;
         }
     }
@@ -48,11 +61,13 @@ int main(int argc, char** argv) {
 
     // Create NGT index
     NGT::Property prop;
-    prop.dimension    = D;
-    prop.objectType   = NGT::ObjectSpace::ObjectType::Float;
-    prop.distanceType = NGT::ObjectSpace::DistanceType::DistanceTypeL2;
+    prop.dimension             = D;
+    prop.objectType            = NGT::ObjectSpace::ObjectType::Float;
+    prop.distanceType          = NGT::ObjectSpace::DistanceType::DistanceTypeL2;
+    prop.edgeSizeForCreation   = edge_size;
 
-    std::cout << "Creating NGT index at " << ngt_path << " ...\n";
+    std::cout << "Creating NGT index at " << ngt_path
+              << " (edgeSizeForCreation=" << edge_size << ") ...\n";
     try {
         NGT::Index::create(ngt_path, prop);
         NGT::Index ngt(ngt_path);
