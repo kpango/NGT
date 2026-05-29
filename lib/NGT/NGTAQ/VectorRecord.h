@@ -98,4 +98,62 @@ inline uint8_t get_tier2_byte(const VectorRecord& rec, int i) {
     return rec.tier2[i];
 }
 
+// ============================================================
+// Variable-stride VectorRecord view (for D_eff != 128)
+// ============================================================
+
+/// Stride in bytes for a VectorRecord with D_eff dimensions.
+/// tier1 = D_eff/8 bytes,  tier2 = D_eff/8 bytes,  norm = 2B,  centroid = 4B.
+constexpr int vrec_stride(int D_eff) { return D_eff / 4 + 6; }
+
+/// Mutable view into a variable-stride record
+struct VectorRecordView {
+    uint8_t* ptr;
+    int tier1_n;  ///< = D_eff / 8
+    int tier2_n;  ///< = D_eff / 8
+
+    uint8_t*       tier1()  const { return ptr; }
+    uint8_t*       tier2()  const { return ptr + tier1_n; }
+
+    uint16_t norm_fp16()    const { uint16_t v; memcpy(&v, ptr+tier1_n+tier2_n,   2); return v; }
+    uint32_t centroid_id()  const { uint32_t v; memcpy(&v, ptr+tier1_n+tier2_n+2, 4); return v; }
+    void set_norm_fp16 (uint16_t v) { memcpy(ptr+tier1_n+tier2_n,   &v, 2); }
+    void set_centroid_id(uint32_t v){ memcpy(ptr+tier1_n+tier2_n+2, &v, 4); }
+
+    void set_tier1_bit(int i, bool v) const {
+        if (v) tier1()[i>>3] |=  (uint8_t)(1u<<(i&7));
+        else   tier1()[i>>3] &= ~(uint8_t)(1u<<(i&7));
+    }
+    bool get_tier1_bit(int i)         const { return (tier1()[i>>3]>>(i&7))&1; }
+    void set_tier2_byte(int i, uint8_t v) const { tier2()[i] = v; }
+    uint8_t get_tier2_byte(int i)          const { return tier2()[i]; }
+};
+
+/// Const view
+struct VectorRecordConstView {
+    const uint8_t* ptr;
+    int tier1_n;
+    int tier2_n;
+
+    const uint8_t* tier1()  const { return ptr; }
+    const uint8_t* tier2()  const { return ptr + tier1_n; }
+
+    uint16_t norm_fp16()   const { uint16_t v; memcpy(&v, ptr+tier1_n+tier2_n,   2); return v; }
+    uint32_t centroid_id() const { uint32_t v; memcpy(&v, ptr+tier1_n+tier2_n+2, 4); return v; }
+    bool get_tier1_bit(int i)          const { return (tier1()[i>>3]>>(i&7))&1; }
+    uint8_t get_tier2_byte(int i)      const { return tier2()[i]; }
+};
+
+inline VectorRecordView vrec_view(uint8_t* base, uint32_t id, int tier1_n, int tier2_n) {
+    return {base + (size_t)id * (size_t)(tier1_n + tier2_n + 6), tier1_n, tier2_n};
+}
+inline VectorRecordConstView vrec_const_view(const uint8_t* base, uint32_t id, int t1n, int t2n) {
+    return {base + (size_t)id * (size_t)(t1n + t2n + 6), t1n, t2n};
+}
+
+/// Helper for reading fixed D=128 VectorRecord as VectorRecordConstView
+inline VectorRecordConstView vrec_from_fixed(const VectorRecord& r) {
+    return {reinterpret_cast<const uint8_t*>(&r), 16, 16};
+}
+
 }} // NGT::NGTAQ

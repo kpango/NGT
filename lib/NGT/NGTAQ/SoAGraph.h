@@ -174,12 +174,33 @@ public:
         }
         fresh.offsets_.push_back(static_cast<uint32_t>(fresh.edge_ids_.size()));
 
+        // Migrate v2 flat storage: compact active nodes only, preserving stride config.
+        if (!v2_records_flat_.empty()) {
+            fresh.v2_tier1_n_    = v2_tier1_n_;
+            fresh.v2_tier2_n_    = v2_tier2_n_;
+            fresh.v2_rec_stride_ = v2_rec_stride_;
+            fresh.v2_records_flat_.resize((size_t)new_id * v2_rec_stride_, 0);
+            uint32_t dst = 0;
+            for (uint32_t i = 0; i < static_cast<uint32_t>(N); ++i) {
+                if (state_[i] != ACTIVE) continue;
+                if ((size_t)i * v2_rec_stride_ + v2_rec_stride_ <= v2_records_flat_.size())
+                    memcpy(fresh.v2_records_flat_.data() + (size_t)dst * v2_rec_stride_,
+                           v2_records_flat_.data()       + (size_t)i   * v2_rec_stride_,
+                           v2_rec_stride_);
+                ++dst;
+            }
+        }
+
         // Move all data members individually — mutex_ cannot be moved/copied.
-        words_    = fresh.words_;
-        state_    = std::move(fresh.state_);
-        offsets_  = std::move(fresh.offsets_);
-        edge_ids_ = std::move(fresh.edge_ids_);
-        bq_data_  = std::move(fresh.bq_data_);
+        words_           = fresh.words_;
+        state_           = std::move(fresh.state_);
+        offsets_         = std::move(fresh.offsets_);
+        edge_ids_        = std::move(fresh.edge_ids_);
+        bq_data_         = std::move(fresh.bq_data_);
+        v2_records_flat_ = std::move(fresh.v2_records_flat_);
+        v2_tier1_n_      = fresh.v2_tier1_n_;
+        v2_tier2_n_      = fresh.v2_tier2_n_;
+        v2_rec_stride_   = fresh.v2_rec_stride_;
     }
 
     // RW lock for external thread safety
@@ -241,14 +262,15 @@ public:
     };
     static_assert(sizeof(PackedV2Node) == 320, "PackedV2Node must be 320 bytes");
 
-    // Build packed layout from v2_records_ + CSR.  Call after all setRecord()
+    // Build packed layout from v2_records_flat_ + CSR.  Call after all setRecord()
     // and finalizeCSR() are done (fromNGTv2 / loadV2 tail).
     void buildPackedV2() {
         const size_t N = state_.size();
         packed_v2_.resize(N);
         for (uint32_t i = 0; i < static_cast<uint32_t>(N); ++i) {
             auto& pn = packed_v2_[i];
-            if (i < v2_records_.size()) pn.rec = v2_records_[i];
+            if ((size_t)i * 38 + 38 <= v2_records_flat_.size())
+                memcpy(&pn.rec, v2_records_flat_.data() + (size_t)i * 38, 38);
             // Read neighbors from CSR
             uint32_t off_b = offsets_[i];
             uint32_t off_e = (i + 1 < offsets_.size()) ? offsets_[i + 1] : off_b;
@@ -277,28 +299,48 @@ public:
         __builtin_prefetch(p + 256, 0, 1);
     }
 
-    // ---- v2 VectorRecord storage (optional, empty if not built) ----
+    // ---- v2 VectorRecord flat byte storage (optional, empty if not built) ----
+    // stride = v2_rec_stride_ = v2_tier1_n_ + v2_tier2_n_ + 6
+    // Default: D_eff=128 → tier1=16B, tier2=16B, stride=38B
 
-    void reserveV2(size_t n) {
-        v2_records_.resize(n);
+    void reserveV2(size_t n, int tier1_n = 16, int tier2_n = 16) {
+        v2_tier1_n_    = tier1_n;
+        v2_tier2_n_    = tier2_n;
+        v2_rec_stride_ = tier1_n + tier2_n + 6;
+        v2_records_flat_.assign((size_t)n * v2_rec_stride_, 0);
     }
 
+    // D=128 backward compat: assumes stride=38
     void setRecord(uint32_t node_id, const NGT::NGTAQ::VectorRecord& rec) {
-        if (static_cast<size_t>(node_id) >= v2_records_.size())
-            v2_records_.resize(node_id + 1);
-        v2_records_[node_id] = rec;
+        if ((size_t)node_id * 38 + 38 > v2_records_flat_.size())
+            v2_records_flat_.resize(((size_t)node_id + 1) * 38, 0);
+        memcpy(v2_records_flat_.data() + (size_t)node_id * 38, &rec, 38);
     }
 
+    void setRecordView(uint32_t node_id, NGT::NGTAQ::VectorRecordView view) {
+        memcpy(v2_records_flat_.data() + (size_t)node_id * v2_rec_stride_, view.ptr, v2_rec_stride_);
+    }
+
+    NGT::NGTAQ::VectorRecordView getRecordView(uint32_t node_id) {
+        return NGT::NGTAQ::vrec_view(v2_records_flat_.data(), node_id, v2_tier1_n_, v2_tier2_n_);
+    }
+
+    // D=128 only: reinterpret flat bytes as VectorRecord
     const NGT::NGTAQ::VectorRecord& getRecord(uint32_t node_id) const {
-        return v2_records_[node_id];
+        return *reinterpret_cast<const NGT::NGTAQ::VectorRecord*>(
+            v2_records_flat_.data() + (size_t)node_id * 38);
+    }
+
+    NGT::NGTAQ::VectorRecordConstView getRecordConstView(uint32_t node_id) const {
+        return NGT::NGTAQ::vrec_const_view(v2_records_flat_.data(), node_id, v2_tier1_n_, v2_tier2_n_);
     }
 
     // Prefetch helpers: issue non-blocking cache hints to hide DRAM latency.
     // Call PREFETCH_DIST iterations ahead of the actual access.
     // locality 3=L1, 2=L2, 1=L3, 0=nontemporal
     void prefetchRecord(uint32_t node_id) const {
-        if (node_id < v2_records_.size())
-            __builtin_prefetch(&v2_records_[node_id], 0, 3);
+        if ((size_t)node_id * v2_rec_stride_ < v2_records_flat_.size())
+            __builtin_prefetch(v2_records_flat_.data() + (size_t)node_id * v2_rec_stride_, 0, 3);
     }
     void prefetchNeighbors(uint32_t node_id) const {
         if (static_cast<size_t>(node_id) + 1 < offsets_.size())
@@ -313,26 +355,44 @@ public:
             __builtin_prefetch(&offsets_[node_id], 0, 3);
     }
 
-    bool hasV2Records() const { return !v2_records_.empty(); }
+    bool hasV2Records() const { return !v2_records_flat_.empty(); }
+    int  v2Tier1N()    const { return v2_tier1_n_; }
+    int  v2Tier2N()    const { return v2_tier2_n_; }
+    int  v2RecStride() const { return v2_rec_stride_; }
 
     void saveV2Records(const std::string& path) const {
         FILE* f = fopen(path.c_str(), "wb");
         if (!f) throw std::runtime_error("SoAGraph::saveV2Records: cannot open " + path);
-        uint64_t n = v2_records_.size();
-        fwrite(&n, sizeof(n), 1, f);
-        if (n > 0)
-            fwrite(v2_records_.data(), sizeof(NGT::NGTAQ::VectorRecord), n, f);
+        int stride = std::max(v2_rec_stride_, 1);
+        uint32_t n_recs = (uint32_t)(v2_records_flat_.size() / stride);
+        uint32_t hdr[4] = {n_recs, (uint32_t)v2_tier1_n_, (uint32_t)v2_tier2_n_, (uint32_t)v2_rec_stride_};
+        fwrite(hdr, sizeof(hdr), 1, f);
+        fwrite(v2_records_flat_.data(), 1, v2_records_flat_.size(), f);
         fclose(f);
     }
 
     void loadV2Records(const std::string& path) {
         FILE* f = fopen(path.c_str(), "rb");
         if (!f) throw std::runtime_error("SoAGraph::loadV2Records: cannot open " + path);
-        uint64_t n = 0;
-        fread(&n, sizeof(n), 1, f);
-        v2_records_.resize(n);
-        if (n > 0)
-            fread(v2_records_.data(), sizeof(NGT::NGTAQ::VectorRecord), n, f);
+        // Try to read new 4-uint32 header; if file is old format (just raw VectorRecord data), fall back
+        uint32_t hdr[4] = {0, 16, 16, 38};
+        size_t nr = fread(hdr, sizeof(hdr), 1, f);
+        if (nr == 1 && hdr[1] >= 8 && hdr[2] >= 8 && hdr[3] >= 38) {
+            // New format: hdr[0]=n_recs, hdr[1]=tier1_n, hdr[2]=tier2_n, hdr[3]=stride
+            v2_tier1_n_    = (int)hdr[1];
+            v2_tier2_n_    = (int)hdr[2];
+            v2_rec_stride_ = (int)hdr[3];
+            v2_records_flat_.resize((size_t)hdr[0] * v2_rec_stride_);
+            fread(v2_records_flat_.data(), 1, v2_records_flat_.size(), f);
+        } else {
+            // Old format: raw VectorRecord[] without header — stride=38
+            fseek(f, 0, SEEK_END);
+            long sz = ftell(f);
+            fseek(f, 0, SEEK_SET);
+            v2_tier1_n_ = 16; v2_tier2_n_ = 16; v2_rec_stride_ = 38;
+            v2_records_flat_.resize(sz);
+            fread(v2_records_flat_.data(), 1, sz, f);
+        }
         fclose(f);
     }
 
@@ -343,7 +403,10 @@ private:
     std::vector<uint32_t> edge_ids_;   // CSR edge data
     std::vector<uint64_t> bq_data_;    // interleaved BQ [N * 2 * words_]: [s0,m0,s1,m1,...]
     mutable std::shared_mutex mutex_;
-    std::vector<NGT::NGTAQ::VectorRecord> v2_records_;
+    std::vector<uint8_t>  v2_records_flat_;   // flat byte array, stride = v2_rec_stride_
+    int v2_tier1_n_    = 16;   // D_eff / 8  (16 for D_eff=128)
+    int v2_tier2_n_    = 16;   // D_eff / 8  (16 for D_eff=128)
+    int v2_rec_stride_ = 38;   // tier1+tier2+norm+centroid = D_eff/4+6
     std::vector<PackedV2Node>             packed_v2_;  // DiskANN-style packed layout
 };
 
