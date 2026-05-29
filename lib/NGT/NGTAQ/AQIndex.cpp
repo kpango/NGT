@@ -528,7 +528,9 @@ NGTAQIndex NGTAQIndex::fromNGTv2(const std::string& ngt_path, const Property& pr
         srht->apply(raw_flat.data() + i*D, rotated.data() + i*D);
 
     // ---- 3. K-means on rotated vectors ----
-    uint32_t K = NGT::NGTAQ::select_k(N);
+    uint32_t K = (prop.k_clusters > 0)
+                 ? static_cast<uint32_t>(prop.k_clusters)
+                 : NGT::NGTAQ::select_k(N);
     auto kmeans = std::make_unique<NGT::NGTAQ::KMeansCentering>(K, D, seed ^ 0xFFFF);
     fprintf(stderr, "[NGTAQv2] K-means K=%u...\n", K);
     kmeans->train(rotated.data(), N);
@@ -884,7 +886,8 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
     // This places the search start close to where the true neighbors are, typically
     // requiring fewer hops to converge → better recall at same gamma_term → higher QPS.
     // N_CLUSTER_SEEDS controls the breadth; 32 is a good default for K≈1000, N=1M.
-    constexpr int N_CLUSTER_SEEDS = 32;
+    // Larger values give tighter d_k initialization → earlier termination → higher QPS at same recall.
+    const int N_CLUSTER_SEEDS = prop_.n_cluster_seeds;
     // Neighboring clusters seeded via precomputed cluster_neighbors_v2_ (built in call_once)
     {
         // Gather seed IDs from the nearest cluster(s)
@@ -1013,7 +1016,7 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
             // soon as it's popped — it can never contribute to the top-k result.
             // Skipping the push avoids a wasted heap insertion+extraction.
             if (static_cast<int>(dk_tracker.size()) >= k &&
-                d_u > (1.f + gamma_term) * d_k)
+                d_u > (1.f + gamma_enq) * d_k)
                 continue;
             cand_q.push({d_u, u});
             // Prefetch offset for u: when u is eventually popped and

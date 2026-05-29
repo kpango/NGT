@@ -1,6 +1,6 @@
 // benchmark_single_gamma.cpp
 // Focused single-gamma benchmark to avoid thermal noise from sweep ordering.
-// Usage: ./bench_sg <cache_dir> <query.fvecs> <gt.ivecs> <gamma> [k=10] [nq=10000] [warmup=500]
+// Usage: ./bench_sg <cache_dir> <query.fvecs> <gt.ivecs> <gamma_term> [k=10] [nq=10000] [warmup=500] [gamma_enq=gamma_term]
 #include "NGT/NGTAQ/AQIndex.h"
 #include "fvecs_io.h"
 #include <algorithm>
@@ -34,19 +34,23 @@ static double pct(std::vector<double> v, double p) {
 int main(int argc, char** argv) {
     if (argc < 5) {
         std::cerr << "Usage: " << argv[0]
-                  << " <cache_dir> <query.fvecs> <gt.ivecs> <gamma> [k=10] [nq=10000] [warmup=500]\n";
+                  << " <cache_dir> <query.fvecs> <gt.ivecs> <gamma_term>"
+                  << " [k=10] [nq=10000] [warmup=500] [gamma_enq=gamma_term]\n";
         return 1;
     }
     const std::string cache_dir  = argv[1];
     const std::string query_path = argv[2];
     const std::string gt_path    = argv[3];
-    const float gamma  = std::stof(argv[4]);
-    const int k        = argc > 5 ? std::stoi(argv[5]) : 10;
-    const int nq_limit = argc > 6 ? std::stoi(argv[6]) : 10000;
-    const int n_warm   = argc > 7 ? std::stoi(argv[7]) : 500;
+    const float gamma_term = std::stof(argv[4]);
+    const int k            = argc > 5 ? std::stoi(argv[5]) : 10;
+    const int nq_limit     = argc > 6 ? std::stoi(argv[6]) : 10000;
+    const int n_warm       = argc > 7 ? std::stoi(argv[7]) : 500;
+    const float gamma_enq      = argc > 8 ? std::stof(argv[8]) : gamma_term;
+    const int   n_cluster_seeds = argc > 9 ? std::stoi(argv[9]) : 32;
 
     NGTAQ::NGTAQIndex idx = [&]() {
         auto i = NGTAQ::NGTAQIndex::load(cache_dir + "/aqindex");
+        i.setNClusterSeeds(n_cluster_seeds);
         i.loadV2(cache_dir);
         return i;
     }();
@@ -58,7 +62,7 @@ int main(int argc, char** argv) {
 
     // Warmup
     for (int i = 0; i < n_warm; ++i)
-        idx.searchV2(queries_2d[i % nq], k, 0.2f, gamma);
+        idx.searchV2(queries_2d[i % nq], k, gamma_enq, gamma_term);
     std::cerr << "Warmup done\n";
 
     // Measure
@@ -66,7 +70,7 @@ int main(int argc, char** argv) {
     double total_recall = 0.0;
     for (int i = 0; i < nq; ++i) {
         auto t0 = std::chrono::high_resolution_clock::now();
-        auto res = idx.searchV2(queries_2d[i], k, 0.2f, gamma);
+        auto res = idx.searchV2(queries_2d[i], k, gamma_enq, gamma_term);
         auto t1 = std::chrono::high_resolution_clock::now();
         lats[i] = std::chrono::duration<double, std::micro>(t1 - t0).count();
         std::vector<uint32_t> ids;
@@ -81,12 +85,13 @@ int main(int argc, char** argv) {
     double p99      = pct(lats, 99.0);
 
     std::cout << std::fixed
-              << "gamma=" << std::setprecision(3) << gamma
+              << "gamma_term=" << std::setprecision(3) << gamma_term
+              << "  gamma_enq=" << std::setprecision(3) << gamma_enq
               << "  recall=" << std::setprecision(4) << recall
               << "  QPS=" << std::setprecision(0) << qps
               << "  P50=" << std::setprecision(1) << p50 << "us"
               << "  P99=" << std::setprecision(1) << p99 << "us"
-              << (recall >= 0.80 ? "  *** >=0.80 ***" : "")
+              << (recall >= 0.90 ? "  *** >=0.90 ***" : recall >= 0.80 ? "  *** >=0.80 ***" : "")
               << "\n";
     return 0;
 }

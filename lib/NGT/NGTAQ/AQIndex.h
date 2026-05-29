@@ -34,6 +34,8 @@ public:
         int    n_entry_points   = 8;
         int    max_edges        = 64;
         int    n_search_threads = 0;   // 0 = omp_get_max_threads() at call time
+        int    k_clusters       = 0;   // 0 = use select_k(N); >0 overrides select_k
+        int    n_cluster_seeds  = 32;  // seeds per cluster for DABS warm-start (larger → tighter d_k init)
         NGT::ObjectSpace::DistanceType metric =
             NGT::ObjectSpace::DistanceTypeL2;
     };
@@ -51,6 +53,9 @@ public:
         searcher_.gamma_term     = gamma_term;
         if (k_prime_factor > 0.0f) searcher_.k_prime_factor = k_prime_factor;
     }
+
+    // Override cluster seed count at search time (not thread-safe while searchV2 is running).
+    void setNClusterSeeds(int n) { prop_.n_cluster_seeds = n; }
 
     // Batch search over multiple queries. Returns one result-vector per query.
     // Uses OpenMP with prop_.n_search_threads (0 = all available threads).
