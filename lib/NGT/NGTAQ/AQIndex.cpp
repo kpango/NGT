@@ -1041,12 +1041,7 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
     for (auto& [approx_d, id] : results) {
         if (static_cast<size_t>(id) * D + D > raw_flat_.size()) continue;
         const float* vec = raw_flat_.data() + static_cast<size_t>(id) * D;
-#if defined(__AVX2__)
-        float exact_sq = NGT::NGTAQ::l2_sq_avx2(query.data(), vec, D);
-#else
-        float exact_sq = 0.f;
-        for (int j = 0; j < D; ++j) { float d = query[j] - vec[j]; exact_sq += d*d; }
-#endif
+        float exact_sq = NGT::NGTAQ::l2_sq(query.data(), vec, D);
         // Store exact_sq in .distance temporarily (sqrt deferred until after sort).
         final_results.push_back({id, exact_sq, approx_d});
     }
