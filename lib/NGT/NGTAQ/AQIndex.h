@@ -84,9 +84,12 @@ public:
     static NGTAQIndex fromNGTv2(const std::string& ngt_path, const Property& prop);
 
     // ADC search using routeV2(). Requires is_v2_ == true.
+    // rerank_factor=0 or 1: standard beam width k (existing behavior).
+    // rerank_factor>1: internally searches k*rerank_factor candidates, returns top k.
     std::vector<SearchResult> searchV2(
         const std::vector<float>& query, int k,
-        float gamma_enq = 0.2f, float gamma_term = 0.4f) const;
+        float gamma_enq = 0.2f, float gamma_term = 0.4f,
+        int rerank_factor = 0) const;
 
     // Save/load v2 state to directory (separate from v1 state).
     void saveV2(const std::string& dir) const;
