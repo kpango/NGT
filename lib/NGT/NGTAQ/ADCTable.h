@@ -292,7 +292,27 @@ inline void build_tier2_lut_fast(const float* q_res, int D,
     const int K    = 256;
     const int D_sub = D / M;  // 8 for D=128
 
-#if defined(__AVX2__) && defined(__FMA__)
+#if defined(__AVX512F__)
+    // AVX-512F path: 16 × __m512 accumulators (K=256 → K/16=16 groups × 16 codes).
+    // Uses 32-wide zmm register file; halves accumulator count vs AVX2 (16 vs 32 regs).
+    const int K16 = K / 16;  // 16 groups of 16 codes
+    for (int sub = 0; sub < M; ++sub) {
+        const float* q_sub  = q_res + sub * D_sub;
+        const float* cb_sub = cb_T + sub * D_sub * K;
+        float*       out    = lut[sub];
+
+        __m512 acc[16];
+        for (int g = 0; g < K16; ++g) acc[g] = _mm512_setzero_ps();
+
+        for (int d = 0; d < D_sub; ++d) {
+            __m512 qd = _mm512_set1_ps(q_sub[d]);
+            const float* c_row = cb_sub + d * K;
+            for (int g = 0; g < K16; ++g)
+                acc[g] = _mm512_fmadd_ps(qd, _mm512_loadu_ps(c_row + g * 16), acc[g]);
+        }
+        for (int g = 0; g < K16; ++g) _mm512_storeu_ps(out + g * 16, acc[g]);
+    }
+#elif defined(__AVX2__) && defined(__FMA__)
     const int K8 = K / 8;  // 32 groups of 8 codes
     for (int sub = 0; sub < M; ++sub) {
         const float* q_sub  = q_res + sub * D_sub;
