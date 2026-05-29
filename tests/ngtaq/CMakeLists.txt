@@ -20,8 +20,11 @@ foreach(TEST_SRC
     benchmark_comparison
     benchmark_v2_fast
     benchmark_v2_clean
+    benchmark_v2_parallel
     benchmark_single_gamma
     build_ngtaqv2
+    rebuild_graph
+    refine_graph
     test_vector_record
     test_srht
     test_kmeans
@@ -37,3 +40,28 @@ foreach(TEST_SRC
         endif()
     endif()
 endforeach()
+
+# HDF5-dependent targets (ann_bench, build_ngtaqv2_ann)
+find_package(HDF5 QUIET COMPONENTS C)
+if(NOT HDF5_FOUND)
+    find_library(HDF5_C_LIB NAMES hdf5 hdf5_serial hdf5-serial)
+    if(HDF5_C_LIB)
+        set(HDF5_C_LIBRARIES ${HDF5_C_LIB})
+        set(HDF5_INCLUDE_DIRS "/usr/include" "/usr/include/hdf5/serial")
+        set(HDF5_FOUND TRUE)
+    endif()
+endif()
+
+if(HDF5_FOUND)
+    message(STATUS "HDF5 found: ${HDF5_C_LIBRARIES} -- building ann_bench and build_ngtaqv2_ann")
+    foreach(HDF5_SRC ann_bench build_ngtaqv2_ann)
+        if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${HDF5_SRC}.cpp")
+            add_executable(${HDF5_SRC} ${HDF5_SRC}.cpp)
+            target_include_directories(${HDF5_SRC} PRIVATE ${HDF5_INCLUDE_DIRS})
+            target_link_libraries(${HDF5_SRC} ngt ${HDF5_C_LIBRARIES})
+            target_compile_features(${HDF5_SRC} PRIVATE cxx_std_17)
+        endif()
+    endforeach()
+else()
+    message(WARNING "HDF5 not found -- skipping ann_bench and build_ngtaqv2_ann")
+endif()
