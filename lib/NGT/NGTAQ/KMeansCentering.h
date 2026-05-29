@@ -11,6 +11,7 @@
 #if defined(__AVX2__) || defined(__AVX__)
 #  include <immintrin.h>
 #endif
+#include "SIMDUtils.h"
 
 namespace NGT { namespace NGTAQ {
 
@@ -118,37 +119,9 @@ public:
     const std::vector<float>& centroids_data() const { return centroids_; }
     void set_centroids(std::vector<float>&& c) { centroids_ = std::move(c); }
 
-    // AVX2-accelerated L2 squared distance — public so call sites can reuse it.
-    // Falls back to scalar for the tail when D % 8 != 0.
+    // AVX-512F/AVX2/scalar unified L2² — dispatched via SIMDUtils.h
     static float l2sq(const float* __restrict__ a, const float* __restrict__ b, int D) {
-#if defined(__AVX2__)
-        __m256 s0 = _mm256_setzero_ps();
-        __m256 s1 = _mm256_setzero_ps();
-        int i = 0;
-        for (; i + 16 <= D; i += 16) {
-            __m256 d0 = _mm256_sub_ps(_mm256_loadu_ps(a+i),   _mm256_loadu_ps(b+i));
-            __m256 d1 = _mm256_sub_ps(_mm256_loadu_ps(a+i+8), _mm256_loadu_ps(b+i+8));
-            s0 = _mm256_fmadd_ps(d0, d0, s0);
-            s1 = _mm256_fmadd_ps(d1, d1, s1);
-        }
-        for (; i + 8 <= D; i += 8) {
-            __m256 d = _mm256_sub_ps(_mm256_loadu_ps(a+i), _mm256_loadu_ps(b+i));
-            s0 = _mm256_fmadd_ps(d, d, s0);
-        }
-        __m256 acc = _mm256_add_ps(s0, s1);
-        __m128 lo  = _mm256_castps256_ps128(acc);
-        __m128 hi  = _mm256_extractf128_ps(acc, 1);
-        __m128 s   = _mm_add_ps(lo, hi);
-        s = _mm_add_ps(s, _mm_movehl_ps(s, s));
-        s = _mm_add_ss(s, _mm_shuffle_ps(s, s, 1));
-        float r = _mm_cvtss_f32(s);
-        for (; i < D; ++i) { float d = a[i]-b[i]; r += d*d; }
-        return r;
-#else
-        float d = 0.f;
-        for (int i = 0; i < D; ++i) { float diff = a[i]-b[i]; d += diff*diff; }
-        return d;
-#endif
+        return NGT::NGTAQ::l2_sq(a, b, D);
     }
 
 private:
