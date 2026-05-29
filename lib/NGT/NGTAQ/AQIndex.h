@@ -89,6 +89,10 @@ public:
 
     bool isV2() const { return is_v2_; }
 
+    // Accessors for raw float vectors and dimension (used by standalone benchmarks)
+    const float* rawFlat() const { return raw_flat_.empty() ? nullptr : raw_flat_.data(); }
+    int dim() const { return prop_.dimension; }
+
 private:
     // Concurrency model:
     //   graph_->mutex() (std::shared_mutex) protects: graph_, raw_flat_, entry_points_
@@ -110,7 +114,8 @@ private:
     std::unique_ptr<NGT::NGTAQ::SRHT>         srht_v2_;
     std::unique_ptr<NGT::NGTAQ::KMeansCentering> kmeans_v2_;
     std::unique_ptr<NGT::NGTAQ::PCAProjector> pca_v2_;
-    std::vector<float>                        tier2_codebook_; // [16][32] = 512 floats
+    std::vector<float>                        tier2_codebook_;   // [M][K][D_sub] = row-major (original layout)
+    std::vector<float>                        tier2_codebook_T_; // [M][D_sub][K] = transposed (for fast AVX2 LUT build)
     std::vector<uint32_t>                     v2_entry_points_;
 
     // Lazy-built inverted list + cluster neighbor table for cluster-aware seeding.

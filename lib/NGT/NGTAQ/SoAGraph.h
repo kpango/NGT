@@ -225,6 +225,58 @@ public:
         }
     }
 
+    // ---- PackedV2Node: DiskANN-style cache-line co-location ----
+    // Record (38B) + n_nbrs (1B) + pad (1B) + nbrs[64] (256B) + pad2 (24B)
+    // = 320 bytes = 5 × 64B cache lines.  Single prefetch covers record AND
+    // all neighbor IDs — breaks the CSR load-use dependency chain.
+
+    static constexpr int PACKED_V2_MAX_NBRS = 64;
+
+    struct alignas(64) PackedV2Node {
+        NGT::NGTAQ::VectorRecord rec;            // 38 bytes [0..37]
+        uint8_t  n_nbrs;                          //  1 byte  [38]
+        uint8_t  _pad0;                           //  1 byte  [39]
+        uint32_t nbrs[PACKED_V2_MAX_NBRS];        // 256 bytes [40..295]
+        uint8_t  _pad1[24];                       //  24 bytes [296..319]
+    };
+    static_assert(sizeof(PackedV2Node) == 320, "PackedV2Node must be 320 bytes");
+
+    // Build packed layout from v2_records_ + CSR.  Call after all setRecord()
+    // and finalizeCSR() are done (fromNGTv2 / loadV2 tail).
+    void buildPackedV2() {
+        const size_t N = state_.size();
+        packed_v2_.resize(N);
+        for (uint32_t i = 0; i < static_cast<uint32_t>(N); ++i) {
+            auto& pn = packed_v2_[i];
+            if (i < v2_records_.size()) pn.rec = v2_records_[i];
+            // Read neighbors from CSR
+            uint32_t off_b = offsets_[i];
+            uint32_t off_e = (i + 1 < offsets_.size()) ? offsets_[i + 1] : off_b;
+            uint32_t cnt = static_cast<uint32_t>(
+                std::min<size_t>(off_e - off_b, PACKED_V2_MAX_NBRS));
+            pn.n_nbrs = static_cast<uint8_t>(cnt);
+            pn._pad0 = 0;
+            if (cnt > 0)
+                std::memcpy(pn.nbrs, edge_ids_.data() + off_b, cnt * sizeof(uint32_t));
+        }
+    }
+
+    bool hasPackedV2() const { return !packed_v2_.empty(); }
+
+    const PackedV2Node* getPackedNode(uint32_t id) const {
+        return packed_v2_.data() + id;
+    }
+
+    // Issue 5 consecutive __builtin_prefetch for 5 × 64B cache lines of one node.
+    void prefetchPackedNode(uint32_t id) const {
+        const char* p = reinterpret_cast<const char*>(packed_v2_.data() + id);
+        __builtin_prefetch(p,       0, 1);
+        __builtin_prefetch(p +  64, 0, 1);
+        __builtin_prefetch(p + 128, 0, 1);
+        __builtin_prefetch(p + 192, 0, 1);
+        __builtin_prefetch(p + 256, 0, 1);
+    }
+
     // ---- v2 VectorRecord storage (optional, empty if not built) ----
 
     void reserveV2(size_t n) {
@@ -251,6 +303,14 @@ public:
     void prefetchNeighbors(uint32_t node_id) const {
         if (static_cast<size_t>(node_id) + 1 < offsets_.size())
             __builtin_prefetch(edge_ids_.data() + offsets_[node_id], 0, 2);
+    }
+    // Prefetch the CSR offset entry for node_id into L1/L2.
+    // Call when pushing a node to the candidate queue: by the time the node is
+    // popped and prefetchNeighbors() is called, offsets_[node_id] will be cached,
+    // eliminating the synchronous DRAM read that gates the neighbor-list prefetch.
+    void prefetchOffset(uint32_t node_id) const {
+        if (static_cast<size_t>(node_id) + 1 < offsets_.size())
+            __builtin_prefetch(&offsets_[node_id], 0, 3);
     }
 
     bool hasV2Records() const { return !v2_records_.empty(); }
@@ -284,6 +344,7 @@ private:
     std::vector<uint64_t> bq_data_;    // interleaved BQ [N * 2 * words_]: [s0,m0,s1,m1,...]
     mutable std::shared_mutex mutex_;
     std::vector<NGT::NGTAQ::VectorRecord> v2_records_;
+    std::vector<PackedV2Node>             packed_v2_;  // DiskANN-style packed layout
 };
 
 } // namespace NGTAQ

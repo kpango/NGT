@@ -133,6 +133,52 @@ inline float tier2_adc_fast(const int8_t lut[16][16], const uint8_t* tier2) {
 }
 
 // ============================================================
+// Tier-2 PQ ADC: float LUT, 16 sub-spaces × 8-bit codes (16 bytes, K=256)
+// lut[sub][code] = dot(q_res[D_sub*sub:D_sub*(sub+1)], sub_centroid[sub][code])
+// Covers full D-dimensional SRHT residual — standard asymmetric ADC.
+// M=16, K=256, D_sub=8: 8× better quantization than M=32 K=16.
+// ============================================================
+
+#if defined(__AVX2__)
+// AVX2 version: 8-wide gather over K=256 LUT.
+// tier2[0..7] → 8 codes → gather from lut[0..7][code]
+// tier2[8..15] → 8 codes → gather from lut[8..15][code]
+// Index for gather: sub*256 + code (float offset, scale=4)
+inline float tier2_adc_pq_avx2(const float lut[16][256], const uint8_t* tier2) {
+    const float* base = &lut[0][0];
+    // Sub-space base offsets (in float units): sub*256 for sub=0..7
+    static const __m256i STRIDE256 = _mm256_set_epi32(7*256, 6*256, 5*256, 4*256,
+                                                        3*256, 2*256,   256,    0);
+    // Process first 8 sub-spaces
+    __m256i codes0 = _mm256_cvtepu8_epi32(_mm_loadl_epi64((const __m128i*)tier2));
+    __m256 v0 = _mm256_i32gather_ps(base, _mm256_add_epi32(STRIDE256, codes0), 4);
+    // Process next 8 sub-spaces (offset base by 8*256 floats)
+    __m256i codes1 = _mm256_cvtepu8_epi32(_mm_loadl_epi64((const __m128i*)(tier2 + 8)));
+    __m256 v1 = _mm256_i32gather_ps(base + 8*256,
+                                     _mm256_add_epi32(STRIDE256, codes1), 4);
+
+    __m256 acc = _mm256_add_ps(v0, v1);
+    __m128 lo = _mm256_castps256_ps128(acc);
+    __m128 hi = _mm256_extractf128_ps(acc, 1);
+    __m128 s  = _mm_add_ps(lo, hi);
+    s = _mm_add_ps(s, _mm_movehl_ps(s, s));
+    s = _mm_add_ss(s, _mm_shuffle_ps(s, s, 1));
+    return _mm_cvtss_f32(s);
+}
+#endif // __AVX2__
+
+inline float tier2_adc_pq(const float lut[16][256], const uint8_t* tier2) {
+#if defined(__AVX2__)
+    return tier2_adc_pq_avx2(lut, tier2);
+#else
+    float acc = 0.f;
+    for (int sub = 0; sub < 16; ++sub)
+        acc += lut[sub][tier2[sub]];
+    return acc;
+#endif
+}
+
+// ============================================================
 // Vectorized squared L2 distance (exact reranking)
 // Handles arbitrary D; loops are unrolled 4× with 8-float AVX2 registers
 // ============================================================

@@ -152,9 +152,20 @@ private:
     uint32_t nearest(const float* x) const {
         float best_dist = std::numeric_limits<float>::max();
         uint32_t best = 0;
+        const float* cp = centroids_.data();
+        // Prefetch next centroid while computing current one to hide L3 latency.
+        // PREFETCH_DIST=24: AVX2 compute per centroid ≈ 8 cycles @ 3GHz ≈ 2.7ns.
+        // L3 latency ≈ 90 cycles ≈ 30ns → need DIST=90/8=11 centroids ahead minimum.
+        // Use 24 for margin. Issue 2 cache lines (128B) to cover the start of each
+        // centroid; the hardware stride prefetcher handles the remaining 6 lines.
+        constexpr int PREFETCH_DIST = 24;
         for (uint32_t k = 0; k < K_; ++k) {
-            const float* c = centroids_.data() + k * D_;
-            float d = l2sq(x, c, D_);
+            if (k + PREFETCH_DIST < K_) {
+                const float* pp = cp + (k + PREFETCH_DIST) * D_;
+                __builtin_prefetch(pp,      0, 1);  // cache line 0 (bytes   0- 63)
+                __builtin_prefetch(pp + 16, 0, 1);  // cache line 1 (bytes  64-127)
+            }
+            float d = l2sq(x, cp + k * D_, D_);
             if (d < best_dist) { best_dist = d; best = k; }
         }
         return best;

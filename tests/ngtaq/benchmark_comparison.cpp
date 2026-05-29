@@ -224,11 +224,19 @@ static std::vector<BenchRow> sweepQBG(
     const std::vector<std::vector<int32_t>>& gt,
     int k)
 {
-    static const size_t GES_VALS[] = {5, 10, 20, 50, 100, 200, 500};
+    // Sweep (numOfProbes, graphExplorationSize) pairs to trace the full recall-QPS curve.
+    // numOfProbes: number of QBG blobs/clusters searched (more probes = higher recall + lower QPS)
+    // graphExplorationSize: size of graph expansion inside each probe (minor effect)
+    struct QBGParam { size_t probes; size_t ges; };
+    static const QBGParam PARAMS[] = {
+        {1,  10}, {2,  10}, {3,  10}, {5,  10}, {8,  10},
+        {10, 10}, {15, 20}, {20, 20}, {30, 50}, {50, 100},
+        {64, 200}
+    };
     const size_t nq = queries.size();
     std::vector<BenchRow> rows;
 
-    auto doSearch = [&](size_t ges) {
+    auto doSearch = [&](size_t probes, size_t ges) {
         std::vector<double> lats(nq);
         double total_recall = 0.0;
 
@@ -239,7 +247,7 @@ static std::vector<BenchRow> sweepQBG(
             sc.setSize(k);
             sc.setEpsilon(0.1f);
             sc.setBlobEpsilon(0.0f);
-            sc.setNumOfProbes(10);
+            sc.setNumOfProbes(probes);
             sc.setGraphExplorationSize(ges);
             sc.setRefinementExpansion(3.0f);
             NGT::ObjectDistances results;
@@ -263,25 +271,43 @@ static std::vector<BenchRow> sweepQBG(
     };
 
     // Warmup
-    doSearch(50);
+    doSearch(10, 50);
 
-    for (size_t ges : GES_VALS) {
-        auto [total_recall, lats] = doSearch(ges);
+    constexpr int N_PARAMS = (int)(sizeof(PARAMS) / sizeof(PARAMS[0]));
+    // Measure heaviest first (most probes) to avoid thermal throttle skewing fast results
+    struct QBGRaw { float recall; float qps; float p50; float p99; };
+    std::vector<QBGRaw> raw(N_PARAMS);
+    for (int pi = N_PARAMS - 1; pi >= 0; --pi) {
+        auto [total_recall, lats] = doSearch(PARAMS[pi].probes, PARAMS[pi].ges);
         double total_us = std::accumulate(lats.begin(), lats.end(), 0.0);
-        std::sort(lats.begin(), lats.end());
+        std::vector<double> slats = lats;
+        std::sort(slats.begin(), slats.end());
+        raw[pi] = {
+            (float)(total_recall / (double)nq),
+            (float)((double)nq / (total_us / 1e6)),
+            (float)pct(slats, 50.0),
+            (float)pct(slats, 99.0)
+        };
+    }
 
-        BenchRow row;
-        row.param_label = std::to_string(ges);
-        row.param_val   = static_cast<double>(ges);
-        row.recall      = total_recall / static_cast<double>(nq);
-        row.qps         = static_cast<double>(nq) / (total_us / 1e6);
-        row.p50_us      = pct(lats, 50.0);
-        row.p99_us      = pct(lats, 99.0);
-        rows.push_back(row);
-
-        std::cout << "  QBG graphExplorationSize=" << ges
-                  << "  recall=" << std::fixed << std::setprecision(4) << row.recall
-                  << "  QPS=" << std::setprecision(0) << row.qps << "\n";
+    for (int pi = 0; pi < N_PARAMS; ++pi) {
+        {
+            std::ostringstream oss;
+            oss << "p" << PARAMS[pi].probes << "g" << PARAMS[pi].ges;
+            BenchRow row;
+            row.param_label = oss.str();
+            row.param_val   = static_cast<double>(PARAMS[pi].probes);
+            row.recall      = raw[pi].recall;
+            row.qps         = raw[pi].qps;
+            row.p50_us      = raw[pi].p50;
+            row.p99_us      = raw[pi].p99;
+            rows.push_back(row);
+        }
+        std::cout << "  QBG probes=" << PARAMS[pi].probes << " ges=" << PARAMS[pi].ges
+                  << "  recall=" << std::fixed << std::setprecision(4) << raw[pi].recall
+                  << "  QPS=" << std::setprecision(0) << raw[pi].qps
+                  << "  P50=" << std::setprecision(1) << raw[pi].p50 << "us"
+                  << "  P99=" << raw[pi].p99 << "us\n";
         std::cout.flush();
     }
     return rows;
@@ -298,10 +324,19 @@ static std::vector<BenchRow> sweepNGTAQv2(
     int k)
 {
     static const float GAMMA_TERMS[] = {0.10f, 0.12f, 0.14f, 0.16f, 0.18f, 0.20f, 0.30f, 0.50f, 0.70f, 1.00f};
+    constexpr int N_GAMMAS = (int)(sizeof(GAMMA_TERMS) / sizeof(GAMMA_TERMS[0]));
     const size_t nq = queries.size();
-    std::vector<BenchRow> rows;
 
-    for (float gt_val : GAMMA_TERMS) {
+    // Warmup: run heaviest gamma to prime cluster membership cache and visited bitvector
+    for (size_t i = 0; i < std::min(nq, size_t(20)); ++i)
+        idx.searchV2(queries[i], k, 0.2f, 1.0f);
+
+    // Measure from heaviest to lightest gamma to avoid thermal throttling on fast gammas
+    struct RawResult { float recall; float qps; float p50; float p99; };
+    std::vector<RawResult> raw(N_GAMMAS);
+
+    for (int gi = N_GAMMAS - 1; gi >= 0; --gi) {
+        float gt_val = GAMMA_TERMS[gi];
         std::vector<double> lats(nq);
         double total_recall = 0.0;
 
@@ -318,8 +353,20 @@ static std::vector<BenchRow> sweepNGTAQv2(
         }
 
         double total_us = std::accumulate(lats.begin(), lats.end(), 0.0);
-        std::sort(lats.begin(), lats.end());
+        std::vector<double> slats = lats;
+        std::sort(slats.begin(), slats.end());
+        raw[gi] = {
+            (float)(total_recall / (double)nq),
+            (float)((double)nq / (total_us / 1e6)),
+            (float)pct(slats, 50.0),
+            (float)pct(slats, 99.0)
+        };
+    }
 
+    // Collect results in ascending gamma order and print
+    std::vector<BenchRow> rows;
+    for (int gi = 0; gi < N_GAMMAS; ++gi) {
+        float gt_val = GAMMA_TERMS[gi];
         BenchRow row;
         {
             std::ostringstream oss;
@@ -327,15 +374,17 @@ static std::vector<BenchRow> sweepNGTAQv2(
             row.param_label = oss.str();
         }
         row.param_val = gt_val;
-        row.recall    = total_recall / static_cast<double>(nq);
-        row.qps       = static_cast<double>(nq) / (total_us / 1e6);
-        row.p50_us    = pct(lats, 50.0);
-        row.p99_us    = pct(lats, 99.0);
+        row.recall    = raw[gi].recall;
+        row.qps       = raw[gi].qps;
+        row.p50_us    = raw[gi].p50;
+        row.p99_us    = raw[gi].p99;
         rows.push_back(row);
 
         std::cout << "  NGTAQv2 gamma_term=" << std::fixed << std::setprecision(3) << gt_val
                   << "  recall=" << std::setprecision(4) << row.recall
-                  << "  QPS=" << std::setprecision(0) << row.qps << "\n";
+                  << "  QPS=" << std::setprecision(0) << row.qps
+                  << "  P50=" << std::setprecision(1) << row.p50_us << "us"
+                  << "  P99=" << row.p99_us << "us\n";
         std::cout.flush();
     }
 
@@ -414,7 +463,9 @@ int main(int argc, char** argv) {
     std::cout.flush();
 
     // grp = QBG graph file, created only after Phase 3 (full build) completes.
-    const bool qbg_prebuilt = std::filesystem::exists(qbg_dir + "/grp");
+    // Old-style QBG: grp at top level; new-style: global/grp.
+    const bool qbg_prebuilt = std::filesystem::exists(qbg_dir + "/grp") ||
+                              std::filesystem::exists(qbg_dir + "/global/grp");
 
     if (!qbg_prebuilt) {
         // Create index skeleton
@@ -617,8 +668,30 @@ int main(int argc, char** argv) {
     printTable("--- QBG (Quantized Blob Graph, PQ4) ---",     "graphExp",   qbg_rows,   k);
 #endif
 
-    // Find crossover near recall = 0.90
-    std::cout << "\n--- Comparison at recall ~0.90 ---\n" << std::fixed;
+    // Find crossover near various recall targets
+    for (double target_recall : {0.80, 0.85, 0.90, 0.95}) {
+        std::cout << "\n--- Comparison at recall ~" << std::fixed << std::setprecision(2) << target_recall << " ---\n";
+        const auto* nv   = nearest(ngtaq_rows, target_recall);
+        const auto* v2v  = nearest(v2_rows,    target_recall);
+#ifndef NGT_QBG_DISABLED
+        const auto* qv   = nearest(qbg_rows,   target_recall);
+#endif
+        if (nv)  std::cout << "  NGTAQ:   recall=" << std::setprecision(4) << nv->recall  << "  QPS=" << std::setprecision(0) << nv->qps  << "  P50=" << std::setprecision(1) << nv->p50_us  << "us  P99=" << nv->p99_us  << "us\n";
+        if (v2v) std::cout << "  NGTAQv2: recall=" << std::setprecision(4) << v2v->recall << "  QPS=" << std::setprecision(0) << v2v->qps << "  P50=" << std::setprecision(1) << v2v->p50_us << "us  P99=" << v2v->p99_us << "us\n";
+#ifndef NGT_QBG_DISABLED
+        if (qv)  std::cout << "  QBG:     recall=" << std::setprecision(4) << qv->recall  << "  QPS=" << std::setprecision(0) << qv->qps  << "  P50=" << std::setprecision(1) << qv->p50_us  << "us  P99=" << qv->p99_us  << "us\n";
+        if (v2v && qv && qv->qps > 0) {
+            double ratio = v2v->qps / qv->qps;
+            std::cout << "  NGTAQv2 vs QBG: ";
+            if (ratio > 1.05) std::cout << "NGTAQv2 " << std::setprecision(2) << ratio << "x faster\n";
+            else if (ratio < 0.95) std::cout << "QBG " << std::setprecision(2) << (1.0/ratio) << "x faster\n";
+            else std::cout << "~equivalent\n";
+        }
+#endif
+    }
+
+    // Legacy comparison summary at ~0.90 for backward compat
+    std::cout << "\n--- Legacy comparison at recall ~0.90 ---\n" << std::fixed;
     const auto* n90  = nearest(ngtaq_rows, 0.90);
     const auto* v290 = nearest(v2_rows,    0.90);
     if (n90) {

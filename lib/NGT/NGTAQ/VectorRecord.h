@@ -87,16 +87,15 @@ inline bool get_tier1_bit(const VectorRecord& rec, int i) {
     return (rec.tier1[i >> 3] >> (i & 7)) & 1;
 }
 
-// ---------- tier-2 nibble access (32 nibbles, 4-bit each) ----------
+// ---------- tier-2 byte access (16 bytes, 8-bit each, M=16 K=256) ----------
+// tier2[16] stores 16 PQ codes, one per sub-space (0-255).
 
-inline void set_tier2_nibble(VectorRecord& rec, int i, uint8_t v) {
-    if (i & 1) rec.tier2[i >> 1] = (rec.tier2[i >> 1] & 0x0F) | (uint8_t)((v & 0xF) << 4);
-    else        rec.tier2[i >> 1] = (rec.tier2[i >> 1] & 0xF0) | (uint8_t)(v & 0xF);
+inline void set_tier2_byte(VectorRecord& rec, int i, uint8_t v) {
+    rec.tier2[i] = v;
 }
 
-inline uint8_t get_tier2_nibble(const VectorRecord& rec, int i) {
-    if (i & 1) return (rec.tier2[i >> 1] >> 4) & 0xF;
-    else        return  rec.tier2[i >> 1]        & 0xF;
+inline uint8_t get_tier2_byte(const VectorRecord& rec, int i) {
+    return rec.tier2[i];
 }
 
 }} // NGT::NGTAQ

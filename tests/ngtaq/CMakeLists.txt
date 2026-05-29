@@ -18,6 +18,8 @@ foreach(TEST_SRC
     benchmark_sift1m
     build_ngt_sift1m
     benchmark_comparison
+    benchmark_v2_fast
+    benchmark_v2_clean
     test_vector_record
     test_srht
     test_kmeans
@@ -28,5 +30,8 @@ foreach(TEST_SRC
         add_executable(${TEST_SRC} ${TEST_SRC}.cpp)
         target_link_libraries(${TEST_SRC} ngt)
         target_compile_features(${TEST_SRC} PRIVATE cxx_std_17)
+        if(${TEST_SRC} STREQUAL "benchmark_comparison")
+            target_compile_definitions(${TEST_SRC} PRIVATE NGT_QBG_DISABLED)
+        endif()
     endif()
 endforeach()
