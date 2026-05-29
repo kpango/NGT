@@ -726,15 +726,15 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
     // 2. Find query's nearest centroid
     uint32_t active_cid = kmeans_v2_->nearest_public(q_rot.data());
     std::vector<float> q_res(D);
-    kmeans_v2_->get_residual(q_rot.data(), active_cid, q_res.data());
 
     // 3. Build initial ADC state (tier-1 + tier-2 PQ on SRHT residuals)
     NGT::NGTAQ::ADCQueryState adc = {};
     float q_norm_sq = 0.f;
-    for (int d = 0; d < D; ++d) q_norm_sq += q_res[d] * q_res[d];
-    adc.q_norm_sq = q_norm_sq;
-    adc.q_norm = std::sqrt(q_norm_sq);
-    adc.q_sum = NGT::NGTAQ::build_tier1_query(q_res.data(), D, adc.q_int8);
+    NGT::NGTAQ::compute_residual_and_tier1(
+        q_rot.data(), kmeans_v2_->centroid(active_cid), D,
+        q_res.data(), adc.q_norm_sq, adc.q_int8, adc.q_sum);
+    adc.q_norm = std::sqrt(adc.q_norm_sq);
+    q_norm_sq = adc.q_norm_sq;
     const float inv_sqrt_D = 1.f / std::sqrt((float)D);
 
     // Save initial cluster residual for tier-2 LUT build post-routing.
@@ -856,12 +856,11 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
         }
         // Cache miss: full rebuild
         active_cid = cid;
-        kmeans_v2_->get_residual(q_rot.data(), active_cid, q_res.data());
-        q_norm_sq = 0.f;
-        for (int d2 = 0; d2 < D; ++d2) q_norm_sq += q_res[d2]*q_res[d2];
-        adc.q_norm_sq = q_norm_sq;
-        adc.q_norm = std::sqrt(q_norm_sq);
-        adc.q_sum = NGT::NGTAQ::build_tier1_query(q_res.data(), D, adc.q_int8);
+        NGT::NGTAQ::compute_residual_and_tier1(
+            q_rot.data(), kmeans_v2_->centroid(active_cid), D,
+            q_res.data(), adc.q_norm_sq, adc.q_int8, adc.q_sum);
+        adc.q_norm = std::sqrt(adc.q_norm_sq);
+        q_norm_sq = adc.q_norm_sq;
         // Store in cache (round-robin eviction)
         const int slot = adc_cache_hand;
         adc_cache_hand = (adc_cache_hand + 1) % ADC_SLOTS;

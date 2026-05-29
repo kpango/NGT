@@ -3,6 +3,13 @@
 #include <cstring>
 #include <cmath>
 
+#if defined(__AVX512F__) || defined(__AVX2__) || defined(__AVX__)
+#  include <immintrin.h>
+#endif
+#if defined(__ARM_NEON)
+#  include <arm_neon.h>
+#endif
+
 namespace NGT { namespace NGTAQ {
 
 // Per-query ADC state, rebuilt when active centroid changes
@@ -30,6 +37,214 @@ inline int32_t build_tier1_query(const float* residual, int D, int8_t* q_int8) {
         qsum += qv;
     }
     return qsum;
+}
+
+// Compute residual and tier-1 query state in a single fused operation.
+// Replaces the 3-step sequence: get_residual + norm_sq loop + build_tier1_query.
+// AVX-512F, AVX2, and scalar paths — dispatched at compile time.
+inline void compute_residual_and_tier1(
+    const float* __restrict__ x,
+    const float* __restrict__ centroid,
+    int D,
+    float*   __restrict__ out_residual,
+    float&   out_norm_sq,
+    int8_t*  __restrict__ out_q_int8,
+    int32_t& out_q_sum
+) {
+#if defined(__AVX512F__)
+    // ---- AVX-512F path ----
+    // Pass 1: residual + norm_sq accumulation (16 floats/iter)
+    __m512 norm_acc = _mm512_setzero_ps();
+    int i = 0;
+    for (; i + 16 <= D; i += 16) {
+        __m512 vx = _mm512_loadu_ps(x + i);
+        __m512 vc = _mm512_loadu_ps(centroid + i);
+        __m512 r  = _mm512_sub_ps(vx, vc);
+        _mm512_storeu_ps(out_residual + i, r);
+        norm_acc = _mm512_fmadd_ps(r, r, norm_acc);
+    }
+    float norm_sq = _mm512_reduce_add_ps(norm_acc);
+    // Handle tail (D not multiple of 16)
+    for (; i < D; ++i) {
+        float r = x[i] - centroid[i];
+        out_residual[i] = r;
+        norm_sq += r * r;
+    }
+    out_norm_sq = norm_sq;
+
+    const float scale = (norm_sq > 1e-10f) ? 127.f / sqrtf(norm_sq) : 0.f;
+    const __m512 scale16 = _mm512_set1_ps(scale);
+    const __m512i hi32   = _mm512_set1_epi32(127);
+    const __m512i lo32   = _mm512_set1_epi32(-127);
+
+    // Pass 2: quantize to int8 (16 floats/iter)
+    __m512i qsum_acc = _mm512_setzero_epi32();
+    i = 0;
+    for (; i + 16 <= D; i += 16) {
+        __m512  r  = _mm512_loadu_ps(out_residual + i);
+        __m512  v  = _mm512_mul_ps(r, scale16);
+        // round-half-away-from-zero: add 0.5 if >=0, else -0.5, then truncate
+        const __m512  half     = _mm512_set1_ps(0.5f);
+        const __m512  neg_half = _mm512_set1_ps(-0.5f);
+        __mmask16 pos_mask = _mm512_cmp_ps_mask(v, _mm512_setzero_ps(), _CMP_GE_OQ);
+        __m512 offset = _mm512_mask_blend_ps(pos_mask, neg_half, half);
+        __m512i vi = _mm512_cvttps_epi32(_mm512_add_ps(v, offset));
+        vi = _mm512_max_epi32(_mm512_min_epi32(vi, hi32), lo32);
+        qsum_acc = _mm512_add_epi32(qsum_acc, vi);
+        // Convert int32 → int8 using AVX-512F saturating conversion
+        __m128i vi8 = _mm512_cvtsepi32_epi8(vi);
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(out_q_int8 + i), vi8);
+    }
+    int32_t qsum = _mm512_reduce_add_epi32(qsum_acc);
+    // Scalar tail
+    for (; i < D; ++i) {
+        float v  = out_residual[i] * scale;
+        int   vi = (int)(v + (v >= 0.f ? 0.5f : -0.5f));
+        int8_t qv = (int8_t)(vi < -127 ? -127 : vi > 127 ? 127 : vi);
+        out_q_int8[i] = qv;
+        qsum += qv;
+    }
+    out_q_sum = qsum;
+
+#elif defined(__AVX2__)
+    // ---- AVX2 path ----
+    // Pass 1: residual + FMA norm_sq accumulation (8 floats/iter)
+    __m256 norm_acc0 = _mm256_setzero_ps();
+    __m256 norm_acc1 = _mm256_setzero_ps();
+    int i = 0;
+    for (; i + 16 <= D; i += 16) {
+        __m256 vx0 = _mm256_loadu_ps(x + i);
+        __m256 vc0 = _mm256_loadu_ps(centroid + i);
+        __m256 r0  = _mm256_sub_ps(vx0, vc0);
+        _mm256_storeu_ps(out_residual + i, r0);
+        norm_acc0 = _mm256_fmadd_ps(r0, r0, norm_acc0);
+
+        __m256 vx1 = _mm256_loadu_ps(x + i + 8);
+        __m256 vc1 = _mm256_loadu_ps(centroid + i + 8);
+        __m256 r1  = _mm256_sub_ps(vx1, vc1);
+        _mm256_storeu_ps(out_residual + i + 8, r1);
+        norm_acc1 = _mm256_fmadd_ps(r1, r1, norm_acc1);
+    }
+    for (; i + 8 <= D; i += 8) {
+        __m256 vx = _mm256_loadu_ps(x + i);
+        __m256 vc = _mm256_loadu_ps(centroid + i);
+        __m256 r  = _mm256_sub_ps(vx, vc);
+        _mm256_storeu_ps(out_residual + i, r);
+        norm_acc0 = _mm256_fmadd_ps(r, r, norm_acc0);
+    }
+
+    // Horizontal reduce norm_sq: merge accumulators then reduce
+    __m256 norm_acc = _mm256_add_ps(norm_acc0, norm_acc1);
+    __m128 lo  = _mm256_castps256_ps128(norm_acc);
+    __m128 hi  = _mm256_extractf128_ps(norm_acc, 1);
+    __m128 sum = _mm_add_ps(lo, hi);
+    sum = _mm_hadd_ps(sum, sum);
+    sum = _mm_hadd_ps(sum, sum);
+    float norm_sq = _mm_cvtss_f32(sum);
+    // Scalar tail for norm_sq
+    for (; i < D; ++i) {
+        float r = x[i] - centroid[i];
+        out_residual[i] = r;
+        norm_sq += r * r;
+    }
+    out_norm_sq = norm_sq;
+
+    const float scale = (norm_sq > 1e-10f) ? 127.f / sqrtf(norm_sq) : 0.f;
+    const __m256  scale8 = _mm256_set1_ps(scale);
+    const __m256  pos_half = _mm256_set1_ps(0.5f);
+    const __m256  neg_half = _mm256_set1_ps(-0.5f);
+    const __m256  zero8    = _mm256_setzero_ps();
+    const __m256i hi32 = _mm256_set1_epi32(127);
+    const __m256i lo32 = _mm256_set1_epi32(-127);
+
+    // Pass 2: quantize to int8 — 32 floats/iter (4 groups of 8)
+    __m256i qsum_acc = _mm256_setzero_si256();
+    i = 0;
+    for (; i + 32 <= D; i += 32) {
+        // Group a: floats [i .. i+7]
+        __m256 va = _mm256_mul_ps(_mm256_loadu_ps(out_residual + i),      scale8);
+        __m256 vb = _mm256_mul_ps(_mm256_loadu_ps(out_residual + i + 8),  scale8);
+        __m256 vc = _mm256_mul_ps(_mm256_loadu_ps(out_residual + i + 16), scale8);
+        __m256 vd = _mm256_mul_ps(_mm256_loadu_ps(out_residual + i + 24), scale8);
+
+        // round-half-away-from-zero: add ±0.5 based on sign then truncate
+        __m256 oa = _mm256_blendv_ps(neg_half, pos_half, _mm256_cmp_ps(va, zero8, _CMP_GE_OQ));
+        __m256 ob = _mm256_blendv_ps(neg_half, pos_half, _mm256_cmp_ps(vb, zero8, _CMP_GE_OQ));
+        __m256 oc = _mm256_blendv_ps(neg_half, pos_half, _mm256_cmp_ps(vc, zero8, _CMP_GE_OQ));
+        __m256 od = _mm256_blendv_ps(neg_half, pos_half, _mm256_cmp_ps(vd, zero8, _CMP_GE_OQ));
+
+        __m256i ia = _mm256_cvttps_epi32(_mm256_add_ps(va, oa));
+        __m256i ib = _mm256_cvttps_epi32(_mm256_add_ps(vb, ob));
+        __m256i ic = _mm256_cvttps_epi32(_mm256_add_ps(vc, oc));
+        __m256i id = _mm256_cvttps_epi32(_mm256_add_ps(vd, od));
+
+        // Clamp to [-127, 127]
+        ia = _mm256_max_epi32(_mm256_min_epi32(ia, hi32), lo32);
+        ib = _mm256_max_epi32(_mm256_min_epi32(ib, hi32), lo32);
+        ic = _mm256_max_epi32(_mm256_min_epi32(ic, hi32), lo32);
+        id = _mm256_max_epi32(_mm256_min_epi32(id, hi32), lo32);
+
+        // Accumulate qsum
+        qsum_acc = _mm256_add_epi32(qsum_acc,
+            _mm256_add_epi32(_mm256_add_epi32(ia, ib), _mm256_add_epi32(ic, id)));
+
+        // Pack int32→int16
+        __m256i ab = _mm256_packs_epi32(ia, ib);
+        __m256i cd = _mm256_packs_epi32(ic, id);
+        // Fix lane interleave from packs_epi32 (AVX2 operates within 128-bit lanes)
+        __m256i ab_fixed = _mm256_permute4x64_epi64(ab, 0xD8);
+        __m256i cd_fixed = _mm256_permute4x64_epi64(cd, 0xD8);
+
+        // Pack int16→int8
+        __m256i abcd = _mm256_packs_epi16(ab_fixed, cd_fixed);
+        // Fix second lane interleave
+        abcd = _mm256_permute4x64_epi64(abcd, 0xD8);
+
+        // Store 32 int8s
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(out_q_int8 + i), abcd);
+    }
+
+    // Reduce qsum_acc: lo128 + hi128, then two shuffles+adds
+    __m128i qlo = _mm256_castsi256_si128(qsum_acc);
+    __m128i qhi = _mm256_extracti128_si256(qsum_acc, 1);
+    __m128i qs  = _mm_add_epi32(qlo, qhi);
+    qs = _mm_add_epi32(qs, _mm_shuffle_epi32(qs, 0x4E)); // 0b01001110
+    qs = _mm_add_epi32(qs, _mm_shuffle_epi32(qs, 0xB1)); // 0b10110001
+    int32_t qsum = _mm_cvtsi128_si32(qs);
+
+    // Scalar tail
+    for (; i < D; ++i) {
+        float v  = out_residual[i] * scale;
+        int   vi = (int)(v + (v >= 0.f ? 0.5f : -0.5f));
+        int8_t qv = (int8_t)(vi < -127 ? -127 : vi > 127 ? 127 : vi);
+        out_q_int8[i] = qv;
+        qsum += qv;
+    }
+    out_q_sum = qsum;
+
+#else
+    // ---- Scalar path (used for ARM NEON and other architectures) ----
+    // TODO: NEON path
+    {
+        float norm_sq = 0.f;
+        for (int i = 0; i < D; ++i) {
+            float r = x[i] - centroid[i];
+            out_residual[i] = r;
+            norm_sq += r * r;
+        }
+        out_norm_sq = norm_sq;
+        const float scale = (norm_sq > 1e-10f) ? 127.f / sqrtf(norm_sq) : 0.f;
+        int32_t qsum = 0;
+        for (int i = 0; i < D; ++i) {
+            float v  = out_residual[i] * scale;
+            int   vi = (int)(v + (v >= 0.f ? 0.5f : -0.5f));
+            int8_t qv = (int8_t)(vi < -127 ? -127 : vi > 127 ? 127 : vi);
+            out_q_int8[i] = qv;
+            qsum += qv;
+        }
+        out_q_sum = qsum;
+    }
+#endif
 }
 
 // Build tier-2 PQ LUT from SRHT-rotated query residual (D dims).

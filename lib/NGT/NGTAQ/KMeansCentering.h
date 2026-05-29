@@ -92,6 +92,14 @@ public:
     // Compute residual: out[d] = x[d] - centroids[id][d]
     void get_residual(const float* x, uint32_t id, float* out) const {
         const float* c = centroids_.data() + id * D_;
+#if defined(__AVX2__)
+        if (D_ % 8 == 0) {
+            for (int d = 0; d < D_; d += 8)
+                _mm256_storeu_ps(out + d,
+                    _mm256_sub_ps(_mm256_loadu_ps(x + d), _mm256_loadu_ps(c + d)));
+            return;
+        }
+#endif
         for (int d = 0; d < D_; ++d) out[d] = x[d] - c[d];
     }
 
