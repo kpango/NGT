@@ -1,5 +1,6 @@
 #pragma once
 #include <cstddef>
+#include "NGT/NGTAQ/VectorRecord.h"
 #if defined(__AVX512F__) || defined(__AVX2__) || defined(__AVX__)
 #  include <immintrin.h>
 #endif
@@ -59,6 +60,41 @@ inline float l2_sq(const float* __restrict__ a, const float* __restrict__ b, int
 #else
     float r = 0.f;
     for (int i = 0; i < D; ++i) { float d = a[i] - b[i]; r += d * d; }
+    return r;
+#endif
+}
+
+// Squared L2 between fp32 query `a` and fp16-packed `x` (dimension D). F16C path.
+inline float l2_sq_f32_fp16(const float* __restrict__ a,
+                            const uint16_t* __restrict__ x, int D) {
+#if defined(__AVX2__) && defined(__F16C__)
+    __m256 s0 = _mm256_setzero_ps(), s1 = _mm256_setzero_ps();
+    int i = 0;
+    // 2 accumulators (vs 4 in l2_sq): the _mm256_cvtph_ps fp16->fp32 conversion
+    // latency is the throughput limiter here, not FMA, so 2 accumulators suffice.
+    for (; i + 16 <= D; i += 16) {
+        __m256 xb0 = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i*)(x + i)));
+        __m256 xb1 = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i*)(x + i + 8)));
+        __m256 d0 = _mm256_sub_ps(_mm256_loadu_ps(a + i),     xb0);
+        __m256 d1 = _mm256_sub_ps(_mm256_loadu_ps(a + i + 8), xb1);
+        s0 = _mm256_fmadd_ps(d0, d0, s0); s1 = _mm256_fmadd_ps(d1, d1, s1);
+    }
+    for (; i + 8 <= D; i += 8) {
+        __m256 xb = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i*)(x + i)));
+        __m256 d  = _mm256_sub_ps(_mm256_loadu_ps(a + i), xb);
+        s0 = _mm256_fmadd_ps(d, d, s0);
+    }
+    __m256 acc = _mm256_add_ps(s0, s1);
+    __m128 lo = _mm256_castps256_ps128(acc), hi = _mm256_extractf128_ps(acc, 1);
+    __m128 s = _mm_add_ps(lo, hi);
+    s = _mm_add_ps(s, _mm_movehl_ps(s, s));
+    s = _mm_add_ss(s, _mm_shuffle_ps(s, s, 1));
+    float r = _mm_cvtss_f32(s);
+    for (; i < D; ++i) { float d=a[i]-fp16_to_float(x[i]); r+=d*d; }
+    return r;
+#else
+    float r = 0.f;
+    for (int i = 0; i < D; ++i) { float d=a[i]-fp16_to_float(x[i]); r+=d*d; }
     return r;
 #endif
 }
