@@ -57,6 +57,10 @@ public:
     // Override cluster seed count at search time (not thread-safe while searchV2 is running).
     void setNClusterSeeds(int n) { prop_.n_cluster_seeds = n; }
 
+    // Override n_probe (number of clusters to probe) at search time.
+    // 0 = use default (is_angular ? 20 : 3). Higher values improve recall at cost of QPS.
+    void setNProbe(int n) { n_probe_override_ = n; }
+
     // Batch search over multiple queries. Returns one result-vector per query.
     // Uses OpenMP with prop_.n_search_threads (0 = all available threads).
     std::vector<std::vector<SearchResult>> searchBatch(
@@ -124,6 +128,11 @@ public:
                           float new_alpha  = -1.0f,
                           int   new_max_edges = -1);
 
+    // Post-hoc tombstone fix: scan raw_flat_ for zero-norm vectors and tombstone them.
+    // Use to repair indices built with code that did not properly tombstone hole nodes.
+    // Returns the count of newly tombstoned nodes.
+    int fixHoleTombstones();
+
 private:
     // Concurrency model:
     //   graph_->mutex() (std::shared_mutex) protects: graph_, raw_flat_, entry_points_
@@ -139,6 +148,13 @@ private:
     DABSSearcher                    searcher_;
     std::vector<uint32_t>           entry_points_;
     std::vector<float>              raw_flat_;     // flat [N*D] exact float vectors
+
+    int                                       n_probe_override_ = 0;  // 0 = default
+
+    // During rebuildGraphSelf, limit total seeds per searchV2 call to avoid queue
+    // flooding on angular data (large clusters). 0 = no limit (full cluster scan).
+    // Set before parallel loop, reset after. mutable so searchV2 (const) can read it.
+    mutable int                               rebuild_max_seeds_ = 0;
 
     // v2 ADC state (null/empty if not built via fromNGTv2)
     bool                                      is_v2_      = false;

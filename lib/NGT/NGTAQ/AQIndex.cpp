@@ -749,14 +749,9 @@ NGTAQIndex NGTAQIndex::fromNGTv2(const std::string& ngt_path, const Property& pr
             float d_bq = bqDistance(graph->getNodeBQ(aq_id), graph->getNodeBQ(nbr), words, D);
             candidates.push_back({nbr, d_bq});
         }
-        // Cluster-aware sort: same centroid neighbors first, then by BQ distance
-        std::stable_sort(candidates.begin(), candidates.end(),
-            [&](const auto& a, const auto& b) {
-                bool a_same = (centroid_ids[a.first] == centroid_ids[aq_id]);
-                bool b_same = (centroid_ids[b.first] == centroid_ids[aq_id]);
-                if (a_same != b_same) return a_same > b_same;
-                return a.second < b.second;
-            });
+        // Pure BQ distance sort (no cluster priority — hurts navigability).
+        std::sort(candidates.begin(), candidates.end(),
+            [](const auto& a, const auto& b) { return a.second < b.second; });
         if (static_cast<int>(candidates.size()) > prop.max_edges)
             candidates.resize(static_cast<size_t>(prop.max_edges));
 
@@ -823,46 +818,60 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
     const int D_orig = (int)query.size();
 
     // 0. Angular/Cosine: L2-normalize query (over D_orig dims)
-    std::vector<float> q_normalized;
+    static thread_local std::vector<float> q_normalized_tl;
     const float* q_src = query.data();
     if (is_angular_) {
-        q_normalized.assign(query.begin(), query.begin() + std::min(D_orig, D));
+        q_normalized_tl.assign(query.begin(), query.begin() + std::min(D_orig, D));
         float norm2 = 0.f;
-        for (float x : q_normalized) norm2 += x * x;
+        for (float x : q_normalized_tl) norm2 += x * x;
         if (norm2 > 1e-12f) {
             float inv = 1.f / std::sqrt(norm2);
-            for (float& x : q_normalized) x *= inv;
+            for (float& x : q_normalized_tl) x *= inv;
         }
-        q_src = q_normalized.data();
+        q_src = q_normalized_tl.data();
     }
 
     // Query padding: zero-pad to D (for D_orig < D, e.g., GloVe-100 → D=128)
-    std::vector<float> q_padded(D, 0.f);
-    std::copy(q_src, q_src + std::min(D_orig, D), q_padded.begin());
-    const float* q_ptr = q_padded.data();
+    // Thread-local scratch buffers: reused across queries on same thread to avoid
+    // per-query heap allocation overhead (~50KB for D=1024, significant for QPS).
+    static thread_local std::vector<float> q_padded_tl;
+    static thread_local std::vector<float> q_rot_tl;
+    static thread_local std::vector<float> q_res_tl;
+    static thread_local std::vector<float> q_res_init_tl;
+    // ADC state: q_int8 buffer lives in a thread_local struct (one alloc per thread).
+    // Using a reference alias so all existing `adc.*` accesses compile unchanged.
+    static thread_local NGT::NGTAQ::ADCQueryState adc_tl(0);
+
+    q_padded_tl.assign(static_cast<size_t>(D), 0.f);
+    std::copy(q_src, q_src + std::min(D_orig, D), q_padded_tl.begin());
+    const float* q_ptr = q_padded_tl.data();
 
     // 1. Rotate query
-    std::vector<float> q_rot(D);
-    srht_v2_->apply(q_ptr, q_rot.data());
+    q_rot_tl.resize(static_cast<size_t>(D));
+    srht_v2_->apply(q_ptr, q_rot_tl.data());
 
     // 2. Find query's nearest centroid
-    uint32_t active_cid = kmeans_v2_->nearest_public(q_rot.data());
-    std::vector<float> q_res(D);
+    uint32_t active_cid = kmeans_v2_->nearest_public(q_rot_tl.data());
+    q_res_tl.resize(static_cast<size_t>(D));
 
     // 3. Build initial ADC state (tier-1 + tier-2 PQ on SRHT residuals)
-    NGT::NGTAQ::ADCQueryState adc(D);
+    // Grow q_int8 once on first use (or if D changed); no allocation on steady-state.
+    if (static_cast<int>(adc_tl.q_int8.size()) < D)
+        adc_tl.q_int8.assign(static_cast<size_t>(D), int8_t(0));
+    NGT::NGTAQ::ADCQueryState& adc = adc_tl;
+    adc.q_norm_sq = 0.f; adc.q_norm = 0.f; adc.q_sum = 0;
     float q_norm_sq = 0.f;
     NGT::NGTAQ::compute_residual_and_tier1(
-        q_rot.data(), kmeans_v2_->centroid(active_cid), D,
-        q_res.data(), adc.q_norm_sq, adc.q_int8.data(), adc.q_sum);
+        q_rot_tl.data(), kmeans_v2_->centroid(active_cid), D,
+        q_res_tl.data(), adc.q_norm_sq, adc.q_int8.data(), adc.q_sum);
     adc.q_norm = std::sqrt(adc.q_norm_sq);
     q_norm_sq = adc.q_norm_sq;
     const float inv_sqrt_D = 1.f / std::sqrt((float)D);
 
     // Save initial cluster residual for tier-2 LUT build post-routing.
     // maybe_rebuild_adc overwrites q_res/q_norm_sq on cluster transitions.
-    const uint32_t initial_cid = active_cid; (void)initial_cid;
-    std::vector<float> q_res_initial(q_res);
+    const uint32_t initial_cid = active_cid;
+    q_res_init_tl.assign(q_res_tl.begin(), q_res_tl.end());
     const float q_norm_sq_initial = q_norm_sq;
 
     std::shared_lock<std::shared_mutex> lock(graph_->mutex());
@@ -884,8 +893,13 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
         }
 
         // 2. Precompute top-N_EXTRA_CLUSTERS nearest clusters for each cluster.
-        // Cost: K² × D scalar ops (K=1000, D=128 → 128M ops, ~15ms) — one-time amortized.
-        constexpr int CLUSTER_NBRS = 2;
+        // Cost: K² × D scalar ops (K=2000, D=256 → 1B ops, ~50ms) — one-time amortized.
+        // Angular data: use 20 neighbor clusters for accurate multi-cluster seeding.
+        // DABS graph traversal bridges inter-cluster gaps via ANNG edges.
+        // Precompute enough cluster neighbors to support any n_probe value.
+        // n_probe_override_ may be set before the first search triggers this call_once.
+        const int default_nbrs = is_angular_ ? 20 : 4;
+        const int CLUSTER_NBRS = std::max(default_nbrs, n_probe_override_);
         cluster_neighbors_v2_.resize(K);
         using CD = std::pair<float, uint32_t>;
         std::vector<CD> dists;
@@ -911,10 +925,12 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
     using Entry = std::pair<float, uint32_t>;
     std::priority_queue<Entry, std::vector<Entry>, std::greater<Entry>> cand_q;
     std::priority_queue<float> dk_tracker;
-    std::vector<std::pair<float, uint32_t>> results;
-    // Reserve 30× k upfront to avoid repeated reallocations during DABS routing.
-    // At γ=0.18 ~200-300 candidates are popped; 30×10=300 covers the common case.
-    results.reserve(static_cast<size_t>(k_beam * 30));
+    // Thread-local results buffer: capacity persists across queries (no malloc on steady-state).
+    static thread_local std::vector<std::pair<float, uint32_t>> results_tl;
+    results_tl.clear();
+    if (results_tl.capacity() < static_cast<size_t>(k_beam * 30))
+        results_tl.reserve(static_cast<size_t>(k_beam * 30));
+    auto& results = results_tl;
     // Flat bitvector for visited tracking: N=1M → 15,625 uint64_t = 125KB (fits in L2)
     // thread_local avoids heap allocation after first query on each thread
     static thread_local std::vector<uint64_t> t_vis;
@@ -929,26 +945,22 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
 
     // ADC state cache: skip get_residual + q_norm_sq loop + build_tier1_query on
     // repeated visits to the same cluster.
-    // Dynamic q_int8 supports variable D. DABS visits 3-15 unique clusters
-    // per query; 8 slots eliminate evictions for typical cases, reducing tail latency.
+    // Thread_local flat int8 buffer (ADC_SLOTS × D) + scalar metadata avoids
+    // per-query heap allocation (~8KB for D=1024).
     constexpr int ADC_SLOTS = 8;
-    struct ADCSlotDyn {
-        uint32_t cid      = UINT32_MAX;
+    struct ADCSlotMeta {
+        uint32_t cid       = UINT32_MAX;
         float    q_norm_sq = 0.f;
         float    q_norm    = 0.f;
         int32_t  q_sum     = 0;
-        std::vector<int8_t> q_int8;
-        explicit ADCSlotDyn(int dim) : q_int8(dim, 0) {}
-        ADCSlotDyn() : q_int8() {}
     };
-    std::vector<ADCSlotDyn> adc_cache(ADC_SLOTS, ADCSlotDyn(D));
+    static thread_local std::vector<int8_t> adc_int8_tl;  // ADC_SLOTS * D int8 entries
+    static thread_local std::array<ADCSlotMeta, ADC_SLOTS> adc_meta_tl;
+    adc_int8_tl.resize(static_cast<size_t>(ADC_SLOTS) * static_cast<size_t>(D));
+    for (auto& m : adc_meta_tl) m.cid = UINT32_MAX;
     // Slot 0 = initial cluster (ADC state already computed above)
-    adc_cache[0].cid       = active_cid;
-    adc_cache[0].q_norm_sq = adc.q_norm_sq;
-    adc_cache[0].q_norm    = adc.q_norm;
-    adc_cache[0].q_sum     = adc.q_sum;
-    std::memcpy(adc_cache[0].q_int8.data(), adc.q_int8.data(), (size_t)D);
-    for (int s = 1; s < ADC_SLOTS; ++s) adc_cache[s].cid = UINT32_MAX;
+    adc_meta_tl[0] = {active_cid, adc.q_norm_sq, adc.q_norm, adc.q_sum};
+    std::memcpy(adc_int8_tl.data(), adc.q_int8.data(), static_cast<size_t>(D));
     int adc_cache_hand = 1;
 
     // Tier-1 routing: fast RaBitQ ADC for DABS beam search.
@@ -966,36 +978,36 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
     };
 
     // Rebuild tier-1 ADC tables on cluster boundary crossing, with cache lookup.
-    // Cache hit (~10ns): restore from 576-byte L1-resident table, skip all recomputation.
+    // Cache hit (~10ns): restore from thread_local L1-resident flat buffer, skip recompute.
     // Cache miss: full rebuild (get_residual + q_norm_sq + sqrt + build_tier1_query ~150ns).
     auto maybe_rebuild_adc = [&](uint32_t cid) {
         if (cid == active_cid) return;
         for (int s = 0; s < ADC_SLOTS; ++s) {
-            if (adc_cache[s].cid == cid) {
+            if (adc_meta_tl[s].cid == cid) {
                 active_cid    = cid;
-                q_norm_sq     = adc_cache[s].q_norm_sq;
-                adc.q_norm_sq = adc_cache[s].q_norm_sq;
-                adc.q_norm    = adc_cache[s].q_norm;
-                adc.q_sum     = adc_cache[s].q_sum;
-                std::memcpy(adc.q_int8.data(), adc_cache[s].q_int8.data(), (size_t)D);
+                q_norm_sq     = adc_meta_tl[s].q_norm_sq;
+                adc.q_norm_sq = adc_meta_tl[s].q_norm_sq;
+                adc.q_norm    = adc_meta_tl[s].q_norm;
+                adc.q_sum     = adc_meta_tl[s].q_sum;
+                std::memcpy(adc.q_int8.data(),
+                            adc_int8_tl.data() + static_cast<size_t>(s) * static_cast<size_t>(D),
+                            static_cast<size_t>(D));
                 return;
             }
         }
         // Cache miss: full rebuild
         active_cid = cid;
         NGT::NGTAQ::compute_residual_and_tier1(
-            q_rot.data(), kmeans_v2_->centroid(active_cid), D,
-            q_res.data(), adc.q_norm_sq, adc.q_int8.data(), adc.q_sum);
+            q_rot_tl.data(), kmeans_v2_->centroid(active_cid), D,
+            q_res_tl.data(), adc.q_norm_sq, adc.q_int8.data(), adc.q_sum);
         adc.q_norm = std::sqrt(adc.q_norm_sq);
         q_norm_sq = adc.q_norm_sq;
         // Store in cache (round-robin eviction)
         const int slot = adc_cache_hand;
         adc_cache_hand = (adc_cache_hand + 1) % ADC_SLOTS;
-        adc_cache[slot].cid       = cid;
-        adc_cache[slot].q_norm_sq = adc.q_norm_sq;
-        adc_cache[slot].q_norm    = adc.q_norm;
-        adc_cache[slot].q_sum     = adc.q_sum;
-        std::memcpy(adc_cache[slot].q_int8.data(), adc.q_int8.data(), (size_t)D);
+        adc_meta_tl[slot] = {cid, adc.q_norm_sq, adc.q_norm, adc.q_sum};
+        std::memcpy(adc_int8_tl.data() + static_cast<size_t>(slot) * static_cast<size_t>(D),
+                    adc.q_int8.data(), static_cast<size_t>(D));
     };
 
     // Tier-2 seed scoring: build LUT from initial cluster, pre-sort all cluster seeds
@@ -1004,76 +1016,119 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
     // LUT built from q_res_initial (saved before routing modifies q_res).
     static thread_local std::vector<float> t2_lut_tl;
     t2_lut_tl.resize(static_cast<size_t>(M_PQ) * 256);
-    NGT::NGTAQ::build_tier2_lut_fast_m(q_res_initial.data(), M_PQ,
+    NGT::NGTAQ::build_tier2_lut_fast_m(q_res_init_tl.data(), M_PQ,
                                         tier2_codebook_T_.data(),
                                         t2_lut_tl.data());
 
-    // Cluster-aware seeding: use members of the query's nearest cluster as entry points.
-    // This places the search start close to where the true neighbors are, typically
-    // requiring fewer hops to converge → better recall at same gamma_term → higher QPS.
-    // N_CLUSTER_SEEDS controls the breadth; 32 is a good default for K≈1000, N=1M.
-    // Larger values give tighter d_k initialization → earlier termination → higher QPS at same recall.
+    // Cluster-aware seeding: probe top-n_probe nearest clusters with PER-CLUSTER ADC.
+    //
+    // Root cause of angular data failure (NYTimes-256, GloVe-100):
+    //   The original code scored ALL seeds with the initial cluster's LUT. Cross-cluster
+    //   seeds are computed with the wrong residual basis → inaccurate ADC estimates →
+    //   d_k initialized too small from primary-cluster-only hits → gamma gate prunes
+    //   all cross-cluster graph edges → recall collapses to ~cluster_size/N * k.
+    //
+    // Fix: per-cluster probing. For each probed cluster c_i:
+    //   1. rebuild ADC state to centroid(c_i) → correct q_res
+    //   2. build tier-2 LUT from q_res(c_i)   → accurate per-cluster ADC
+    //   3. score ALL cluster members with accurate LUT
+    // This mirrors IVF nprobe: angular data requires more probing because unit vectors
+    // spread true neighbors across many clusters (no magnitude diversity).
+    //
+    // After seeding, restore t2_lut_tl to initial cluster (used by DABS termination gate).
     const int N_CLUSTER_SEEDS = prop_.n_cluster_seeds;
-    // Neighboring clusters seeded via precomputed cluster_neighbors_v2_ (built in call_once)
+    // n_probe: angular data seeds from more clusters than L2 for accurate d_k initialization.
+    // Per-cluster tier-2 scoring gives cross-cluster seeds with correct ADC residuals,
+    // so d_k is properly initialized before DABS beam search begins.
+    // L2 data: DABS with 3 neighbor clusters is highly effective.
+    const int n_probe = (n_probe_override_ > 0) ? n_probe_override_
+                                                 : (is_angular_ ? 20 : 3);
     {
-        // Gather seed IDs from the nearest cluster(s)
-        std::vector<uint32_t> seeds;
-        seeds.reserve(static_cast<size_t>(N_CLUSTER_SEEDS * 4)); // primary + up to 2 neighbor clusters
-
-        // Primary cluster
-        if (active_cid < cluster_members_v2_.size()) {
-            const auto& primary = cluster_members_v2_[active_cid];
-            const size_t take = std::min(primary.size(),
-                                         static_cast<size_t>(N_CLUSTER_SEEDS));
-            for (size_t i = 0; i < take; ++i) seeds.push_back(primary[i]);
+        // Build list of clusters to probe: primary cluster + top-(n_probe-1) neighbors.
+        // cluster_neighbors_v2_[active_cid] is sorted by cluster-centroid L2 distance.
+        std::vector<uint32_t> probe_clusters;
+        probe_clusters.reserve(static_cast<size_t>(n_probe));
+        probe_clusters.push_back(initial_cid);  // primary cluster first
+        if (initial_cid < cluster_neighbors_v2_.size()) {
+            for (uint32_t c2 : cluster_neighbors_v2_[initial_cid]) {
+                if (static_cast<int>(probe_clusters.size()) >= n_probe) break;
+                probe_clusters.push_back(c2);
+            }
         }
 
-        // Expand to neighboring clusters using precomputed cluster neighbor table (O(1)).
-        // cluster_neighbors_v2_[active_cid] gives the nearest CLUSTER_NBRS clusters,
-        // precomputed offline during call_once — zero per-query centroid scan overhead.
-        if (active_cid < cluster_neighbors_v2_.size()) {
-            for (uint32_t cid2 : cluster_neighbors_v2_[active_cid]) {
-                if (cid2 >= cluster_members_v2_.size()) continue;
-                const auto& nbr_members = cluster_members_v2_[cid2];
-                const size_t take = std::min(nbr_members.size(),
-                                              static_cast<size_t>(N_CLUSTER_SEEDS));
-                for (size_t i = 0; i < take; ++i) seeds.push_back(nbr_members[i]);
+        struct SeedScore { float score; uint32_t id; };
+        std::vector<SeedScore> scored;
+        scored.reserve(static_cast<size_t>(n_probe) * 200);
+
+        // Score seeds from each probed cluster with the CORRECT centroid's LUT.
+        // For each cluster c_i: rebuild ADC → build LUT(c_i) → score all members.
+        static thread_local std::vector<float> t2_lut_probe;
+        t2_lut_probe.resize(static_cast<size_t>(M_PQ) * 256);
+        for (uint32_t cid_p : probe_clusters) {
+            if (cid_p >= cluster_members_v2_.size()) continue;
+            const auto& members = cluster_members_v2_[cid_p];
+            if (members.empty()) continue;
+
+            // Angular: rebuild ADC + tier-2 LUT per cluster for accurate cross-cluster scoring.
+            // L2: initial-cluster LUT is accurate (magnitude diversity makes cross-cluster
+            //     residual error negligible for seeding); skip expensive per-cluster rebuild.
+            if (is_angular_) {
+                maybe_rebuild_adc(cid_p);
+                NGT::NGTAQ::build_tier2_lut_fast_m(q_res_tl.data(), M_PQ,
+                                                    tier2_codebook_T_.data(),
+                                                    t2_lut_probe.data());
+            }
+            const float q_ns  = is_angular_ ? adc.q_norm_sq : q_norm_sq_initial;
+            const float* lut_p = is_angular_ ? t2_lut_probe.data() : t2_lut_tl.data();
+            // Score all members of this cluster with the correct LUT
+            const size_t take = is_angular_
+                ? members.size()                                         // scan full cluster for angular
+                : std::min(members.size(), static_cast<size_t>(N_CLUSTER_SEEDS)); // limit for L2
+            // Prefetch only what we'll score: avoids cache pollution for L2 (full-cluster
+            // prefetch evicts DABS hot data from L1/L2 when only 32/N_CLUSTER_SEEDS are used).
+            for (size_t mi = 0; mi < take; ++mi) {
+                if (members[mi] < N) graph_->prefetchRecord(members[mi]);
+            }
+            for (size_t mi = 0; mi < take; ++mi) {
+                uint32_t ep = members[mi];
+                if (ep >= N || graph_->isTombstone(ep)) continue;
+                auto rec = graph_->getRecordConstView(ep);
+                float norm_x = NGT::NGTAQ::fp16_to_float(rec.norm_fp16());
+                float t2_ip  = NGT::NGTAQ::tier2_adc_pq_m(lut_p, rec.tier2(), M_PQ);
+                float d_approx = q_ns + norm_x * norm_x - 2.0f * t2_ip;
+                scored.push_back({d_approx, ep});
             }
         }
 
         // Fall back to static entry points if cluster membership is empty
-        if (seeds.empty()) {
-            for (uint32_t ep : entry_points_) seeds.push_back(ep);
+        if (scored.empty()) {
+            for (uint32_t ep : entry_points_) {
+                if (ep < N && !graph_->isTombstone(ep)) {
+                    auto rec = graph_->getRecordConstView(ep);
+                    scored.push_back({std::numeric_limits<float>::infinity(), ep});
+                }
+            }
         }
 
-        // Tier-2 sort seeds before routing: score by PQ ADC using initial-cluster LUT.
-        // Seeds in the same cluster as the query get accurate scores; cross-cluster seeds
-        // get an approximation (different residual basis), but still better than random order.
-        // Sorting ~96 floats costs ~0.5μs; benefit: routing starts from the closest seed.
-        {
-            // Bulk prefetch all seed records before the scoring loop.
-            // Issuing all ~96 prefetches at once lets the hardware overlap multiple
-            // DRAM requests (max ~20 outstanding) instead of serialising them.
-            // Expected gain: ~5μs → ~0.5μs for the cold-miss phase.
-            for (uint32_t ep : seeds) {
-                if (ep < N) graph_->prefetchRecord(ep);
-            }
+        // Sort seeds by accurate per-cluster ADC estimate; best-first ensures d_k
+        // is initialized from the true near-neighbors rather than random seeds.
+        std::sort(scored.begin(), scored.end(),
+                  [](const SeedScore& a, const SeedScore& b){ return a.score < b.score; });
 
-            struct SeedScore { float score; uint32_t id; };
-            std::vector<SeedScore> scored;
-            scored.reserve(seeds.size());
-            for (uint32_t ep : seeds) {
-                if (ep >= N || graph_->isTombstone(ep)) continue;
-                auto rec = graph_->getRecordConstView(ep);
-                float norm_x = NGT::NGTAQ::fp16_to_float(rec.norm_fp16());
-                float t2_ip = NGT::NGTAQ::tier2_adc_pq_m(t2_lut_tl.data(), rec.tier2(), M_PQ);
-                // Use initial-cluster residual norm for L2 estimate
-                float d_approx = q_norm_sq_initial + norm_x * norm_x - 2.0f * t2_ip;
-                scored.push_back({d_approx, ep});
-            }
-            std::sort(scored.begin(), scored.end(),
-                      [](const SeedScore& a, const SeedScore& b){ return a.score < b.score; });
-            // Push sorted seeds into priority queue (best first for warm d_k)
+        // During rebuildGraphSelf on angular data, limit total seeds to avoid queue
+        // flooding (n_probe=20 × avg_cluster_members can be 20k+ seeds per query).
+        // rebuild_max_seeds_ = 0 (default) means no limit (normal search path).
+        if (rebuild_max_seeds_ > 0 &&
+            static_cast<int>(scored.size()) > rebuild_max_seeds_)
+            scored.resize(static_cast<size_t>(rebuild_max_seeds_));
+
+        {
+            // ── DABS path for all metrics ─────────────────────────────────────────
+            // Per-cluster tier-2 seeding (above) gives accurate cross-cluster d_k
+            // initialization. DABS graph traversal then bridges inter-cluster gaps
+            // via ANNG edges (built on true angular proximity for normalized vectors).
+            // gamma_enq ≥ 0.50 (caller should use this for angular) ensures tier-1
+            // noise (~44% max deflation) doesn't prune true near-neighbors.
             for (const auto& s : scored) {
                 if (is_visited(s.id)) continue;
                 mark_visited(s.id);
@@ -1083,11 +1138,27 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
                 cand_q.push({d, s.id});
                 graph_->prefetchOffset(s.id);
             }
+
+            // Angular only: restore t2_lut_tl and ADC to initial cluster.
+            // The DABS termination gate (two-gate tier-2 check) uses t2_lut_tl with the
+            // initial-cluster residual. L2 never rebuilt LUT/ADC during seeding → no restore.
+            if (is_angular_) {
+                NGT::NGTAQ::build_tier2_lut_fast_m(q_res_init_tl.data(), M_PQ,
+                                                    tier2_codebook_T_.data(),
+                                                    t2_lut_tl.data());
+                maybe_rebuild_adc(initial_cid);
+            }
         }
     }
 
     while (!cand_q.empty()) {
         auto [dist_x, x] = cand_q.top(); cand_q.pop();
+
+        // Skip tombstoned (hole) nodes: zero-norm train vectors excluded during
+        // normalization. Their raw_flat_ entry is all-zeros, so exact L2 reranking
+        // gives dist = ||q_norm|| = 1.0, which beats true NNs with dist > 1.0
+        // (cos_sim < 0.5) and causes recall collapse on angular datasets (NYTimes).
+        if (graph_->isTombstone(x)) continue;
 
         // Fast-path termination: node is so far that even maximum tier-1 deflation
         // (3σ ≈ 2.32×) of a true near-neighbor can't explain this distance.
@@ -1111,13 +1182,23 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
         // terminating. Only fires in the "uncertain zone" (1× to 2× threshold): nodes that
         // tier-1 calls too far but tier-2 may recognize as close. Cost: 1 fp16_to_float +
         // 1 tier2_adc_pq (~5ns) per uncertain termination candidate.
+        //
+        // Angular EXCEPTION: t2_lut_tl uses the initial cluster's residual, but DABS pops
+        // nodes from any cluster (after maybe_rebuild_adc). For cross-cluster nodes, this
+        // gives a grossly wrong distance (wrong residual basis) → overestimates → false
+        // termination → recall collapse for angular. Skip tier-2 for angular; rely solely
+        // on tier-1 with a suitably large gamma_term (≥0.50 recommended for angular).
         if (dk_tracker.size() >= static_cast<size_t>(k_beam) &&
             dist_x > (1.f + gamma_term) * d_k) {
-            float nx2  = NGT::NGTAQ::fp16_to_float(rec_x.norm_fp16());
-            float t2ip = NGT::NGTAQ::tier2_adc_pq_m(t2_lut_tl.data(), rec_x.tier2(), M_PQ);
-            float d_t2 = q_norm_sq_initial + nx2 * nx2 - 2.0f * t2ip;
-            if (d_t2 > (1.f + gamma_term) * d_k) break;
-            // tier-2 override: tier-1 overestimated this node — continue processing
+            if (!is_angular_) {
+                float nx2  = NGT::NGTAQ::fp16_to_float(rec_x.norm_fp16());
+                float t2ip = NGT::NGTAQ::tier2_adc_pq_m(t2_lut_tl.data(), rec_x.tier2(), M_PQ);
+                float d_t2 = q_norm_sq_initial + nx2 * nx2 - 2.0f * t2ip;
+                if (d_t2 > (1.f + gamma_term) * d_k) break;
+                // tier-2 override: tier-1 overestimated this node — continue processing
+            } else {
+                break;  // angular: trust tier-1 termination (no 2-gate with wrong LUT)
+            }
         }
 
         maybe_rebuild_adc(rec_x.centroid_id());
@@ -1171,25 +1252,23 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
         }
     }
 
-    // Select top k*15 candidates by approximate score for exact L2 reranking.
-    // nth_element (O(n)) is faster than sort (O(n log n)) when n >> refine_n.
-    // tier-1 has ~0.5bit noise but good rank correlation for initial filtering.
-    const size_t refine_n = static_cast<size_t>(k_beam * 15);
+    // Select top candidates by approximate score for exact L2 reranking.
+    // BQ ADC noise ~44% causes true NNs to appear at high ADC ranks; k_beam*15 was
+    // too aggressive and threw away genuine neighbors.  k_beam*100 keeps a much
+    // wider ADC window so true NNs survive to the exact-distance stage.
+    const size_t refine_n = static_cast<size_t>(k_beam * 100);
     if (results.size() > refine_n) {
         std::nth_element(results.begin(), results.begin() + refine_n, results.end());
         results.resize(refine_n);
     }
 
-    // 1-hop expansion: after refine_n trimming, add unvisited neighbors of the
-    // top-EXPAND_N DABS candidates as additional exact-L2 candidates.
-    // Results[0..refine_n-1] are already the best DABS candidates; expansion
-    // appends new nodes WITHOUT displacing them (they compete only in final sort).
-    // DABS pops in priority order, so results[0..EXPAND_N-1] are approximately
-    // the EXPAND_N closest nodes (pop order ≈ ascending ADC distance).
-    // Cost: EXPAND_N × avg_degree neighbor checks + ~50-100 ADC computations.
-    // Expected gain: +3-7% recall at high gamma, ~0% cost at low gamma.
+    // 1-hop expansion from top-EXPAND_N candidates (all metrics).
+    // For angular DABS: ANNG edges bridge inter-cluster gaps; expanding top seeds
+    // finds true NNs in neighboring clusters not reached by beam search.
+    // EXPAND_N raised from 20→200: covers secondary cluster seeds whose true NNs
+    // are reachable 2 hops away from any of the top-200 ADC candidates.
     {
-        constexpr size_t EXPAND_N = 20;
+        constexpr size_t EXPAND_N = 200;
         const size_t expand_from = std::min(EXPAND_N, results.size());
         for (size_t ei = 0; ei < expand_from; ++ei) {
             uint32_t node = results[ei].second;
@@ -1212,6 +1291,9 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
     final_results.reserve(results.size());
     for (auto& [approx_d, id] : results) {
         if (static_cast<size_t>(id) * D + D > raw_flat_.size()) continue;
+        // Safety net: tombstoned nodes have raw_flat_=zeros → exact dist=1.0
+        // which beats angular NNs with dist>1.0. Filter here as belt-and-suspenders.
+        if (graph_->isTombstone(static_cast<uint32_t>(id))) continue;
         const float* vec = raw_flat_.data() + static_cast<size_t>(id) * D;
         float exact_sq = NGT::NGTAQ::l2_sq(q_ptr, vec, D);
         // Store exact_sq in .distance temporarily (sqrt deferred until after sort).
@@ -1243,7 +1325,9 @@ void NGTAQIndex::rebuildGraphFromNGT(const std::string& ngt_path,
     if (new_alpha    > 0.0f) prop_.alpha     = new_alpha;
     if (new_max_edges > 0)   prop_.max_edges = new_max_edges;
 
-    const size_t N    = size();
+    // Use graph_->size() (= state_.size(), includes tombstones) not size()
+    // (= activeCount()).  resetEdges() requires adj.size() == state_.size().
+    const size_t N    = graph_->size();
     const int    D    = prop_.dimension;
     const int    words = D / 64;
 
@@ -1263,8 +1347,8 @@ void NGTAQIndex::rebuildGraphFromNGT(const std::string& ngt_path,
         catch (...) { continue; }
         if (!node || node->empty()) continue;
 
-        // Read cluster id from the existing v2 record (for cluster-aware sort)
-        uint32_t own_cid = graph_->getRecord(aq_id).centroid_id;
+        // Use getRecordConstView (correct variable stride) for cluster-aware sort.
+        uint32_t own_cid = graph_->getRecordConstView(aq_id).centroid_id();
 
         std::vector<std::pair<uint32_t, float>> candidates;
         candidates.reserve(node->size());
@@ -1276,15 +1360,9 @@ void NGTAQIndex::rebuildGraphFromNGT(const std::string& ngt_path,
             candidates.push_back({nbr, d_bq});
         }
 
-        // Cluster-aware sort: same centroid neighbors first (improves local connectivity),
-        // then by BQ distance — mirrors the original fromNGTv2 construction.
-        std::stable_sort(candidates.begin(), candidates.end(),
-            [&](const auto& a, const auto& b) {
-                bool a_same = (graph_->getRecord(a.first).centroid_id == own_cid);
-                bool b_same = (graph_->getRecord(b.first).centroid_id == own_cid);
-                if (a_same != b_same) return a_same > b_same;
-                return a.second < b.second;
-            });
+        // Pure BQ distance sort (no cluster priority — see rebuildGraphSelf comment).
+        std::sort(candidates.begin(), candidates.end(),
+            [](const auto& a, const auto& b) { return a.second < b.second; });
         if (static_cast<int>(candidates.size()) > prop_.max_edges)
             candidates.resize(static_cast<size_t>(prop_.max_edges));
 
@@ -1308,6 +1386,30 @@ void NGTAQIndex::rebuildGraphFromNGT(const std::string& ngt_path,
 }
 
 // ---------------------------------------------------------------------------
+// fixHoleTombstones: post-hoc tombstone repair.
+// Scan raw_flat_ for zero-norm vectors (hole nodes created when zero-norm
+// train vectors were excluded during normalization but not properly tombstoned
+// in the serialized graph). Tombstones them so they cannot appear in search results.
+// ---------------------------------------------------------------------------
+int NGTAQIndex::fixHoleTombstones() {
+    const int D = (d_eff_ > 0) ? d_eff_ : prop_.dimension;
+    const size_t N = graph_->size();
+    int n_fixed = 0;
+    for (size_t i = 0; i < N; ++i) {
+        if (graph_->isTombstone(static_cast<uint32_t>(i))) continue;
+        const float* v = raw_flat_.data() + i * static_cast<size_t>(D);
+        float norm2 = 0.f;
+        for (int d = 0; d < D; ++d) norm2 += v[d] * v[d];
+        if (norm2 < 1e-12f) {
+            graph_->removeNode(static_cast<uint32_t>(i));
+            ++n_fixed;
+        }
+    }
+    fprintf(stderr, "[fixHoleTombstones] tombstoned %d zero-norm (hole) nodes\n", n_fixed);
+    return n_fixed;
+}
+
+// ---------------------------------------------------------------------------
 // rebuildGraphSelf: self-referential graph refinement.
 // Runs searchV2 on every node to find high-quality candidate neighbors, then
 // re-prunes with AlphaCGPruner. One pass raises recall ceiling by ~5-10%.
@@ -1321,7 +1423,10 @@ void NGTAQIndex::rebuildGraphSelf(int   k_search,
     if (new_alpha    > 0.0f) prop_.alpha     = new_alpha;
     if (new_max_edges > 0)   prop_.max_edges = new_max_edges;
 
-    const size_t N    = size();
+    // BUGFIX: use graph_->size() (= state_.size(), includes tombstones) not size()
+    // (= activeCount(), excludes tombstones).  resetEdges() requires adj.size() ==
+    // state_.size(); if adj is undersized it reads past the end → SIGSEGV.
+    const size_t N    = graph_->size();
     const int    D    = prop_.dimension;
     const int    words = D / 64;
 
@@ -1333,6 +1438,26 @@ void NGTAQIndex::rebuildGraphSelf(int   k_search,
     if (!raw_flat_.empty()) {
         std::vector<float> dummy(raw_flat_.data(), raw_flat_.data() + D);
         searchV2(dummy, 1, gamma, gamma);
+    }
+
+    // During rebuild we want maximum neighbor diversity, not maximum QPS.
+    // Default: probe ALL K clusters so every node's true k-NN can be discovered
+    // across cluster boundaries.  Caller can override via setNProbe() before calling
+    // rebuildGraphSelf() (e.g. to cap rebuild time on large datasets).
+    // rebuild_max_seeds_ is set to match so all probed centroids are used as seeds.
+    int saved_n_probe_override = n_probe_override_;
+    if (is_angular_) {
+        const int K_clusters = static_cast<int>(kmeans_v2_ ? kmeans_v2_->num_clusters() : 0);
+        if (K_clusters > 0) {
+            // If caller pre-set via setNProbe(), honour that value (capped at K).
+            // Otherwise default to probing all K clusters.
+            const int caller_probe = saved_n_probe_override;  // 0 = "not set by caller"
+            const int effective_probe = (caller_probe > 0)
+                ? std::min(caller_probe, K_clusters)
+                : K_clusters;
+            n_probe_override_  = effective_probe;
+            rebuild_max_seeds_ = effective_probe;
+        }
     }
 
     // Parallel search: for each node i, find its k_search approximate NN.
@@ -1349,33 +1474,83 @@ void NGTAQIndex::rebuildGraphSelf(int   k_search,
         // Search for k_search+1: self may appear in results; we'll skip it.
         auto results = searchV2(q, k_search + 1, gamma, gamma);
 
-        // Build candidate list with BQ distances (required for AlphaCGPruner).
+        // Build candidate list sorted by EXACT distance (two-phase approach).
+        //
+        // Problem: original code sorted/trimmed by BQ distance, which is
+        // cluster-relative (residual BQ).  Cross-cluster true NNs have noisy
+        // inter-cluster BQ distances and were ranked at positions 50-200+,
+        // well outside the max_edges=128 cutoff → never reached alpha-CG.
+        //
+        // Fix phase 1: sort and trim by EXACT distance so cross-cluster true
+        // NNs (small exact_dist) survive the max_edges cutoff.
+        // Fix phase 2: replace with BQ distances for alpha-CG input so the
+        // pruner retains its original navigability behaviour (same tau).
+        //
+        // Why BQ for alpha-CG: cross-cluster candidates have high BQ dist →
+        // high pruning threshold → hard to be "dominated" → they are KEPT.
+        // In-cluster candidates behave as before (accurate BQ distances).
         std::vector<std::pair<uint32_t, float>> candidates;
         candidates.reserve(results.size());
-        uint32_t own_cid = graph_->getRecord(static_cast<uint32_t>(i)).centroid_id;
         for (auto& r : results) {
             if (r.id == static_cast<uint32_t>(i)) continue;  // skip self
-            float d_bq = bqDistance(graph_->getNodeBQ(static_cast<uint32_t>(i)),
-                                     graph_->getNodeBQ(r.id), words, D);
-            candidates.push_back({r.id, d_bq});
+            candidates.push_back({r.id, r.distance});  // exact dist for ranking
         }
 
-        // Cluster-aware sort: same centroid first, then by BQ distance.
-        std::stable_sort(candidates.begin(), candidates.end(),
-            [&](const auto& a, const auto& b) {
-                bool a_same = (graph_->getRecord(a.first).centroid_id == own_cid);
-                bool b_same = (graph_->getRecord(b.first).centroid_id == own_cid);
-                if (a_same != b_same) return a_same > b_same;
-                return a.second < b.second;
-            });
+        // Phase 1: trim by exact distance (cross-cluster true NNs survive).
+        std::sort(candidates.begin(), candidates.end(),
+            [](const auto& a, const auto& b) { return a.second < b.second; });
         if (static_cast<int>(candidates.size()) > prop_.max_edges)
             candidates.resize(static_cast<size_t>(prop_.max_edges));
+
+        // Phase 2: cluster-aware selective alpha-CG.
+        //
+        // Cross-cluster candidates (confirmed true NNs by Phase 1 exact trim) are
+        // added unconditionally to the graph.  Applying BQ alpha-CG to them is
+        // counterproductive: inter-cluster BQ distances are meaningless (different
+        // residual frames), so the pruning decision is random noise and removes
+        // valid cross-cluster edges that are critical for navigability.
+        //
+        // In-cluster candidates still use BQ alpha-CG which IS meaningful within a
+        // cluster (same residual frame) and produces a navigable in-cluster sub-graph.
+        const uint32_t cid_i = graph_->getRecordConstView(static_cast<uint32_t>(i)).centroid_id();
+
+        std::vector<std::pair<uint32_t, float>> in_cluster_cands;
+        std::vector<uint32_t> cross_cluster_ids;
+        in_cluster_cands.reserve(candidates.size());
+        // candidates is currently sorted by exact distance (Phase 1 order).
+        // We iterate in that order so cross_cluster_ids preserves exact-dist rank.
+        for (auto& c : candidates) {
+            const uint32_t cid_c = graph_->getRecordConstView(c.first).centroid_id();
+            const float bq_d = bqDistance(graph_->getNodeBQ(static_cast<uint32_t>(i)),
+                                           graph_->getNodeBQ(c.first), words, D);
+            if (cid_c == cid_i) {
+                in_cluster_cands.push_back({c.first, bq_d});
+            } else {
+                cross_cluster_ids.push_back(c.first);  // exact-dist order preserved
+            }
+        }
+
+        std::sort(in_cluster_cands.begin(), in_cluster_cands.end(),
+            [](const auto& a, const auto& b) { return a.second < b.second; });
 
         auto dist_fn = [&](uint32_t v, uint32_t u) -> float {
             return bqDistance(graph_->getNodeBQ(v), graph_->getNodeBQ(u), words, D);
         };
-        adj[i] = pruner.prune(candidates, tau, dist_fn);
+
+        // Alpha-CG on in-cluster candidates → navigable in-cluster sub-graph.
+        adj[i] = pruner.prune(in_cluster_cands, tau, dist_fn);
+
+        // Append cross-cluster candidates unconditionally (closest first, exact-dist order).
+        const int max_adj = prop_.max_edges;
+        for (uint32_t ccid : cross_cluster_ids) {
+            if (static_cast<int>(adj[i].size()) >= max_adj) break;
+            adj[i].push_back(ccid);
+        }
     }
+
+    // Reset overrides before any post-rebuild searches.
+    rebuild_max_seeds_ = 0;
+    n_probe_override_  = saved_n_probe_override;
 
     graph_->resetEdges(adj);
 
