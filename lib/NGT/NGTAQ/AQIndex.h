@@ -104,8 +104,9 @@ public:
     int  dEff()      const { return d_eff_ > 0 ? d_eff_ : prop_.dimension; }
     int  mPQ()       const { return m_pq_; }
 
-    // Accessors for raw float vectors and dimension (used by standalone benchmarks)
-    const float* rawFlat() const { return raw_flat_.empty() ? nullptr : raw_flat_.data(); }
+    // Accessors for raw fp16 vectors and dimension (used by standalone benchmarks).
+    // Elements are fp16-packed; decode with NGT::NGTAQ::fp16_to_float.
+    const uint16_t* rawFlat() const { return raw_flat_.empty() ? nullptr : raw_flat_.data(); }
     int dim() const { return prop_.dimension; }
 
     // Rebuild v2 graph edges from a (denser) NGT source index without re-training
@@ -147,7 +148,7 @@ private:
     AlphaCGPruner                   pruner_;
     DABSSearcher                    searcher_;
     std::vector<uint32_t>           entry_points_;
-    std::vector<float>              raw_flat_;     // flat [N*D] exact float vectors
+    std::vector<uint16_t>           raw_flat_;     // flat [N*D] exact vectors, fp16-packed (rerank via l2_sq_f32_fp16)
 
     int                                       n_probe_override_ = 0;  // 0 = default
 
@@ -175,10 +176,11 @@ private:
     mutable std::vector<std::vector<uint32_t>> cluster_neighbors_v2_; // cluster_id → [nearest cluster_ids]
 
     // Private constructor used by fromNGT() and load().
+    // raw_flat is fp16-packed [N*D] (see raw_flat_).
     NGTAQIndex(Property prop, BinaryQuantizer bq,
                std::unique_ptr<SoAGraph> graph,
                std::vector<uint32_t> eps,
-               std::vector<float> raw_flat);
+               std::vector<uint16_t> raw_flat);
 
     static std::vector<uint32_t> selectEntryPoints(
         const SoAGraph& graph, int n, uint32_t seed = 42);

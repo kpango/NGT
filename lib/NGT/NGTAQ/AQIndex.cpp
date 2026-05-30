@@ -26,7 +26,7 @@ namespace NGTAQ {
 NGTAQIndex::NGTAQIndex(Property prop, BinaryQuantizer bq,
                        std::unique_ptr<SoAGraph> graph,
                        std::vector<uint32_t> eps,
-                       std::vector<float> raw_flat)
+                       std::vector<uint16_t> raw_flat)
     : prop_(prop)
     , bq_(std::move(bq))
     , graph_(std::move(graph))
@@ -141,8 +141,13 @@ NGTAQIndex NGTAQIndex::fromNGT(const std::string& ngt_path, const Property& prop
     int n_ep = std::min(prop.n_entry_points, static_cast<int>(N));
     auto entry_points = selectEntryPoints(*graph, n_ep);
 
+    // Pack the fp32 working buffer into fp16 for the exact-rerank store (Task 0.2).
+    std::vector<uint16_t> raw_flat_h(raw_flat.size());
+    for (size_t i = 0; i < raw_flat.size(); ++i)
+        raw_flat_h[i] = NGT::NGTAQ::float_to_fp16(raw_flat[i]);
+
     return NGTAQIndex(prop, std::move(bq), std::move(graph),
-                      std::move(entry_points), std::move(raw_flat));
+                      std::move(entry_points), std::move(raw_flat_h));
 }
 
 // ---------------------------------------------------------------------------
@@ -176,31 +181,33 @@ std::vector<SearchResult> NGTAQIndex::search(
         }
     }
 
+    // Cosine: raw_flat_ stores pre-normalized vectors; normalize the query once
+    // (identical for all candidates) and reuse inside the refinement loop.
+    const bool is_cosine = (prop_.metric != NGT::ObjectSpace::DistanceTypeL2);
+    std::vector<float> qn;
+    if (is_cosine) {
+        qn.assign(query.data(), query.data() + D);
+        float norm_sq = 0.0f;
+        for (float x : qn) norm_sq += x * x;
+        if (norm_sq > 0.0f) {
+            float inv_norm = 1.0f / std::sqrt(norm_sq);
+            for (float& x : qn) x *= inv_norm;
+        }
+    }
+
     // Exact-distance refinement
     std::vector<SearchResult> results;
     results.reserve(cand_ids.size());
     for (uint32_t id : cand_ids) {
         if (static_cast<size_t>(id) * D + D > raw_flat_.size()) continue;
-        const float* vec = raw_flat_.data() + static_cast<size_t>(id) * D;
+        // raw_flat_ is fp16-packed; decode lazily via the F16C helpers.
+        const uint16_t* vec = raw_flat_.data() + static_cast<size_t>(id) * D;
         float exact_dist = 0.0f;
-        if (prop_.metric == NGT::ObjectSpace::DistanceTypeL2) {
-            float sq = 0.0f;
-            for (int j = 0; j < D; ++j) {
-                float d = query[j] - vec[j];
-                sq += d * d;
-            }
-            exact_dist = std::sqrt(sq);
+        if (!is_cosine) {
+            exact_dist = std::sqrt(NGT::NGTAQ::l2_sq_f32_fp16(query.data(), vec, D));
         } else {
-            // Cosine: raw_flat_ stores pre-normalized vectors; normalize query too.
-            std::vector<float> qn(query.data(), query.data() + D);
-            float norm_sq = 0.0f;
-            for (float x : qn) norm_sq += x * x;
-            if (norm_sq > 0.0f) {
-                float inv_norm = 1.0f / std::sqrt(norm_sq);
-                for (float& x : qn) x *= inv_norm;
-            }
             float dot = 0.0f;
-            for (int j = 0; j < D; ++j) dot += qn[j] * vec[j];
+            for (int j = 0; j < D; ++j) dot += qn[j] * NGT::NGTAQ::fp16_to_float(vec[j]);
             exact_dist = 1.0f - dot;
         }
         float bq_dist = bqDistance(q_bq.data(), graph_->getNodeBQ(id), words, D);
@@ -254,17 +261,25 @@ uint32_t NGTAQIndex::insert(const std::vector<float>& vec) {
     std::unique_lock<std::shared_mutex> lock(graph_->mutex());
     uint32_t new_id = graph_->addNode(bq_buf.data());
 
-    // Append raw float vector to flat array
-    raw_flat_.insert(raw_flat_.end(), vec.begin(), vec.begin() + D);
-    // Normalize in-place for cosine metric
+    // Append raw vector to flat array, fp16-packed.
+    raw_flat_.reserve(raw_flat_.size() + static_cast<size_t>(D));
+    for (int j = 0; j < D; ++j)
+        raw_flat_.push_back(NGT::NGTAQ::float_to_fp16(vec[j]));
+    // Normalize in-place for cosine metric (fp16 round-trip).
     if (prop_.metric == NGT::ObjectSpace::DistanceTypeAngle ||
         prop_.metric == NGT::ObjectSpace::DistanceTypeCosine) {
-        float* v = raw_flat_.data() + static_cast<size_t>(new_id) * D;
+        uint16_t* h = raw_flat_.data() + static_cast<size_t>(new_id) * D;
+        // Norm is computed over the fp16-rounded values (not the original fp32) so the
+        // stored vector is normalized consistently with how search-time decode reads it.
         float norm_sq = 0.0f;
-        for (int j = 0; j < D; ++j) norm_sq += v[j] * v[j];
+        for (int j = 0; j < D; ++j) {
+            float f = NGT::NGTAQ::fp16_to_float(h[j]);
+            norm_sq += f * f;
+        }
         if (norm_sq > 0.0f) {
             float inv_norm = 1.0f / std::sqrt(norm_sq);
-            for (int j = 0; j < D; ++j) v[j] *= inv_norm;
+            for (int j = 0; j < D; ++j)
+                h[j] = NGT::NGTAQ::float_to_fp16(NGT::NGTAQ::fp16_to_float(h[j]) * inv_norm);
         }
     }
 
@@ -318,8 +333,8 @@ void NGTAQIndex::rebuild() {
         if (!graph_->isTombstone(i)) old_to_new[i] = next_id++;
     }
 
-    // Reorder raw_flat_ to match post-rebuild node ordering
-    std::vector<float> new_flat(static_cast<size_t>(next_id) * D);
+    // Reorder raw_flat_ to match post-rebuild node ordering (fp16 elements)
+    std::vector<uint16_t> new_flat(static_cast<size_t>(next_id) * D);
     for (uint32_t i = 0; i < static_cast<uint32_t>(N); ++i) {
         if (old_to_new[i] == static_cast<uint32_t>(-1)) continue;
         size_t src_off = static_cast<size_t>(i) * D;
@@ -349,18 +364,26 @@ size_t NGTAQIndex::size() const {
 // save
 // ---------------------------------------------------------------------------
 // Magic number identifying the versioned binary format.
-// Old format: first 4 bytes = prop_.dimension (small positive int, typically 128).
-// New format: first 4 bytes = kPropMagic, followed by uint32_t prop_size, then prop bytes.
-static constexpr uint32_t kPropMagic = 0xAE17AE17u;
+// Oldest format:  first 4 bytes = prop_.dimension (small positive int, typically 128); fp32 raw_flat_.
+// fp32 versioned:  first 4 bytes = kPropMagicFp32, then [prop_size][prop_bytes]; fp32 raw_flat_.
+// fp16 versioned:  first 4 bytes = kPropMagicFp16 (Task 0.2), same prop header but raw_flat_ is uint16_t.
+// The fp16 magic distinguishes the new layout; older indices are rejected in load()
+// (no fp32→fp16 conversion — indices are rebuilt; see Task 0.3).
+static constexpr uint32_t kPropMagicFp32 = 0xAE17AE17u;
+static constexpr uint32_t kPropMagicFp16 = 0xAE17AE18u;
+
+// raw_flat_ I/O writes n_elems * sizeof(uint16_t) bytes via a std::streamsize cast;
+// on a 64-bit streamsize this never overflows for any feasible index size.
+static_assert(sizeof(std::streamsize) >= 8, "NGTAQ index I/O assumes 64-bit streamsize");
 
 void NGTAQIndex::save(const std::string& path) const {
     std::ofstream os(path, std::ios::binary);
     if (!os) throw std::runtime_error("NGTAQIndex::save: cannot open " + path);
 
     // 1. Property — versioned format: [magic][prop_size][prop_bytes]
-    //    Backward-compat: old files start with prop_.dimension; new files with kPropMagic.
+    //    kPropMagicFp16 marks the fp16 raw_flat_ layout (Task 0.2).
     const uint32_t prop_size = sizeof(prop_);
-    os.write(reinterpret_cast<const char*>(&kPropMagic), 4);
+    os.write(reinterpret_cast<const char*>(&kPropMagicFp16), 4);
     os.write(reinterpret_cast<const char*>(&prop_size),  4);
     os.write(reinterpret_cast<const char*>(&prop_), prop_size);
 
@@ -377,12 +400,12 @@ void NGTAQIndex::save(const std::string& path) const {
         os.write(reinterpret_cast<const char*>(entry_points_.data()),
                  n_ep * sizeof(uint32_t));
 
-    // 5. Raw flat vectors: uint64_t n_floats, then float array
-    uint64_t n_floats = static_cast<uint64_t>(raw_flat_.size());
-    os.write(reinterpret_cast<const char*>(&n_floats), sizeof(n_floats));
-    if (n_floats > 0)
+    // 5. Raw flat vectors: uint64_t n_elems, then fp16 (uint16_t) array
+    uint64_t n_elems = static_cast<uint64_t>(raw_flat_.size());
+    os.write(reinterpret_cast<const char*>(&n_elems), sizeof(n_elems));
+    if (n_elems > 0)
         os.write(reinterpret_cast<const char*>(raw_flat_.data()),
-                 static_cast<std::streamsize>(n_floats * sizeof(float)));
+                 static_cast<std::streamsize>(n_elems * sizeof(uint16_t)));
 
     os.flush();
     if (!os) throw std::runtime_error("NGTAQIndex::save: write error on " + path);
@@ -396,8 +419,9 @@ NGTAQIndex NGTAQIndex::load(const std::string& path) {
     if (!is) throw std::runtime_error("NGTAQIndex::load: cannot open " + path);
 
     // 1. Property — detect format by magic number.
-    //    Old format (pre-k_clusters/n_cluster_seeds): first 4 bytes = dimension (e.g. 128).
-    //    New format: first 4 bytes = kPropMagic (0xAE17AE17), then uint32_t prop_size, then prop bytes.
+    //    fp16 versioned (current): first 4 bytes = kPropMagicFp16, then [prop_size][prop_bytes].
+    //    fp32 versioned (legacy):  first 4 bytes = kPropMagicFp32  → rejected (rebuild required).
+    //    oldest (pre-magic):       first 4 bytes = dimension (small int) → rejected (rebuild required).
     Property prop;
     memset(&prop, 0, sizeof(prop));
     prop.k_clusters      = 0;   // default: use select_k(N)
@@ -407,8 +431,16 @@ NGTAQIndex NGTAQIndex::load(const std::string& path) {
     is.read(reinterpret_cast<char*>(&maybe_magic), 4);
     if (!is) throw std::runtime_error("NGTAQIndex::load: failed to read header from " + path);
 
-    if (maybe_magic == kPropMagic) {
-        // New versioned format: [magic(4)][prop_size(4)][prop_bytes(prop_size)]
+    if (maybe_magic != kPropMagicFp16) {
+        // Either the legacy fp32 versioned magic, or the oldest dimension-prefixed
+        // format — both store raw_flat_ as fp32. We do not convert (YAGNI; indices are
+        // rebuilt in Task 0.3). Reject with a clear, actionable error.
+        throw std::runtime_error(
+            "AQ index uses fp32 raw_flat_; rebuild required for fp16 (Task 0.2)");
+    }
+
+    // fp16 versioned format: [magic(4)][prop_size(4)][prop_bytes(prop_size)]
+    {
         uint32_t stored_size;
         is.read(reinterpret_cast<char*>(&stored_size), 4);
         if (!is) throw std::runtime_error("NGTAQIndex::load: failed to read prop_size from " + path);
@@ -418,40 +450,6 @@ NGTAQIndex NGTAQIndex::load(const std::string& path) {
         // Skip unknown future fields (forward compatibility)
         if (stored_size > static_cast<uint32_t>(sizeof(prop)))
             is.seekg(static_cast<std::streamoff>(stored_size - sizeof(prop)), std::ios::cur);
-    } else {
-        // Old format: first 4 bytes = dimension. Property had 11 fields (44 bytes total),
-        // without k_clusters or n_cluster_seeds. Use a local layout-compatible struct.
-        struct OldProperty {
-            int     dimension;
-            float   alpha;
-            float   kappa;
-            float   gamma_enq;
-            float   gamma_term;
-            float   k_prime_factor;
-            int     n_tau_samples;
-            int     n_entry_points;
-            int     max_edges;
-            int     n_search_threads;
-            int32_t metric;  // NGT::ObjectSpace::DistanceType, int-sized enum
-        };
-        static_assert(sizeof(OldProperty) == 44, "OldProperty layout mismatch");
-        OldProperty old{};
-        old.dimension = static_cast<int>(maybe_magic);  // first 4 bytes already consumed
-        is.read(reinterpret_cast<char*>(&old.alpha),
-                static_cast<std::streamsize>(sizeof(OldProperty) - sizeof(int)));
-        if (!is) throw std::runtime_error("NGTAQIndex::load: failed to read old-format property from " + path);
-        prop.dimension        = old.dimension;
-        prop.alpha            = old.alpha;
-        prop.kappa            = old.kappa;
-        prop.gamma_enq        = old.gamma_enq;
-        prop.gamma_term       = old.gamma_term;
-        prop.k_prime_factor   = old.k_prime_factor;
-        prop.n_tau_samples    = old.n_tau_samples;
-        prop.n_entry_points   = old.n_entry_points;
-        prop.max_edges        = old.max_edges;
-        prop.n_search_threads = old.n_search_threads;
-        // k_clusters / n_cluster_seeds retain defaults set above
-        prop.metric = static_cast<NGT::ObjectSpace::DistanceType>(old.metric);
     }
 
     if (prop.dimension <= 0 || prop.dimension > 65536)
@@ -477,20 +475,20 @@ NGTAQIndex NGTAQIndex::load(const std::string& path) {
     if (n_ep > 0)
         is.read(reinterpret_cast<char*>(entry_points.data()), n_ep * sizeof(uint32_t));
 
-    // 5. Raw flat vectors
-    uint64_t n_floats = 0;
-    is.read(reinterpret_cast<char*>(&n_floats), sizeof(n_floats));
+    // 5. Raw flat vectors (fp16 / uint16_t elements)
+    uint64_t n_elems = 0;
+    is.read(reinterpret_cast<char*>(&n_elems), sizeof(n_elems));
     if (!is) throw std::runtime_error("NGTAQIndex::load: failed to read vec count");
     // Upper bound = dimension × maximum reasonable vector count (20M vectors).
-    // Full consistency check (n_floats == prop_.dimension * graph->size()) is done
+    // Full consistency check (n_elems == prop_.dimension * graph->size()) is done
     // implicitly: the read below will fail or produce wrong results if corrupt.
     const uint64_t max_reasonable = static_cast<uint64_t>(prop.dimension) * 20000000ULL;
-    if (n_floats > max_reasonable)
-        throw std::runtime_error("NGTAQIndex::load: n_floats exceeds limit (file corrupt?)");
-    std::vector<float> raw_flat(n_floats);
-    if (n_floats > 0)
+    if (n_elems > max_reasonable)
+        throw std::runtime_error("NGTAQIndex::load: n_elems exceeds limit (file corrupt?)");
+    std::vector<uint16_t> raw_flat(n_elems);
+    if (n_elems > 0)
         is.read(reinterpret_cast<char*>(raw_flat.data()),
-                static_cast<std::streamsize>(n_floats * sizeof(float)));
+                static_cast<std::streamsize>(n_elems * sizeof(uint16_t)));
 
     if (!is)
         throw std::runtime_error("NGTAQIndex::load: stream error reading " + path);
@@ -765,9 +763,15 @@ NGTAQIndex NGTAQIndex::fromNGTv2(const std::string& ngt_path, const Property& pr
     int n_ep = std::min(prop.n_entry_points, static_cast<int>(N));
     auto entry_points = selectEntryPoints(*graph, n_ep);
 
+    // Pack the fp32 working buffer into fp16 for the exact-rerank store (Task 0.2).
+    // raw_flat (fp32) was consumed by SRHT/BQ/normalization above; only fp16 is kept.
+    std::vector<uint16_t> raw_flat_h(raw_flat.size());
+    for (size_t i = 0; i < raw_flat.size(); ++i)
+        raw_flat_h[i] = NGT::NGTAQ::float_to_fp16(raw_flat[i]);
+
     // Construct index
     NGTAQIndex idx(prop, std::move(bq), std::move(graph),
-                   std::move(entry_points), std::move(raw_flat));
+                   std::move(entry_points), std::move(raw_flat_h));
     idx.is_v2_ = true;
     idx.srht_v2_        = std::move(srht);
     idx.kmeans_v2_      = std::move(kmeans);
@@ -1294,8 +1298,9 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
         // Safety net: tombstoned nodes have raw_flat_=zeros → exact dist=1.0
         // which beats angular NNs with dist>1.0. Filter here as belt-and-suspenders.
         if (graph_->isTombstone(static_cast<uint32_t>(id))) continue;
-        const float* vec = raw_flat_.data() + static_cast<size_t>(id) * D;
-        float exact_sq = NGT::NGTAQ::l2_sq(q_ptr, vec, D);
+        // raw_flat_ is fp16-packed; F16C rerank reads half the bytes vs fp32.
+        const uint16_t* vec = raw_flat_.data() + static_cast<size_t>(id) * D;
+        float exact_sq = NGT::NGTAQ::l2_sq_f32_fp16(q_ptr, vec, D);
         // Store exact_sq in .distance temporarily (sqrt deferred until after sort).
         final_results.push_back({id, exact_sq, approx_d});
     }
@@ -1397,9 +1402,12 @@ int NGTAQIndex::fixHoleTombstones() {
     int n_fixed = 0;
     for (size_t i = 0; i < N; ++i) {
         if (graph_->isTombstone(static_cast<uint32_t>(i))) continue;
-        const float* v = raw_flat_.data() + i * static_cast<size_t>(D);
+        const uint16_t* h = raw_flat_.data() + i * static_cast<size_t>(D);
         float norm2 = 0.f;
-        for (int d = 0; d < D; ++d) norm2 += v[d] * v[d];
+        for (int d = 0; d < D; ++d) {
+            float f = NGT::NGTAQ::fp16_to_float(h[d]);
+            norm2 += f * f;
+        }
         if (norm2 < 1e-12f) {
             graph_->removeNode(static_cast<uint32_t>(i));
             ++n_fixed;
@@ -1436,7 +1444,9 @@ void NGTAQIndex::rebuildGraphSelf(int   k_search,
     // Warm up lazy cluster tables with a dummy query (triggers call_once).
     // This ensures subsequent parallel queries don't race on cluster_members_once_.
     if (!raw_flat_.empty()) {
-        std::vector<float> dummy(raw_flat_.data(), raw_flat_.data() + D);
+        std::vector<float> dummy(D);
+        const uint16_t* h = raw_flat_.data();
+        for (int d = 0; d < D; ++d) dummy[d] = NGT::NGTAQ::fp16_to_float(h[d]);
         searchV2(dummy, 1, gamma, gamma);
     }
 
@@ -1469,8 +1479,9 @@ void NGTAQIndex::rebuildGraphSelf(int   k_search,
 #endif
     for (size_t i = 0; i < N; ++i) {
         if (graph_->isTombstone(static_cast<uint32_t>(i))) continue;
-        std::vector<float> q(raw_flat_.data() + i * static_cast<size_t>(D),
-                             raw_flat_.data() + (i + 1) * static_cast<size_t>(D));
+        std::vector<float> q(D);
+        const uint16_t* h = raw_flat_.data() + i * static_cast<size_t>(D);
+        for (int d = 0; d < D; ++d) q[d] = NGT::NGTAQ::fp16_to_float(h[d]);
         // Search for k_search+1: self may appear in results; we'll skip it.
         auto results = searchV2(q, k_search + 1, gamma, gamma);
 
