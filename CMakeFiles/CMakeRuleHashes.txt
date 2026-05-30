@@ -1,0 +1,3 @@
+# Hashes of file build rules.
+75dba579f4c12c37488663d3b561c7f7 lib/NGT/CMakeFiles/versiondef
+7df0a7f19b2ac4da488415bf7f952d8e lib/NGT/command

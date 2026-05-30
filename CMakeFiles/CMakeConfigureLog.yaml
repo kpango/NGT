@@ -1,0 +1,1026 @@
+
+---
+events:
+  -
+    kind: "message-v1"
+    backtrace:
+      - "/usr/share/cmake-4.2/Modules/CMakeDetermineSystem.cmake:212 (message)"
+      - "CMakeLists.txt:3 (project)"
+    message: |
+      The system is: Linux - 7.0.9-zen1-1-zen - x86_64
+  -
+    kind: "find-v1"
+    backtrace:
+      - "/usr/share/cmake-4.2/Modules/CMakeDetermineCompilerId.cmake:462 (find_file)"
+      - "/usr/share/cmake-4.2/Modules/CMakeDetermineCompilerId.cmake:500 (CMAKE_DETERMINE_COMPILER_ID_WRITE)"
+      - "/usr/share/cmake-4.2/Modules/CMakeDetermineCompilerId.cmake:8 (CMAKE_DETERMINE_COMPILER_ID_BUILD)"
+      - "/usr/share/cmake-4.2/Modules/CMakeDetermineCompilerId.cmake:64 (__determine_compiler_id_test)"
+      - "/usr/share/cmake-4.2/Modules/CMakeDetermineCCompiler.cmake:122 (CMAKE_DETERMINE_COMPILER_ID)"
+      - "CMakeLists.txt:3 (project)"
+    mode: "file"
+    variable: "src_in"
+    description: "Path to a file."
+    settings:
+      SearchFramework: "NEVER"
+      SearchAppBundle: "NEVER"
+      CMAKE_FIND_USE_CMAKE_PATH: true
+      CMAKE_FIND_USE_CMAKE_ENVIRONMENT_PATH: true
+      CMAKE_FIND_USE_SYSTEM_ENVIRONMENT_PATH: true
+      CMAKE_FIND_USE_CMAKE_SYSTEM_PATH: true
+      CMAKE_FIND_USE_INSTALL_PREFIX: true
+    names:
+      - "CMakeCCompilerId.c.in"
+    candidate_directories:
+      - "/usr/share/cmake-4.2/Modules/"
+    found: "/usr/share/cmake-4.2/Modules/CMakeCCompilerId.c.in"
+    search_context:
+      ENV{PATH}:
+        - "/usr/local/bin"
+        - "/usr/local/sbin"
+        - "/usr/bin"
+        - "/usr/sbin"
+        - "/bin"
+        - "/sbin"
+        - "/usr/local/go/bin"
+        - "/usr/local/bun/bin"
+        - "/home/kpango/go/bin"
+        - "/home/kpango/.local/bin"
+        - "/home/kpango/.cargo/bin"
+        - "/home/kpango/.bun-shims"
+        - "/home/kpango/.claude/plugins/cache/claude-plugins-official/superpowers/5.1.0/bin"
+        - "/home/kpango/.claude/plugins/marketplaces/claude-plugins-official/external_plugins/github/bin"
+        - "/home/kpango/.claude/plugins/marketplaces/thedotmack/plugin/bin"
+      CMAKE_INSTALL_PREFIX: "/usr/local"
+  -
+    kind: "message-v1"
+    backtrace:
+      - "/usr/share/cmake-4.2/Modules/CMakeDetermineCompilerId.cmake:17 (message)"
+      - "/usr/share/cmake-4.2/Modules/CMakeDetermineCompilerId.cmake:64 (__determine_compiler_id_test)"
+      - "/usr/share/cmake-4.2/Modules/CMakeDetermineCCompiler.cmake:122 (CMAKE_DETERMINE_COMPILER_ID)"
+      - "CMakeLists.txt:3 (project)"
+    message: |
+      Compiling the C compiler identification source file "CMakeCCompilerId.c" succeeded.
+      Compiler: /usr/bin/clang 
+      Build flags: -I/include:-I/include:-I/usr/local/opt/openssl/include:
+      Id flags:  
+      
+      The output was:
+      0
+      
+      
+      Compilation of the C compiler identification source "CMakeCCompilerId.c" produced "a.out"
+      
+      The C compiler identification is Clang, found in:
+        /home/kpango/go/src/github.com/kpango/NGT/CMakeFiles/4.2.3/CompilerIdC/a.out
+      
+  -
+    kind: "find-v1"
+    backtrace:
+      - "/usr/share/cmake-4.2/Modules/CMakeDetermineCompilerId.cmake:462 (find_file)"
+      - "/usr/share/cmake-4.2/Modules/CMakeDetermineCompilerId.cmake:500 (CMAKE_DETERMINE_COMPILER_ID_WRITE)"
+      - "/usr/share/cmake-4.2/Modules/CMakeDetermineCompilerId.cmake:8 (CMAKE_DETERMINE_COMPILER_ID_BUILD)"
+      - "/usr/share/cmake-4.2/Modules/CMakeDetermineCompilerId.cmake:64 (__determine_compiler_id_test)"
+      - "/usr/share/cmake-4.2/Modules/CMakeDetermineCXXCompiler.cmake:125 (CMAKE_DETERMINE_COMPILER_ID)"
+      - "CMakeLists.txt:3 (project)"
+    mode: "file"
+    variable: "src_in"
+    description: "Path to a file."
+    settings:
+      SearchFramework: "NEVER"
+      SearchAppBundle: "NEVER"
+      CMAKE_FIND_USE_CMAKE_PATH: true
+      CMAKE_FIND_USE_CMAKE_ENVIRONMENT_PATH: true
+      CMAKE_FIND_USE_SYSTEM_ENVIRONMENT_PATH: true
+      CMAKE_FIND_USE_CMAKE_SYSTEM_PATH: true
+      CMAKE_FIND_USE_INSTALL_PREFIX: true
+    names:
+      - "CMakeCXXCompilerId.cpp.in"
+    candidate_directories:
+      - "/usr/share/cmake-4.2/Modules/"
+    found: "/usr/share/cmake-4.2/Modules/CMakeCXXCompilerId.cpp.in"
+    search_context:
+      ENV{PATH}:
+        - "/usr/local/bin"
+        - "/usr/local/sbin"
+        - "/usr/bin"
+        - "/usr/sbin"
+        - "/bin"
+        - "/sbin"
+        - "/usr/local/go/bin"
+        - "/usr/local/bun/bin"
+        - "/home/kpango/go/bin"
+        - "/home/kpango/.local/bin"
+        - "/home/kpango/.cargo/bin"
+        - "/home/kpango/.bun-shims"
+        - "/home/kpango/.claude/plugins/cache/claude-plugins-official/superpowers/5.1.0/bin"
+        - "/home/kpango/.claude/plugins/marketplaces/claude-plugins-official/external_plugins/github/bin"
+        - "/home/kpango/.claude/plugins/marketplaces/thedotmack/plugin/bin"
+      CMAKE_INSTALL_PREFIX: "/usr/local"
+  -
+    kind: "message-v1"
+    backtrace:
+      - "/usr/share/cmake-4.2/Modules/CMakeDetermineCompilerId.cmake:17 (message)"
+      - "/usr/share/cmake-4.2/Modules/CMakeDetermineCompilerId.cmake:64 (__determine_compiler_id_test)"
+      - "/usr/share/cmake-4.2/Modules/CMakeDetermineCXXCompiler.cmake:125 (CMAKE_DETERMINE_COMPILER_ID)"
+      - "CMakeLists.txt:3 (project)"
+    message: |
+      Compiling the CXX compiler identification source file "CMakeCXXCompilerId.cpp" succeeded.
+      Compiler: /usr/bin/clang++ 
+      Build flags: 
+      Id flags:  
+      
+      The output was:
+      0
+      
+      
+      Compilation of the CXX compiler identification source "CMakeCXXCompilerId.cpp" produced "a.out"
+      
+      The CXX compiler identification is Clang, found in:
+        /home/kpango/go/src/github.com/kpango/NGT/CMakeFiles/4.2.3/CompilerIdCXX/a.out
+      
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "/usr/share/cmake-4.2/Modules/CMakeDetermineCompilerABI.cmake:83 (try_compile)"
+      - "/usr/share/cmake-4.2/Modules/CMakeTestCCompiler.cmake:26 (CMAKE_DETERMINE_COMPILER_ABI)"
+      - "CMakeLists.txt:3 (project)"
+    checks:
+      - "Detecting C compiler ABI info"
+    directories:
+      source: "/home/kpango/go/src/github.com/kpango/NGT/CMakeFiles/CMakeScratch/TryCompile-cF3xCB"
+      binary: "/home/kpango/go/src/github.com/kpango/NGT/CMakeFiles/CMakeScratch/TryCompile-cF3xCB"
+    cmakeVariables:
+      CMAKE_CXX_COMPILER_CLANG_SCAN_DEPS: "/usr/bin/clang-scan-deps-21"
+      CMAKE_C_FLAGS: "-I/include:-I/include:-I/usr/local/opt/openssl/include:"
+      CMAKE_C_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: ""
+    buildResult:
+      variable: "CMAKE_C_ABI_COMPILED"
+      cached: true
+      stdout: |
+        Change Dir: '/home/kpango/go/src/github.com/kpango/NGT/CMakeFiles/CMakeScratch/TryCompile-cF3xCB'
+        
+        Run Build Command(s): /usr/bin/cmake -E env VERBOSE=1 /usr/bin/gmake -f Makefile cmTC_ea534/fast
+        /usr/bin/gmake  -f CMakeFiles/cmTC_ea534.dir/build.make CMakeFiles/cmTC_ea534.dir/build
+        gmake[1]: Entering directory '/home/kpango/go/src/github.com/kpango/NGT/CMakeFiles/CMakeScratch/TryCompile-cF3xCB'
+        Building C object CMakeFiles/cmTC_ea534.dir/CMakeCCompilerABI.c.o
+        /usr/bin/clang   -I/include:-I/include:-I/usr/local/opt/openssl/include:    -v -MD -MT CMakeFiles/cmTC_ea534.dir/CMakeCCompilerABI.c.o -MF CMakeFiles/cmTC_ea534.dir/CMakeCCompilerABI.c.o.d -o CMakeFiles/cmTC_ea534.dir/CMakeCCompilerABI.c.o -c /usr/share/cmake-4.2/Modules/CMakeCCompilerABI.c
+        Ubuntu clang version 21.1.8 (6ubuntu1)
+        Target: x86_64-pc-linux-gnu
+        Thread model: posix
+        InstalledDir: /usr/lib/llvm-21/bin
+        Found candidate GCC installation: /usr/lib/gcc/x86_64-linux-gnu/15
+        Selected GCC installation: /usr/lib/gcc/x86_64-linux-gnu/15
+        Candidate multilib: .;@m64
+        Selected multilib: .;@m64
+         (in-process)
+         "/usr/lib/llvm-21/bin/clang" -cc1 -triple x86_64-pc-linux-gnu -emit-obj -disable-free -clear-ast-before-backend -disable-llvm-verifier -discard-value-names -main-file-name CMakeCCompilerABI.c -mrelocation-model pic -pic-level 2 -pic-is-pie -mframe-pointer=all -fmath-errno -ffp-contract=on -fno-rounding-math -mconstructor-aliases -funwind-tables=2 -target-cpu x86-64 -tune-cpu generic -debugger-tuning=gdb -fdebug-compilation-dir=/home/kpango/go/src/github.com/kpango/NGT/CMakeFiles/CMakeScratch/TryCompile-cF3xCB -v -fcoverage-compilation-dir=/home/kpango/go/src/github.com/kpango/NGT/CMakeFiles/CMakeScratch/TryCompile-cF3xCB -resource-dir /usr/lib/llvm-21/lib/clang/21 -dependency-file CMakeFiles/cmTC_ea534.dir/CMakeCCompilerABI.c.o.d -MT CMakeFiles/cmTC_ea534.dir/CMakeCCompilerABI.c.o -sys-header-deps -I /include:-I/include:-I/usr/local/opt/openssl/include: -c-isystem /include -c-isystem /include -c-isystem . -cxx-isystem /include -cxx-isystem /include -cxx-isystem . -internal-isystem /usr/lib/llvm-21/lib/clang/21/include -internal-isystem /usr/local/include -internal-isystem /usr/lib/gcc/x86_64-linux-gnu/15/../../../../x86_64-linux-gnu/include -internal-externc-isystem /usr/include/x86_64-linux-gnu -internal-externc-isystem /include -internal-externc-isystem /usr/include -ferror-limit 19 -fgnuc-version=4.2.1 -fskip-odr-check-in-gmf -faddrsig -D__GCC_HAVE_DWARF2_CFI_ASM=1 -o CMakeFiles/cmTC_ea534.dir/CMakeCCompilerABI.c.o -x c /usr/share/cmake-4.2/Modules/CMakeCCompilerABI.c
+        clang -cc1 version 21.1.8 based upon LLVM 21.1.8 default target x86_64-pc-linux-gnu
+        ignoring nonexistent directory "/include:-I/include:-I/usr/local/opt/openssl/include:"
+        ignoring nonexistent directory "/include"
+        ignoring nonexistent directory "/include"
+        ignoring nonexistent directory "/include"
+        ignoring nonexistent directory "/include"
+        ignoring nonexistent directory "/usr/lib/gcc/x86_64-linux-gnu/15/../../../../x86_64-linux-gnu/include"
+        ignoring nonexistent directory "/include"
+        #include "..." search starts here:
+        #include <...> search starts here:
+         .
+         /usr/lib/llvm-21/lib/clang/21/include
+         /usr/local/include
+         /usr/include/x86_64-linux-gnu
+         /usr/include
+        End of search list.
+        Linking C executable cmTC_ea534
+        /usr/bin/cmake -E cmake_link_script CMakeFiles/cmTC_ea534.dir/link.txt --verbose=1
+        Ubuntu clang version 21.1.8 (6ubuntu1)
+        Target: x86_64-pc-linux-gnu
+        Thread model: posix
+        InstalledDir: /usr/lib/llvm-21/bin
+        Found candidate GCC installation: /usr/lib/gcc/x86_64-linux-gnu/15
+        Selected GCC installation: /usr/lib/gcc/x86_64-linux-gnu/15
+        Candidate multilib: .;@m64
+        Selected multilib: .;@m64
+         "/usr/bin/ld" -z relro --hash-style=gnu --build-id --eh-frame-hdr -m elf_x86_64 -pie -dynamic-linker /lib64/ld-linux-x86-64.so.2 -o cmTC_ea534 /lib/x86_64-linux-gnu/Scrt1.o /lib/x86_64-linux-gnu/crti.o /usr/lib/gcc/x86_64-linux-gnu/15/crtbeginS.o -L/usr/lib/gcc/x86_64-linux-gnu/15 -L/usr/lib/gcc/x86_64-linux-gnu/15/../../../../lib64 -L/lib/x86_64-linux-gnu -L/lib/../lib64 -L/usr/lib/x86_64-linux-gnu -L/usr/lib64 -L/lib -L/usr/lib -L/lib -L/usr/local/lib -L/usr/lib/google-cloud-sdk/lib -L/opt/containerd/lib -L/opt/cuda/lib -L/lib -L/usr/local/lib -L/usr/lib/google-cloud-sdk/lib -L/opt/containerd/lib -L/opt/cuda/lib -L/usr/lib -L/usr/local/lib -L/lib -L/lib64 -L/var/lib -L/google-cloud-sdk/lib -L/usr/local/go/lib -L/usr/lib/dart/lib -L/usr/lib/node_modules/lib -v CMakeFiles/cmTC_ea534.dir/CMakeCCompilerABI.c.o -lgcc --as-needed -lgcc_s --no-as-needed -lc -lgcc --as-needed -lgcc_s --no-as-needed /usr/lib/gcc/x86_64-linux-gnu/15/crtendS.o /lib/x86_64-linux-gnu/crtn.o
+        GNU ld (GNU Binutils for Ubuntu) 2.46
+        /usr/bin/clang -I/include:-I/include:-I/usr/local/opt/openssl/include:   -v -Wl,-v CMakeFiles/cmTC_ea534.dir/CMakeCCompilerABI.c.o -o cmTC_ea534
+        gmake[1]: Leaving directory '/home/kpango/go/src/github.com/kpango/NGT/CMakeFiles/CMakeScratch/TryCompile-cF3xCB'
+        
+      exitCode: 0
+  -
+    kind: "message-v1"
+    backtrace:
+      - "/usr/share/cmake-4.2/Modules/CMakeDetermineCompilerABI.cmake:217 (message)"
+      - "/usr/share/cmake-4.2/Modules/CMakeTestCCompiler.cmake:26 (CMAKE_DETERMINE_COMPILER_ABI)"
+      - "CMakeLists.txt:3 (project)"
+    message: |
+      Parsed C implicit include dir info: rv=done
+        found start of include info
+        found start of implicit include info
+          add: [.]
+          add: [/usr/lib/llvm-21/lib/clang/21/include]
+          add: [/usr/local/include]
+          add: [/usr/include/x86_64-linux-gnu]
+          add: [/usr/include]
+        end of search list found
+        skipping relative include dir [.]
+        collapse include dir [/usr/lib/llvm-21/lib/clang/21/include] ==> [/usr/lib/llvm-21/lib/clang/21/include]
+        collapse include dir [/usr/local/include] ==> [/usr/local/include]
+        collapse include dir [/usr/include/x86_64-linux-gnu] ==> [/usr/include/x86_64-linux-gnu]
+        collapse include dir [/usr/include] ==> [/usr/include]
+        implicit include dirs: [/usr/lib/llvm-21/lib/clang/21/include;/usr/local/include;/usr/include/x86_64-linux-gnu;/usr/include]
+      
+      
+  -
+    kind: "message-v1"
+    backtrace:
+      - "/usr/share/cmake-4.2/Modules/CMakeDetermineCompilerABI.cmake:253 (message)"
+      - "/usr/share/cmake-4.2/Modules/CMakeTestCCompiler.cmake:26 (CMAKE_DETERMINE_COMPILER_ABI)"
+      - "CMakeLists.txt:3 (project)"
+    message: |
+      Parsed C implicit link information:
+        link line regex: [^( *|.*[/\\])(ld[0-9]*(|\\.[a-rt-z][a-z]*|\\.s[a-np-z][a-z]*|\\.so[a-z]+)|CMAKE_LINK_STARTFILE-NOTFOUND|([^/\\]+-)?ld|collect2)[^/\\]*( |$)]
+        linker tool regex: [^[ 	]*(->|"|[0-9]+>[ 	-]*Build:[ 	0-9]+ ms[ 	]*)?[ 	]*(([^"]*[/\\])?(ld[0-9]*(|\\.[a-rt-z][a-z]*|\\.s[a-np-z][a-z]*|\\.so[a-z]+)))("|,| |$)]
+        ignore line: [Change Dir: '/home/kpango/go/src/github.com/kpango/NGT/CMakeFiles/CMakeScratch/TryCompile-cF3xCB']
+        ignore line: []
+        ignore line: [Run Build Command(s): /usr/bin/cmake -E env VERBOSE=1 /usr/bin/gmake -f Makefile cmTC_ea534/fast]
+        ignore line: [/usr/bin/gmake  -f CMakeFiles/cmTC_ea534.dir/build.make CMakeFiles/cmTC_ea534.dir/build]
+        ignore line: [gmake[1]: Entering directory '/home/kpango/go/src/github.com/kpango/NGT/CMakeFiles/CMakeScratch/TryCompile-cF3xCB']
+        ignore line: [Building C object CMakeFiles/cmTC_ea534.dir/CMakeCCompilerABI.c.o]
+        ignore line: [/usr/bin/clang   -I/include:-I/include:-I/usr/local/opt/openssl/include:    -v -MD -MT CMakeFiles/cmTC_ea534.dir/CMakeCCompilerABI.c.o -MF CMakeFiles/cmTC_ea534.dir/CMakeCCompilerABI.c.o.d -o CMakeFiles/cmTC_ea534.dir/CMakeCCompilerABI.c.o -c /usr/share/cmake-4.2/Modules/CMakeCCompilerABI.c]
+        ignore line: [Ubuntu clang version 21.1.8 (6ubuntu1)]
+        ignore line: [Target: x86_64-pc-linux-gnu]
+        ignore line: [Thread model: posix]
+        ignore line: [InstalledDir: /usr/lib/llvm-21/bin]
+        ignore line: [Found candidate GCC installation: /usr/lib/gcc/x86_64-linux-gnu/15]
+        ignore line: [Selected GCC installation: /usr/lib/gcc/x86_64-linux-gnu/15]
+        ignore line: [Candidate multilib: .]
+        ignore line: [@m64]
+        ignore line: [Selected multilib: .]
+        ignore line: [@m64]
+        ignore line: [ (in-process)]
+        ignore line: [ "/usr/lib/llvm-21/bin/clang" -cc1 -triple x86_64-pc-linux-gnu -emit-obj -disable-free -clear-ast-before-backend -disable-llvm-verifier -discard-value-names -main-file-name CMakeCCompilerABI.c -mrelocation-model pic -pic-level 2 -pic-is-pie -mframe-pointer=all -fmath-errno -ffp-contract=on -fno-rounding-math -mconstructor-aliases -funwind-tables=2 -target-cpu x86-64 -tune-cpu generic -debugger-tuning=gdb -fdebug-compilation-dir=/home/kpango/go/src/github.com/kpango/NGT/CMakeFiles/CMakeScratch/TryCompile-cF3xCB -v -fcoverage-compilation-dir=/home/kpango/go/src/github.com/kpango/NGT/CMakeFiles/CMakeScratch/TryCompile-cF3xCB -resource-dir /usr/lib/llvm-21/lib/clang/21 -dependency-file CMakeFiles/cmTC_ea534.dir/CMakeCCompilerABI.c.o.d -MT CMakeFiles/cmTC_ea534.dir/CMakeCCompilerABI.c.o -sys-header-deps -I /include:-I/include:-I/usr/local/opt/openssl/include: -c-isystem /include -c-isystem /include -c-isystem . -cxx-isystem /include -cxx-isystem /include -cxx-isystem . -internal-isystem /usr/lib/llvm-21/lib/clang/21/include -internal-isystem /usr/local/include -internal-isystem /usr/lib/gcc/x86_64-linux-gnu/15/../../../../x86_64-linux-gnu/include -internal-externc-isystem /usr/include/x86_64-linux-gnu -internal-externc-isystem /include -internal-externc-isystem /usr/include -ferror-limit 19 -fgnuc-version=4.2.1 -fskip-odr-check-in-gmf -faddrsig -D__GCC_HAVE_DWARF2_CFI_ASM=1 -o CMakeFiles/cmTC_ea534.dir/CMakeCCompilerABI.c.o -x c /usr/share/cmake-4.2/Modules/CMakeCCompilerABI.c]
+        ignore line: [clang -cc1 version 21.1.8 based upon LLVM 21.1.8 default target x86_64-pc-linux-gnu]
+        ignore line: [ignoring nonexistent directory "/include:-I/include:-I/usr/local/opt/openssl/include:"]
+        ignore line: [ignoring nonexistent directory "/include"]
+        ignore line: [ignoring nonexistent directory "/include"]
+        ignore line: [ignoring nonexistent directory "/include"]
+        ignore line: [ignoring nonexistent directory "/include"]
+        ignore line: [ignoring nonexistent directory "/usr/lib/gcc/x86_64-linux-gnu/15/../../../../x86_64-linux-gnu/include"]
+        ignore line: [ignoring nonexistent directory "/include"]
+        ignore line: [#include "..." search starts here:]
+        ignore line: [#include <...> search starts here:]
+        ignore line: [ .]
+        ignore line: [ /usr/lib/llvm-21/lib/clang/21/include]
+        ignore line: [ /usr/local/include]
+        ignore line: [ /usr/include/x86_64-linux-gnu]
+        ignore line: [ /usr/include]
+        ignore line: [End of search list.]
+        ignore line: [Linking C executable cmTC_ea534]
+        ignore line: [/usr/bin/cmake -E cmake_link_script CMakeFiles/cmTC_ea534.dir/link.txt --verbose=1]
+        ignore line: [Ubuntu clang version 21.1.8 (6ubuntu1)]
+        ignore line: [Target: x86_64-pc-linux-gnu]
+        ignore line: [Thread model: posix]
+        ignore line: [InstalledDir: /usr/lib/llvm-21/bin]
+        ignore line: [Found candidate GCC installation: /usr/lib/gcc/x86_64-linux-gnu/15]
+        ignore line: [Selected GCC installation: /usr/lib/gcc/x86_64-linux-gnu/15]
+        ignore line: [Candidate multilib: .]
+        ignore line: [@m64]
+        ignore line: [Selected multilib: .]
+        ignore line: [@m64]
+        link line: [ "/usr/bin/ld" -z relro --hash-style=gnu --build-id --eh-frame-hdr -m elf_x86_64 -pie -dynamic-linker /lib64/ld-linux-x86-64.so.2 -o cmTC_ea534 /lib/x86_64-linux-gnu/Scrt1.o /lib/x86_64-linux-gnu/crti.o /usr/lib/gcc/x86_64-linux-gnu/15/crtbeginS.o -L/usr/lib/gcc/x86_64-linux-gnu/15 -L/usr/lib/gcc/x86_64-linux-gnu/15/../../../../lib64 -L/lib/x86_64-linux-gnu -L/lib/../lib64 -L/usr/lib/x86_64-linux-gnu -L/usr/lib64 -L/lib -L/usr/lib -L/lib -L/usr/local/lib -L/usr/lib/google-cloud-sdk/lib -L/opt/containerd/lib -L/opt/cuda/lib -L/lib -L/usr/local/lib -L/usr/lib/google-cloud-sdk/lib -L/opt/containerd/lib -L/opt/cuda/lib -L/usr/lib -L/usr/local/lib -L/lib -L/lib64 -L/var/lib -L/google-cloud-sdk/lib -L/usr/local/go/lib -L/usr/lib/dart/lib -L/usr/lib/node_modules/lib -v CMakeFiles/cmTC_ea534.dir/CMakeCCompilerABI.c.o -lgcc --as-needed -lgcc_s --no-as-needed -lc -lgcc --as-needed -lgcc_s --no-as-needed /usr/lib/gcc/x86_64-linux-gnu/15/crtendS.o /lib/x86_64-linux-gnu/crtn.o]
+          arg [/usr/bin/ld] ==> ignore
+          arg [-zrelro] ==> ignore
+          arg [--hash-style=gnu] ==> ignore
+          arg [--build-id] ==> ignore
+          arg [--eh-frame-hdr] ==> ignore
+          arg [-m] ==> ignore
+          arg [elf_x86_64] ==> ignore
+          arg [-pie] ==> ignore
+          arg [-dynamic-linker] ==> ignore
+          arg [/lib64/ld-linux-x86-64.so.2] ==> ignore
+          arg [-o] ==> ignore
+          arg [cmTC_ea534] ==> ignore
+          arg [/lib/x86_64-linux-gnu/Scrt1.o] ==> obj [/lib/x86_64-linux-gnu/Scrt1.o]
+          arg [/lib/x86_64-linux-gnu/crti.o] ==> obj [/lib/x86_64-linux-gnu/crti.o]
+          arg [/usr/lib/gcc/x86_64-linux-gnu/15/crtbeginS.o] ==> obj [/usr/lib/gcc/x86_64-linux-gnu/15/crtbeginS.o]
+          arg [-L/usr/lib/gcc/x86_64-linux-gnu/15] ==> dir [/usr/lib/gcc/x86_64-linux-gnu/15]
+          arg [-L/usr/lib/gcc/x86_64-linux-gnu/15/../../../../lib64] ==> dir [/usr/lib/gcc/x86_64-linux-gnu/15/../../../../lib64]
+          arg [-L/lib/x86_64-linux-gnu] ==> dir [/lib/x86_64-linux-gnu]
+          arg [-L/lib/../lib64] ==> dir [/lib/../lib64]
+          arg [-L/usr/lib/x86_64-linux-gnu] ==> dir [/usr/lib/x86_64-linux-gnu]
+          arg [-L/usr/lib64] ==> dir [/usr/lib64]
+          arg [-L/lib] ==> dir [/lib]
+          arg [-L/usr/lib] ==> dir [/usr/lib]
+          arg [-L/lib] ==> dir [/lib]
+          arg [-L/usr/local/lib] ==> dir [/usr/local/lib]
+          arg [-L/usr/lib/google-cloud-sdk/lib] ==> dir [/usr/lib/google-cloud-sdk/lib]
+          arg [-L/opt/containerd/lib] ==> dir [/opt/containerd/lib]
+          arg [-L/opt/cuda/lib] ==> dir [/opt/cuda/lib]
+          arg [-L/lib] ==> dir [/lib]
+          arg [-L/usr/local/lib] ==> dir [/usr/local/lib]
+          arg [-L/usr/lib/google-cloud-sdk/lib] ==> dir [/usr/lib/google-cloud-sdk/lib]
+          arg [-L/opt/containerd/lib] ==> dir [/opt/containerd/lib]
+          arg [-L/opt/cuda/lib] ==> dir [/opt/cuda/lib]
+          arg [-L/usr/lib] ==> dir [/usr/lib]
+          arg [-L/usr/local/lib] ==> dir [/usr/local/lib]
+          arg [-L/lib] ==> dir [/lib]
+          arg [-L/lib64] ==> dir [/lib64]
+          arg [-L/var/lib] ==> dir [/var/lib]
+          arg [-L/google-cloud-sdk/lib] ==> dir [/google-cloud-sdk/lib]
+          arg [-L/usr/local/go/lib] ==> dir [/usr/local/go/lib]
+          arg [-L/usr/lib/dart/lib] ==> dir [/usr/lib/dart/lib]
+          arg [-L/usr/lib/node_modules/lib] ==> dir [/usr/lib/node_modules/lib]
+          arg [-v] ==> ignore
+          arg [CMakeFiles/cmTC_ea534.dir/CMakeCCompilerABI.c.o] ==> ignore
+          arg [-lgcc] ==> lib [gcc]
+          arg [--as-needed] ==> ignore
+          arg [-lgcc_s] ==> lib [gcc_s]
+          arg [--no-as-needed] ==> ignore
+          arg [-lc] ==> lib [c]
+          arg [-lgcc] ==> lib [gcc]
+          arg [--as-needed] ==> ignore
+          arg [-lgcc_s] ==> lib [gcc_s]
+          arg [--no-as-needed] ==> ignore
+          arg [/usr/lib/gcc/x86_64-linux-gnu/15/crtendS.o] ==> obj [/usr/lib/gcc/x86_64-linux-gnu/15/crtendS.o]
+          arg [/lib/x86_64-linux-gnu/crtn.o] ==> obj [/lib/x86_64-linux-gnu/crtn.o]
+        linker tool for 'C': /usr/bin/ld
+        collapse library dir [/usr/lib/gcc/x86_64-linux-gnu/15] ==> [/usr/lib/gcc/x86_64-linux-gnu/15]
+        collapse library dir [/usr/lib/gcc/x86_64-linux-gnu/15/../../../../lib64] ==> [/usr/lib64]
+        collapse library dir [/lib/x86_64-linux-gnu] ==> [/lib/x86_64-linux-gnu]
+        collapse library dir [/lib/../lib64] ==> [/lib64]
+        collapse library dir [/usr/lib/x86_64-linux-gnu] ==> [/usr/lib/x86_64-linux-gnu]
+        collapse library dir [/usr/lib64] ==> [/usr/lib64]
+        collapse library dir [/lib] ==> [/lib]
+        collapse library dir [/usr/lib] ==> [/usr/lib]
+        collapse library dir [/lib] ==> [/lib]
+        collapse library dir [/usr/local/lib] ==> [/usr/local/lib]
+        collapse library dir [/usr/lib/google-cloud-sdk/lib] ==> [/usr/lib/google-cloud-sdk/lib]
+        collapse library dir [/opt/containerd/lib] ==> [/opt/containerd/lib]
+        collapse library dir [/opt/cuda/lib] ==> [/opt/cuda/lib]
+        collapse library dir [/lib] ==> [/lib]
+        collapse library dir [/usr/local/lib] ==> [/usr/local/lib]
+        collapse library dir [/usr/lib/google-cloud-sdk/lib] ==> [/usr/lib/google-cloud-sdk/lib]
+        collapse library dir [/opt/containerd/lib] ==> [/opt/containerd/lib]
+        collapse library dir [/opt/cuda/lib] ==> [/opt/cuda/lib]
+        collapse library dir [/usr/lib] ==> [/usr/lib]
+        collapse library dir [/usr/local/lib] ==> [/usr/local/lib]
+        collapse library dir [/lib] ==> [/lib]
+        collapse library dir [/lib64] ==> [/lib64]
+        collapse library dir [/var/lib] ==> [/var/lib]
+        collapse library dir [/google-cloud-sdk/lib] ==> [/google-cloud-sdk/lib]
+        collapse library dir [/usr/local/go/lib] ==> [/usr/local/go/lib]
+        collapse library dir [/usr/lib/dart/lib] ==> [/usr/lib/dart/lib]
+        collapse library dir [/usr/lib/node_modules/lib] ==> [/usr/lib/node_modules/lib]
+        implicit libs: [gcc;gcc_s;c;gcc;gcc_s]
+        implicit objs: [/lib/x86_64-linux-gnu/Scrt1.o;/lib/x86_64-linux-gnu/crti.o;/usr/lib/gcc/x86_64-linux-gnu/15/crtbeginS.o;/usr/lib/gcc/x86_64-linux-gnu/15/crtendS.o;/lib/x86_64-linux-gnu/crtn.o]
+        implicit dirs: [/usr/lib/gcc/x86_64-linux-gnu/15;/usr/lib64;/lib/x86_64-linux-gnu;/lib64;/usr/lib/x86_64-linux-gnu;/lib;/usr/lib;/usr/local/lib;/usr/lib/google-cloud-sdk/lib;/opt/containerd/lib;/opt/cuda/lib;/var/lib;/google-cloud-sdk/lib;/usr/local/go/lib;/usr/lib/dart/lib;/usr/lib/node_modules/lib]
+        implicit fwks: []
+      
+      
+  -
+    kind: "message-v1"
+    backtrace:
+      - "/usr/share/cmake-4.2/Modules/Internal/CMakeDetermineLinkerId.cmake:38 (message)"
+      - "/usr/share/cmake-4.2/Modules/CMakeDetermineCompilerABI.cmake:299 (cmake_determine_linker_id)"
+      - "/usr/share/cmake-4.2/Modules/CMakeTestCCompiler.cmake:26 (CMAKE_DETERMINE_COMPILER_ABI)"
+      - "CMakeLists.txt:3 (project)"
+    message: |
+      Running the C compiler's linker: "/usr/bin/ld" "-v"
+      GNU ld (GNU Binutils for Ubuntu) 2.46
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "/usr/share/cmake-4.2/Modules/CMakeDetermineCompilerABI.cmake:83 (try_compile)"
+      - "/usr/share/cmake-4.2/Modules/CMakeTestCXXCompiler.cmake:26 (CMAKE_DETERMINE_COMPILER_ABI)"
+      - "CMakeLists.txt:3 (project)"
+    checks:
+      - "Detecting CXX compiler ABI info"
+    directories:
+      source: "/home/kpango/go/src/github.com/kpango/NGT/CMakeFiles/CMakeScratch/TryCompile-27Ajpo"
+      binary: "/home/kpango/go/src/github.com/kpango/NGT/CMakeFiles/CMakeScratch/TryCompile-27Ajpo"
+    cmakeVariables:
+      CMAKE_CXX_COMPILER_CLANG_SCAN_DEPS: "/usr/bin/clang-scan-deps-21"
+      CMAKE_CXX_FLAGS: ""
+      CMAKE_CXX_FLAGS_DEBUG: "-g"
+      CMAKE_CXX_SCAN_FOR_MODULES: "OFF"
+      CMAKE_EXE_LINKER_FLAGS: ""
+    buildResult:
+      variable: "CMAKE_CXX_ABI_COMPILED"
+      cached: true
+      stdout: |
+        Change Dir: '/home/kpango/go/src/github.com/kpango/NGT/CMakeFiles/CMakeScratch/TryCompile-27Ajpo'
+        
+        Run Build Command(s): /usr/bin/cmake -E env VERBOSE=1 /usr/bin/gmake -f Makefile cmTC_53e64/fast
+        /usr/bin/gmake  -f CMakeFiles/cmTC_53e64.dir/build.make CMakeFiles/cmTC_53e64.dir/build
+        gmake[1]: Entering directory '/home/kpango/go/src/github.com/kpango/NGT/CMakeFiles/CMakeScratch/TryCompile-27Ajpo'
+        Building CXX object CMakeFiles/cmTC_53e64.dir/CMakeCXXCompilerABI.cpp.o
+        /usr/bin/clang++   -v -MD -MT CMakeFiles/cmTC_53e64.dir/CMakeCXXCompilerABI.cpp.o -MF CMakeFiles/cmTC_53e64.dir/CMakeCXXCompilerABI.cpp.o.d -o CMakeFiles/cmTC_53e64.dir/CMakeCXXCompilerABI.cpp.o -c /usr/share/cmake-4.2/Modules/CMakeCXXCompilerABI.cpp
+        Ubuntu clang version 21.1.8 (6ubuntu1)
+        Target: x86_64-pc-linux-gnu
+        Thread model: posix
+        InstalledDir: /usr/lib/llvm-21/bin
+        Found candidate GCC installation: /usr/lib/gcc/x86_64-linux-gnu/15
+        Selected GCC installation: /usr/lib/gcc/x86_64-linux-gnu/15
+        Candidate multilib: .;@m64
+        Selected multilib: .;@m64
+         (in-process)
+         "/usr/lib/llvm-21/bin/clang" -cc1 -triple x86_64-pc-linux-gnu -emit-obj -disable-free -clear-ast-before-backend -disable-llvm-verifier -discard-value-names -main-file-name CMakeCXXCompilerABI.cpp -mrelocation-model pic -pic-level 2 -pic-is-pie -mframe-pointer=all -fmath-errno -ffp-contract=on -fno-rounding-math -mconstructor-aliases -funwind-tables=2 -target-cpu x86-64 -tune-cpu generic -debugger-tuning=gdb -fdebug-compilation-dir=/home/kpango/go/src/github.com/kpango/NGT/CMakeFiles/CMakeScratch/TryCompile-27Ajpo -v -fcoverage-compilation-dir=/home/kpango/go/src/github.com/kpango/NGT/CMakeFiles/CMakeScratch/TryCompile-27Ajpo -resource-dir /usr/lib/llvm-21/lib/clang/21 -dependency-file CMakeFiles/cmTC_53e64.dir/CMakeCXXCompilerABI.cpp.o.d -MT CMakeFiles/cmTC_53e64.dir/CMakeCXXCompilerABI.cpp.o -sys-header-deps -c-isystem /include -c-isystem /include -c-isystem . -cxx-isystem /include -cxx-isystem /include -cxx-isystem . -internal-isystem /usr/lib/gcc/x86_64-linux-gnu/15/../../../../include/c++/15 -internal-isystem /usr/lib/gcc/x86_64-linux-gnu/15/../../../../include/x86_64-linux-gnu/c++/15 -internal-isystem /usr/lib/gcc/x86_64-linux-gnu/15/../../../../include/c++/15/backward -internal-isystem /usr/lib/llvm-21/lib/clang/21/include -internal-isystem /usr/local/include -internal-isystem /usr/lib/gcc/x86_64-linux-gnu/15/../../../../x86_64-linux-gnu/include -internal-externc-isystem /usr/include/x86_64-linux-gnu -internal-externc-isystem /include -internal-externc-isystem /usr/include -fdeprecated-macro -ferror-limit 19 -fgnuc-version=4.2.1 -fskip-odr-check-in-gmf -fcxx-exceptions -fexceptions -faddrsig -D__GCC_HAVE_DWARF2_CFI_ASM=1 -o CMakeFiles/cmTC_53e64.dir/CMakeCXXCompilerABI.cpp.o -x c++ /usr/share/cmake-4.2/Modules/CMakeCXXCompilerABI.cpp
+        clang -cc1 version 21.1.8 based upon LLVM 21.1.8 default target x86_64-pc-linux-gnu
+        ignoring nonexistent directory "/include"
+        ignoring nonexistent directory "/include"
+        ignoring nonexistent directory "/include"
+        ignoring nonexistent directory "/include"
+        ignoring nonexistent directory "/usr/lib/gcc/x86_64-linux-gnu/15/../../../../x86_64-linux-gnu/include"
+        ignoring nonexistent directory "/include"
+        #include "..." search starts here:
+        #include <...> search starts here:
+         .
+         /usr/lib/gcc/x86_64-linux-gnu/15/../../../../include/c++/15
+         /usr/lib/gcc/x86_64-linux-gnu/15/../../../../include/x86_64-linux-gnu/c++/15
+         /usr/lib/gcc/x86_64-linux-gnu/15/../../../../include/c++/15/backward
+         /usr/lib/llvm-21/lib/clang/21/include
+         /usr/local/include
+         /usr/include/x86_64-linux-gnu
+         /usr/include
+        End of search list.
+        Linking CXX executable cmTC_53e64
+        /usr/bin/cmake -E cmake_link_script CMakeFiles/cmTC_53e64.dir/link.txt --verbose=1
+        Ubuntu clang version 21.1.8 (6ubuntu1)
+        Target: x86_64-pc-linux-gnu
+        Thread model: posix
+        InstalledDir: /usr/lib/llvm-21/bin
+        Found candidate GCC installation: /usr/lib/gcc/x86_64-linux-gnu/15
+        Selected GCC installation: /usr/lib/gcc/x86_64-linux-gnu/15
+        Candidate multilib: .;@m64
+        Selected multilib: .;@m64
+         "/usr/bin/ld" -z relro --hash-style=gnu --build-id --eh-frame-hdr -m elf_x86_64 -pie -dynamic-linker /lib64/ld-linux-x86-64.so.2 -o cmTC_53e64 /lib/x86_64-linux-gnu/Scrt1.o /lib/x86_64-linux-gnu/crti.o /usr/lib/gcc/x86_64-linux-gnu/15/crtbeginS.o -L/usr/lib/gcc/x86_64-linux-gnu/15 -L/usr/lib/gcc/x86_64-linux-gnu/15/../../../../lib64 -L/lib/x86_64-linux-gnu -L/lib/../lib64 -L/usr/lib/x86_64-linux-gnu -L/usr/lib64 -L/lib -L/usr/lib -L/lib -L/usr/local/lib -L/usr/lib/google-cloud-sdk/lib -L/opt/containerd/lib -L/opt/cuda/lib -L/lib -L/usr/local/lib -L/usr/lib/google-cloud-sdk/lib -L/opt/containerd/lib -L/opt/cuda/lib -L/usr/lib -L/usr/local/lib -L/lib -L/lib64 -L/var/lib -L/google-cloud-sdk/lib -L/usr/local/go/lib -L/usr/lib/dart/lib -L/usr/lib/node_modules/lib -v CMakeFiles/cmTC_53e64.dir/CMakeCXXCompilerABI.cpp.o -lstdc++ -lm -lgcc_s -lgcc -lc -lgcc_s -lgcc /usr/lib/gcc/x86_64-linux-gnu/15/crtendS.o /lib/x86_64-linux-gnu/crtn.o
+        GNU ld (GNU Binutils for Ubuntu) 2.46
+        /usr/bin/clang++  -v -Wl,-v CMakeFiles/cmTC_53e64.dir/CMakeCXXCompilerABI.cpp.o -o cmTC_53e64
+        gmake[1]: Leaving directory '/home/kpango/go/src/github.com/kpango/NGT/CMakeFiles/CMakeScratch/TryCompile-27Ajpo'
+        
+      exitCode: 0
+  -
+    kind: "message-v1"
+    backtrace:
+      - "/usr/share/cmake-4.2/Modules/CMakeDetermineCompilerABI.cmake:217 (message)"
+      - "/usr/share/cmake-4.2/Modules/CMakeTestCXXCompiler.cmake:26 (CMAKE_DETERMINE_COMPILER_ABI)"
+      - "CMakeLists.txt:3 (project)"
+    message: |
+      Parsed CXX implicit include dir info: rv=done
+        found start of include info
+        found start of implicit include info
+          add: [.]
+          add: [/usr/lib/gcc/x86_64-linux-gnu/15/../../../../include/c++/15]
+          add: [/usr/lib/gcc/x86_64-linux-gnu/15/../../../../include/x86_64-linux-gnu/c++/15]
+          add: [/usr/lib/gcc/x86_64-linux-gnu/15/../../../../include/c++/15/backward]
+          add: [/usr/lib/llvm-21/lib/clang/21/include]
+          add: [/usr/local/include]
+          add: [/usr/include/x86_64-linux-gnu]
+          add: [/usr/include]
+        end of search list found
+        skipping relative include dir [.]
+        collapse include dir [/usr/lib/gcc/x86_64-linux-gnu/15/../../../../include/c++/15] ==> [/usr/include/c++/15]
+        collapse include dir [/usr/lib/gcc/x86_64-linux-gnu/15/../../../../include/x86_64-linux-gnu/c++/15] ==> [/usr/include/x86_64-linux-gnu/c++/15]
+        collapse include dir [/usr/lib/gcc/x86_64-linux-gnu/15/../../../../include/c++/15/backward] ==> [/usr/include/c++/15/backward]
+        collapse include dir [/usr/lib/llvm-21/lib/clang/21/include] ==> [/usr/lib/llvm-21/lib/clang/21/include]
+        collapse include dir [/usr/local/include] ==> [/usr/local/include]
+        collapse include dir [/usr/include/x86_64-linux-gnu] ==> [/usr/include/x86_64-linux-gnu]
+        collapse include dir [/usr/include] ==> [/usr/include]
+        implicit include dirs: [/usr/include/c++/15;/usr/include/x86_64-linux-gnu/c++/15;/usr/include/c++/15/backward;/usr/lib/llvm-21/lib/clang/21/include;/usr/local/include;/usr/include/x86_64-linux-gnu;/usr/include]
+      
+      
+  -
+    kind: "message-v1"
+    backtrace:
+      - "/usr/share/cmake-4.2/Modules/CMakeDetermineCompilerABI.cmake:253 (message)"
+      - "/usr/share/cmake-4.2/Modules/CMakeTestCXXCompiler.cmake:26 (CMAKE_DETERMINE_COMPILER_ABI)"
+      - "CMakeLists.txt:3 (project)"
+    message: |
+      Parsed CXX implicit link information:
+        link line regex: [^( *|.*[/\\])(ld[0-9]*(|\\.[a-rt-z][a-z]*|\\.s[a-np-z][a-z]*|\\.so[a-z]+)|CMAKE_LINK_STARTFILE-NOTFOUND|([^/\\]+-)?ld|collect2)[^/\\]*( |$)]
+        linker tool regex: [^[ 	]*(->|"|[0-9]+>[ 	-]*Build:[ 	0-9]+ ms[ 	]*)?[ 	]*(([^"]*[/\\])?(ld[0-9]*(|\\.[a-rt-z][a-z]*|\\.s[a-np-z][a-z]*|\\.so[a-z]+)))("|,| |$)]
+        ignore line: [Change Dir: '/home/kpango/go/src/github.com/kpango/NGT/CMakeFiles/CMakeScratch/TryCompile-27Ajpo']
+        ignore line: []
+        ignore line: [Run Build Command(s): /usr/bin/cmake -E env VERBOSE=1 /usr/bin/gmake -f Makefile cmTC_53e64/fast]
+        ignore line: [/usr/bin/gmake  -f CMakeFiles/cmTC_53e64.dir/build.make CMakeFiles/cmTC_53e64.dir/build]
+        ignore line: [gmake[1]: Entering directory '/home/kpango/go/src/github.com/kpango/NGT/CMakeFiles/CMakeScratch/TryCompile-27Ajpo']
+        ignore line: [Building CXX object CMakeFiles/cmTC_53e64.dir/CMakeCXXCompilerABI.cpp.o]
+        ignore line: [/usr/bin/clang++   -v -MD -MT CMakeFiles/cmTC_53e64.dir/CMakeCXXCompilerABI.cpp.o -MF CMakeFiles/cmTC_53e64.dir/CMakeCXXCompilerABI.cpp.o.d -o CMakeFiles/cmTC_53e64.dir/CMakeCXXCompilerABI.cpp.o -c /usr/share/cmake-4.2/Modules/CMakeCXXCompilerABI.cpp]
+        ignore line: [Ubuntu clang version 21.1.8 (6ubuntu1)]
+        ignore line: [Target: x86_64-pc-linux-gnu]
+        ignore line: [Thread model: posix]
+        ignore line: [InstalledDir: /usr/lib/llvm-21/bin]
+        ignore line: [Found candidate GCC installation: /usr/lib/gcc/x86_64-linux-gnu/15]
+        ignore line: [Selected GCC installation: /usr/lib/gcc/x86_64-linux-gnu/15]
+        ignore line: [Candidate multilib: .]
+        ignore line: [@m64]
+        ignore line: [Selected multilib: .]
+        ignore line: [@m64]
+        ignore line: [ (in-process)]
+        ignore line: [ "/usr/lib/llvm-21/bin/clang" -cc1 -triple x86_64-pc-linux-gnu -emit-obj -disable-free -clear-ast-before-backend -disable-llvm-verifier -discard-value-names -main-file-name CMakeCXXCompilerABI.cpp -mrelocation-model pic -pic-level 2 -pic-is-pie -mframe-pointer=all -fmath-errno -ffp-contract=on -fno-rounding-math -mconstructor-aliases -funwind-tables=2 -target-cpu x86-64 -tune-cpu generic -debugger-tuning=gdb -fdebug-compilation-dir=/home/kpango/go/src/github.com/kpango/NGT/CMakeFiles/CMakeScratch/TryCompile-27Ajpo -v -fcoverage-compilation-dir=/home/kpango/go/src/github.com/kpango/NGT/CMakeFiles/CMakeScratch/TryCompile-27Ajpo -resource-dir /usr/lib/llvm-21/lib/clang/21 -dependency-file CMakeFiles/cmTC_53e64.dir/CMakeCXXCompilerABI.cpp.o.d -MT CMakeFiles/cmTC_53e64.dir/CMakeCXXCompilerABI.cpp.o -sys-header-deps -c-isystem /include -c-isystem /include -c-isystem . -cxx-isystem /include -cxx-isystem /include -cxx-isystem . -internal-isystem /usr/lib/gcc/x86_64-linux-gnu/15/../../../../include/c++/15 -internal-isystem /usr/lib/gcc/x86_64-linux-gnu/15/../../../../include/x86_64-linux-gnu/c++/15 -internal-isystem /usr/lib/gcc/x86_64-linux-gnu/15/../../../../include/c++/15/backward -internal-isystem /usr/lib/llvm-21/lib/clang/21/include -internal-isystem /usr/local/include -internal-isystem /usr/lib/gcc/x86_64-linux-gnu/15/../../../../x86_64-linux-gnu/include -internal-externc-isystem /usr/include/x86_64-linux-gnu -internal-externc-isystem /include -internal-externc-isystem /usr/include -fdeprecated-macro -ferror-limit 19 -fgnuc-version=4.2.1 -fskip-odr-check-in-gmf -fcxx-exceptions -fexceptions -faddrsig -D__GCC_HAVE_DWARF2_CFI_ASM=1 -o CMakeFiles/cmTC_53e64.dir/CMakeCXXCompilerABI.cpp.o -x c++ /usr/share/cmake-4.2/Modules/CMakeCXXCompilerABI.cpp]
+        ignore line: [clang -cc1 version 21.1.8 based upon LLVM 21.1.8 default target x86_64-pc-linux-gnu]
+        ignore line: [ignoring nonexistent directory "/include"]
+        ignore line: [ignoring nonexistent directory "/include"]
+        ignore line: [ignoring nonexistent directory "/include"]
+        ignore line: [ignoring nonexistent directory "/include"]
+        ignore line: [ignoring nonexistent directory "/usr/lib/gcc/x86_64-linux-gnu/15/../../../../x86_64-linux-gnu/include"]
+        ignore line: [ignoring nonexistent directory "/include"]
+        ignore line: [#include "..." search starts here:]
+        ignore line: [#include <...> search starts here:]
+        ignore line: [ .]
+        ignore line: [ /usr/lib/gcc/x86_64-linux-gnu/15/../../../../include/c++/15]
+        ignore line: [ /usr/lib/gcc/x86_64-linux-gnu/15/../../../../include/x86_64-linux-gnu/c++/15]
+        ignore line: [ /usr/lib/gcc/x86_64-linux-gnu/15/../../../../include/c++/15/backward]
+        ignore line: [ /usr/lib/llvm-21/lib/clang/21/include]
+        ignore line: [ /usr/local/include]
+        ignore line: [ /usr/include/x86_64-linux-gnu]
+        ignore line: [ /usr/include]
+        ignore line: [End of search list.]
+        ignore line: [Linking CXX executable cmTC_53e64]
+        ignore line: [/usr/bin/cmake -E cmake_link_script CMakeFiles/cmTC_53e64.dir/link.txt --verbose=1]
+        ignore line: [Ubuntu clang version 21.1.8 (6ubuntu1)]
+        ignore line: [Target: x86_64-pc-linux-gnu]
+        ignore line: [Thread model: posix]
+        ignore line: [InstalledDir: /usr/lib/llvm-21/bin]
+        ignore line: [Found candidate GCC installation: /usr/lib/gcc/x86_64-linux-gnu/15]
+        ignore line: [Selected GCC installation: /usr/lib/gcc/x86_64-linux-gnu/15]
+        ignore line: [Candidate multilib: .]
+        ignore line: [@m64]
+        ignore line: [Selected multilib: .]
+        ignore line: [@m64]
+        link line: [ "/usr/bin/ld" -z relro --hash-style=gnu --build-id --eh-frame-hdr -m elf_x86_64 -pie -dynamic-linker /lib64/ld-linux-x86-64.so.2 -o cmTC_53e64 /lib/x86_64-linux-gnu/Scrt1.o /lib/x86_64-linux-gnu/crti.o /usr/lib/gcc/x86_64-linux-gnu/15/crtbeginS.o -L/usr/lib/gcc/x86_64-linux-gnu/15 -L/usr/lib/gcc/x86_64-linux-gnu/15/../../../../lib64 -L/lib/x86_64-linux-gnu -L/lib/../lib64 -L/usr/lib/x86_64-linux-gnu -L/usr/lib64 -L/lib -L/usr/lib -L/lib -L/usr/local/lib -L/usr/lib/google-cloud-sdk/lib -L/opt/containerd/lib -L/opt/cuda/lib -L/lib -L/usr/local/lib -L/usr/lib/google-cloud-sdk/lib -L/opt/containerd/lib -L/opt/cuda/lib -L/usr/lib -L/usr/local/lib -L/lib -L/lib64 -L/var/lib -L/google-cloud-sdk/lib -L/usr/local/go/lib -L/usr/lib/dart/lib -L/usr/lib/node_modules/lib -v CMakeFiles/cmTC_53e64.dir/CMakeCXXCompilerABI.cpp.o -lstdc++ -lm -lgcc_s -lgcc -lc -lgcc_s -lgcc /usr/lib/gcc/x86_64-linux-gnu/15/crtendS.o /lib/x86_64-linux-gnu/crtn.o]
+          arg [/usr/bin/ld] ==> ignore
+          arg [-zrelro] ==> ignore
+          arg [--hash-style=gnu] ==> ignore
+          arg [--build-id] ==> ignore
+          arg [--eh-frame-hdr] ==> ignore
+          arg [-m] ==> ignore
+          arg [elf_x86_64] ==> ignore
+          arg [-pie] ==> ignore
+          arg [-dynamic-linker] ==> ignore
+          arg [/lib64/ld-linux-x86-64.so.2] ==> ignore
+          arg [-o] ==> ignore
+          arg [cmTC_53e64] ==> ignore
+          arg [/lib/x86_64-linux-gnu/Scrt1.o] ==> obj [/lib/x86_64-linux-gnu/Scrt1.o]
+          arg [/lib/x86_64-linux-gnu/crti.o] ==> obj [/lib/x86_64-linux-gnu/crti.o]
+          arg [/usr/lib/gcc/x86_64-linux-gnu/15/crtbeginS.o] ==> obj [/usr/lib/gcc/x86_64-linux-gnu/15/crtbeginS.o]
+          arg [-L/usr/lib/gcc/x86_64-linux-gnu/15] ==> dir [/usr/lib/gcc/x86_64-linux-gnu/15]
+          arg [-L/usr/lib/gcc/x86_64-linux-gnu/15/../../../../lib64] ==> dir [/usr/lib/gcc/x86_64-linux-gnu/15/../../../../lib64]
+          arg [-L/lib/x86_64-linux-gnu] ==> dir [/lib/x86_64-linux-gnu]
+          arg [-L/lib/../lib64] ==> dir [/lib/../lib64]
+          arg [-L/usr/lib/x86_64-linux-gnu] ==> dir [/usr/lib/x86_64-linux-gnu]
+          arg [-L/usr/lib64] ==> dir [/usr/lib64]
+          arg [-L/lib] ==> dir [/lib]
+          arg [-L/usr/lib] ==> dir [/usr/lib]
+          arg [-L/lib] ==> dir [/lib]
+          arg [-L/usr/local/lib] ==> dir [/usr/local/lib]
+          arg [-L/usr/lib/google-cloud-sdk/lib] ==> dir [/usr/lib/google-cloud-sdk/lib]
+          arg [-L/opt/containerd/lib] ==> dir [/opt/containerd/lib]
+          arg [-L/opt/cuda/lib] ==> dir [/opt/cuda/lib]
+          arg [-L/lib] ==> dir [/lib]
+          arg [-L/usr/local/lib] ==> dir [/usr/local/lib]
+          arg [-L/usr/lib/google-cloud-sdk/lib] ==> dir [/usr/lib/google-cloud-sdk/lib]
+          arg [-L/opt/containerd/lib] ==> dir [/opt/containerd/lib]
+          arg [-L/opt/cuda/lib] ==> dir [/opt/cuda/lib]
+          arg [-L/usr/lib] ==> dir [/usr/lib]
+          arg [-L/usr/local/lib] ==> dir [/usr/local/lib]
+          arg [-L/lib] ==> dir [/lib]
+          arg [-L/lib64] ==> dir [/lib64]
+          arg [-L/var/lib] ==> dir [/var/lib]
+          arg [-L/google-cloud-sdk/lib] ==> dir [/google-cloud-sdk/lib]
+          arg [-L/usr/local/go/lib] ==> dir [/usr/local/go/lib]
+          arg [-L/usr/lib/dart/lib] ==> dir [/usr/lib/dart/lib]
+          arg [-L/usr/lib/node_modules/lib] ==> dir [/usr/lib/node_modules/lib]
+          arg [-v] ==> ignore
+          arg [CMakeFiles/cmTC_53e64.dir/CMakeCXXCompilerABI.cpp.o] ==> ignore
+          arg [-lstdc++] ==> lib [stdc++]
+          arg [-lm] ==> lib [m]
+          arg [-lgcc_s] ==> lib [gcc_s]
+          arg [-lgcc] ==> lib [gcc]
+          arg [-lc] ==> lib [c]
+          arg [-lgcc_s] ==> lib [gcc_s]
+          arg [-lgcc] ==> lib [gcc]
+          arg [/usr/lib/gcc/x86_64-linux-gnu/15/crtendS.o] ==> obj [/usr/lib/gcc/x86_64-linux-gnu/15/crtendS.o]
+          arg [/lib/x86_64-linux-gnu/crtn.o] ==> obj [/lib/x86_64-linux-gnu/crtn.o]
+        linker tool for 'CXX': /usr/bin/ld
+        collapse library dir [/usr/lib/gcc/x86_64-linux-gnu/15] ==> [/usr/lib/gcc/x86_64-linux-gnu/15]
+        collapse library dir [/usr/lib/gcc/x86_64-linux-gnu/15/../../../../lib64] ==> [/usr/lib64]
+        collapse library dir [/lib/x86_64-linux-gnu] ==> [/lib/x86_64-linux-gnu]
+        collapse library dir [/lib/../lib64] ==> [/lib64]
+        collapse library dir [/usr/lib/x86_64-linux-gnu] ==> [/usr/lib/x86_64-linux-gnu]
+        collapse library dir [/usr/lib64] ==> [/usr/lib64]
+        collapse library dir [/lib] ==> [/lib]
+        collapse library dir [/usr/lib] ==> [/usr/lib]
+        collapse library dir [/lib] ==> [/lib]
+        collapse library dir [/usr/local/lib] ==> [/usr/local/lib]
+        collapse library dir [/usr/lib/google-cloud-sdk/lib] ==> [/usr/lib/google-cloud-sdk/lib]
+        collapse library dir [/opt/containerd/lib] ==> [/opt/containerd/lib]
+        collapse library dir [/opt/cuda/lib] ==> [/opt/cuda/lib]
+        collapse library dir [/lib] ==> [/lib]
+        collapse library dir [/usr/local/lib] ==> [/usr/local/lib]
+        collapse library dir [/usr/lib/google-cloud-sdk/lib] ==> [/usr/lib/google-cloud-sdk/lib]
+        collapse library dir [/opt/containerd/lib] ==> [/opt/containerd/lib]
+        collapse library dir [/opt/cuda/lib] ==> [/opt/cuda/lib]
+        collapse library dir [/usr/lib] ==> [/usr/lib]
+        collapse library dir [/usr/local/lib] ==> [/usr/local/lib]
+        collapse library dir [/lib] ==> [/lib]
+        collapse library dir [/lib64] ==> [/lib64]
+        collapse library dir [/var/lib] ==> [/var/lib]
+        collapse library dir [/google-cloud-sdk/lib] ==> [/google-cloud-sdk/lib]
+        collapse library dir [/usr/local/go/lib] ==> [/usr/local/go/lib]
+        collapse library dir [/usr/lib/dart/lib] ==> [/usr/lib/dart/lib]
+        collapse library dir [/usr/lib/node_modules/lib] ==> [/usr/lib/node_modules/lib]
+        implicit libs: [stdc++;m;gcc_s;gcc;c;gcc_s;gcc]
+        implicit objs: [/lib/x86_64-linux-gnu/Scrt1.o;/lib/x86_64-linux-gnu/crti.o;/usr/lib/gcc/x86_64-linux-gnu/15/crtbeginS.o;/usr/lib/gcc/x86_64-linux-gnu/15/crtendS.o;/lib/x86_64-linux-gnu/crtn.o]
+        implicit dirs: [/usr/lib/gcc/x86_64-linux-gnu/15;/usr/lib64;/lib/x86_64-linux-gnu;/lib64;/usr/lib/x86_64-linux-gnu;/lib;/usr/lib;/usr/local/lib;/usr/lib/google-cloud-sdk/lib;/opt/containerd/lib;/opt/cuda/lib;/var/lib;/google-cloud-sdk/lib;/usr/local/go/lib;/usr/lib/dart/lib;/usr/lib/node_modules/lib]
+        implicit fwks: []
+      
+      
+  -
+    kind: "message-v1"
+    backtrace:
+      - "/usr/share/cmake-4.2/Modules/Internal/CMakeDetermineLinkerId.cmake:38 (message)"
+      - "/usr/share/cmake-4.2/Modules/CMakeDetermineCompilerABI.cmake:299 (cmake_determine_linker_id)"
+      - "/usr/share/cmake-4.2/Modules/CMakeTestCXXCompiler.cmake:26 (CMAKE_DETERMINE_COMPILER_ABI)"
+      - "CMakeLists.txt:3 (project)"
+    message: |
+      Running the CXX compiler's linker: "/usr/bin/ld" "-v"
+      GNU ld (GNU Binutils for Ubuntu) 2.46
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "/usr/share/cmake-4.2/Modules/FindHDF5.cmake:409 (try_compile)"
+      - "/usr/share/cmake-4.2/Modules/FindHDF5.cmake:776 (_HDF5_test_regular_compiler_C)"
+      - "tests/ngtaq/CMakeLists.txt:46 (find_package)"
+    directories:
+      source: "/home/kpango/go/src/github.com/kpango/NGT/CMakeFiles/CMakeScratch/TryCompile-lUbIBo"
+      binary: "/home/kpango/go/src/github.com/kpango/NGT/CMakeFiles/CMakeScratch/TryCompile-lUbIBo"
+    cmakeVariables:
+      CMAKE_CXX_COMPILER_CLANG_SCAN_DEPS: "/usr/bin/clang-scan-deps-21"
+      CMAKE_C_FLAGS: "-I/include:-I/include:-I/usr/local/opt/openssl/include:"
+      CMAKE_C_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: ""
+    buildResult:
+      variable: "HDF5_C_COMPILER_NO_INTERROGATE"
+      cached: true
+      stdout: |
+        Change Dir: '/home/kpango/go/src/github.com/kpango/NGT/CMakeFiles/CMakeScratch/TryCompile-lUbIBo'
+        
+        Run Build Command(s): /usr/bin/cmake -E env VERBOSE=1 /usr/bin/gmake -f Makefile cmTC_87c55/fast
+        /usr/bin/gmake  -f CMakeFiles/cmTC_87c55.dir/build.make CMakeFiles/cmTC_87c55.dir/build
+        gmake[1]: Entering directory '/home/kpango/go/src/github.com/kpango/NGT/CMakeFiles/CMakeScratch/TryCompile-lUbIBo'
+        Building C object CMakeFiles/cmTC_87c55.dir/cmake_hdf5_test.c.o
+        /usr/bin/clang   -I/include:-I/include:-I/usr/local/opt/openssl/include:  -MD -MT CMakeFiles/cmTC_87c55.dir/cmake_hdf5_test.c.o -MF CMakeFiles/cmTC_87c55.dir/cmake_hdf5_test.c.o.d -o CMakeFiles/cmTC_87c55.dir/cmake_hdf5_test.c.o -c /home/kpango/go/src/github.com/kpango/NGT/tests/ngtaq/CMakeFiles/hdf5/cmake_hdf5_test.c
+        /home/kpango/go/src/github.com/kpango/NGT/tests/ngtaq/CMakeFiles/hdf5/cmake_hdf5_test.c:1:10: fatal error: 'hdf5.h' file not found
+            1 | #include <hdf5.h>
+              |          ^~~~~~~~
+        1 error generated.
+        gmake[1]: *** [CMakeFiles/cmTC_87c55.dir/build.make:82: CMakeFiles/cmTC_87c55.dir/cmake_hdf5_test.c.o] Error 1
+        gmake[1]: Leaving directory '/home/kpango/go/src/github.com/kpango/NGT/CMakeFiles/CMakeScratch/TryCompile-lUbIBo'
+        gmake: *** [Makefile:134: cmTC_87c55/fast] Error 2
+        
+      exitCode: 2
+...
+
+---
+events:
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "/usr/share/cmake-4.2/Modules/FindHDF5.cmake:409 (try_compile)"
+      - "/usr/share/cmake-4.2/Modules/FindHDF5.cmake:776 (_HDF5_test_regular_compiler_C)"
+      - "tests/ngtaq/CMakeLists.txt:46 (find_package)"
+    directories:
+      source: "/home/kpango/go/src/github.com/kpango/NGT/CMakeFiles/CMakeScratch/TryCompile-ps1cPZ"
+      binary: "/home/kpango/go/src/github.com/kpango/NGT/CMakeFiles/CMakeScratch/TryCompile-ps1cPZ"
+    cmakeVariables:
+      CMAKE_CXX_COMPILER_CLANG_SCAN_DEPS: "/usr/bin/clang-scan-deps-21"
+      CMAKE_C_FLAGS: "-I/include:-I/include:-I/usr/local/opt/openssl/include:"
+      CMAKE_C_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: ""
+    buildResult:
+      variable: "HDF5_C_COMPILER_NO_INTERROGATE"
+      cached: true
+      stdout: |
+        Change Dir: '/home/kpango/go/src/github.com/kpango/NGT/CMakeFiles/CMakeScratch/TryCompile-ps1cPZ'
+        
+        Run Build Command(s): /usr/bin/cmake -E env VERBOSE=1 /usr/bin/gmake -f Makefile cmTC_63a4a/fast
+        /usr/bin/gmake  -f CMakeFiles/cmTC_63a4a.dir/build.make CMakeFiles/cmTC_63a4a.dir/build
+        gmake[1]: Entering directory '/home/kpango/go/src/github.com/kpango/NGT/CMakeFiles/CMakeScratch/TryCompile-ps1cPZ'
+        Building C object CMakeFiles/cmTC_63a4a.dir/cmake_hdf5_test.c.o
+        /usr/bin/clang   -I/include:-I/include:-I/usr/local/opt/openssl/include:  -MD -MT CMakeFiles/cmTC_63a4a.dir/cmake_hdf5_test.c.o -MF CMakeFiles/cmTC_63a4a.dir/cmake_hdf5_test.c.o.d -o CMakeFiles/cmTC_63a4a.dir/cmake_hdf5_test.c.o -c /home/kpango/go/src/github.com/kpango/NGT/tests/ngtaq/CMakeFiles/hdf5/cmake_hdf5_test.c
+        /home/kpango/go/src/github.com/kpango/NGT/tests/ngtaq/CMakeFiles/hdf5/cmake_hdf5_test.c:1:10: fatal error: 'hdf5.h' file not found
+            1 | #include <hdf5.h>
+              |          ^~~~~~~~
+        1 error generated.
+        gmake[1]: *** [CMakeFiles/cmTC_63a4a.dir/build.make:82: CMakeFiles/cmTC_63a4a.dir/cmake_hdf5_test.c.o] Error 1
+        gmake[1]: Leaving directory '/home/kpango/go/src/github.com/kpango/NGT/CMakeFiles/CMakeScratch/TryCompile-ps1cPZ'
+        gmake: *** [Makefile:134: cmTC_63a4a/fast] Error 2
+        
+      exitCode: 2
+...
+
+---
+events:
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "/usr/share/cmake-4.2/Modules/FindHDF5.cmake:409 (try_compile)"
+      - "/usr/share/cmake-4.2/Modules/FindHDF5.cmake:776 (_HDF5_test_regular_compiler_C)"
+      - "tests/ngtaq/CMakeLists.txt:46 (find_package)"
+    directories:
+      source: "/home/kpango/go/src/github.com/kpango/NGT/CMakeFiles/CMakeScratch/TryCompile-U9RxlP"
+      binary: "/home/kpango/go/src/github.com/kpango/NGT/CMakeFiles/CMakeScratch/TryCompile-U9RxlP"
+    cmakeVariables:
+      CMAKE_CXX_COMPILER_CLANG_SCAN_DEPS: "/usr/bin/clang-scan-deps-21"
+      CMAKE_C_FLAGS: "-I/include:-I/include:-I/usr/local/opt/openssl/include:"
+      CMAKE_C_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: ""
+    buildResult:
+      variable: "HDF5_C_COMPILER_NO_INTERROGATE"
+      cached: true
+      stdout: |
+        Change Dir: '/home/kpango/go/src/github.com/kpango/NGT/CMakeFiles/CMakeScratch/TryCompile-U9RxlP'
+        
+        Run Build Command(s): /usr/bin/cmake -E env VERBOSE=1 /usr/bin/gmake -f Makefile cmTC_c37f7/fast
+        /usr/bin/gmake  -f CMakeFiles/cmTC_c37f7.dir/build.make CMakeFiles/cmTC_c37f7.dir/build
+        gmake[1]: Entering directory '/home/kpango/go/src/github.com/kpango/NGT/CMakeFiles/CMakeScratch/TryCompile-U9RxlP'
+        Building C object CMakeFiles/cmTC_c37f7.dir/cmake_hdf5_test.c.o
+        /usr/bin/clang   -I/include:-I/include:-I/usr/local/opt/openssl/include:  -MD -MT CMakeFiles/cmTC_c37f7.dir/cmake_hdf5_test.c.o -MF CMakeFiles/cmTC_c37f7.dir/cmake_hdf5_test.c.o.d -o CMakeFiles/cmTC_c37f7.dir/cmake_hdf5_test.c.o -c /home/kpango/go/src/github.com/kpango/NGT/tests/ngtaq/CMakeFiles/hdf5/cmake_hdf5_test.c
+        /home/kpango/go/src/github.com/kpango/NGT/tests/ngtaq/CMakeFiles/hdf5/cmake_hdf5_test.c:1:10: fatal error: 'hdf5.h' file not found
+            1 | #include <hdf5.h>
+              |          ^~~~~~~~
+        1 error generated.
+        gmake[1]: *** [CMakeFiles/cmTC_c37f7.dir/build.make:82: CMakeFiles/cmTC_c37f7.dir/cmake_hdf5_test.c.o] Error 1
+        gmake[1]: Leaving directory '/home/kpango/go/src/github.com/kpango/NGT/CMakeFiles/CMakeScratch/TryCompile-U9RxlP'
+        gmake: *** [Makefile:134: cmTC_c37f7/fast] Error 2
+        
+      exitCode: 2
+...
+
+---
+events:
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "/usr/share/cmake-4.2/Modules/FindHDF5.cmake:409 (try_compile)"
+      - "/usr/share/cmake-4.2/Modules/FindHDF5.cmake:776 (_HDF5_test_regular_compiler_C)"
+      - "tests/ngtaq/CMakeLists.txt:46 (find_package)"
+    directories:
+      source: "/home/kpango/go/src/github.com/kpango/NGT/CMakeFiles/CMakeScratch/TryCompile-UC5PU3"
+      binary: "/home/kpango/go/src/github.com/kpango/NGT/CMakeFiles/CMakeScratch/TryCompile-UC5PU3"
+    cmakeVariables:
+      CMAKE_CXX_COMPILER_CLANG_SCAN_DEPS: "/usr/bin/clang-scan-deps-21"
+      CMAKE_C_FLAGS: "-I/include:-I/include:-I/usr/local/opt/openssl/include:"
+      CMAKE_C_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: ""
+    buildResult:
+      variable: "HDF5_C_COMPILER_NO_INTERROGATE"
+      cached: true
+      stdout: |
+        Change Dir: '/home/kpango/go/src/github.com/kpango/NGT/CMakeFiles/CMakeScratch/TryCompile-UC5PU3'
+        
+        Run Build Command(s): /usr/bin/cmake -E env VERBOSE=1 /usr/bin/gmake -f Makefile cmTC_8d888/fast
+        /usr/bin/gmake  -f CMakeFiles/cmTC_8d888.dir/build.make CMakeFiles/cmTC_8d888.dir/build
+        gmake[1]: Entering directory '/home/kpango/go/src/github.com/kpango/NGT/CMakeFiles/CMakeScratch/TryCompile-UC5PU3'
+        Building C object CMakeFiles/cmTC_8d888.dir/cmake_hdf5_test.c.o
+        /usr/bin/clang   -I/include:-I/include:-I/usr/local/opt/openssl/include:  -MD -MT CMakeFiles/cmTC_8d888.dir/cmake_hdf5_test.c.o -MF CMakeFiles/cmTC_8d888.dir/cmake_hdf5_test.c.o.d -o CMakeFiles/cmTC_8d888.dir/cmake_hdf5_test.c.o -c /home/kpango/go/src/github.com/kpango/NGT/tests/ngtaq/CMakeFiles/hdf5/cmake_hdf5_test.c
+        /home/kpango/go/src/github.com/kpango/NGT/tests/ngtaq/CMakeFiles/hdf5/cmake_hdf5_test.c:1:10: fatal error: 'hdf5.h' file not found
+            1 | #include <hdf5.h>
+              |          ^~~~~~~~
+        1 error generated.
+        gmake[1]: *** [CMakeFiles/cmTC_8d888.dir/build.make:82: CMakeFiles/cmTC_8d888.dir/cmake_hdf5_test.c.o] Error 1
+        gmake[1]: Leaving directory '/home/kpango/go/src/github.com/kpango/NGT/CMakeFiles/CMakeScratch/TryCompile-UC5PU3'
+        gmake: *** [Makefile:134: cmTC_8d888/fast] Error 2
+        
+      exitCode: 2
+...
+
+---
+events:
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "/usr/share/cmake-4.2/Modules/FindHDF5.cmake:409 (try_compile)"
+      - "/usr/share/cmake-4.2/Modules/FindHDF5.cmake:776 (_HDF5_test_regular_compiler_C)"
+      - "tests/ngtaq/CMakeLists.txt:46 (find_package)"
+    directories:
+      source: "/home/kpango/go/src/github.com/kpango/NGT/CMakeFiles/CMakeScratch/TryCompile-VzHfVt"
+      binary: "/home/kpango/go/src/github.com/kpango/NGT/CMakeFiles/CMakeScratch/TryCompile-VzHfVt"
+    cmakeVariables:
+      CMAKE_CXX_COMPILER_CLANG_SCAN_DEPS: "/usr/bin/clang-scan-deps-21"
+      CMAKE_C_FLAGS: "-I/include:-I/include:-I/usr/local/opt/openssl/include:"
+      CMAKE_C_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: ""
+    buildResult:
+      variable: "HDF5_C_COMPILER_NO_INTERROGATE"
+      cached: true
+      stdout: |
+        Change Dir: '/home/kpango/go/src/github.com/kpango/NGT/CMakeFiles/CMakeScratch/TryCompile-VzHfVt'
+        
+        Run Build Command(s): /usr/bin/cmake -E env VERBOSE=1 /usr/bin/gmake -f Makefile cmTC_b9dc1/fast
+        /usr/bin/gmake  -f CMakeFiles/cmTC_b9dc1.dir/build.make CMakeFiles/cmTC_b9dc1.dir/build
+        gmake[1]: Entering directory '/home/kpango/go/src/github.com/kpango/NGT/CMakeFiles/CMakeScratch/TryCompile-VzHfVt'
+        Building C object CMakeFiles/cmTC_b9dc1.dir/cmake_hdf5_test.c.o
+        /usr/bin/clang   -I/include:-I/include:-I/usr/local/opt/openssl/include:  -MD -MT CMakeFiles/cmTC_b9dc1.dir/cmake_hdf5_test.c.o -MF CMakeFiles/cmTC_b9dc1.dir/cmake_hdf5_test.c.o.d -o CMakeFiles/cmTC_b9dc1.dir/cmake_hdf5_test.c.o -c /home/kpango/go/src/github.com/kpango/NGT/tests/ngtaq/CMakeFiles/hdf5/cmake_hdf5_test.c
+        /home/kpango/go/src/github.com/kpango/NGT/tests/ngtaq/CMakeFiles/hdf5/cmake_hdf5_test.c:1:10: fatal error: 'hdf5.h' file not found
+            1 | #include <hdf5.h>
+              |          ^~~~~~~~
+        1 error generated.
+        gmake[1]: *** [CMakeFiles/cmTC_b9dc1.dir/build.make:82: CMakeFiles/cmTC_b9dc1.dir/cmake_hdf5_test.c.o] Error 1
+        gmake[1]: Leaving directory '/home/kpango/go/src/github.com/kpango/NGT/CMakeFiles/CMakeScratch/TryCompile-VzHfVt'
+        gmake: *** [Makefile:134: cmTC_b9dc1/fast] Error 2
+        
+      exitCode: 2
+...
+
+---
+events:
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "/usr/share/cmake-4.2/Modules/FindHDF5.cmake:409 (try_compile)"
+      - "/usr/share/cmake-4.2/Modules/FindHDF5.cmake:776 (_HDF5_test_regular_compiler_C)"
+      - "tests/ngtaq/CMakeLists.txt:46 (find_package)"
+    directories:
+      source: "/home/kpango/go/src/github.com/kpango/NGT/CMakeFiles/CMakeScratch/TryCompile-gH0I1F"
+      binary: "/home/kpango/go/src/github.com/kpango/NGT/CMakeFiles/CMakeScratch/TryCompile-gH0I1F"
+    cmakeVariables:
+      CMAKE_CXX_COMPILER_CLANG_SCAN_DEPS: "/usr/bin/clang-scan-deps-21"
+      CMAKE_C_FLAGS: "-I/include:-I/include:-I/usr/local/opt/openssl/include:"
+      CMAKE_C_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: ""
+    buildResult:
+      variable: "HDF5_C_COMPILER_NO_INTERROGATE"
+      cached: true
+      stdout: |
+        Change Dir: '/home/kpango/go/src/github.com/kpango/NGT/CMakeFiles/CMakeScratch/TryCompile-gH0I1F'
+        
+        Run Build Command(s): /usr/bin/cmake -E env VERBOSE=1 /usr/bin/gmake -f Makefile cmTC_97743/fast
+        /usr/bin/gmake  -f CMakeFiles/cmTC_97743.dir/build.make CMakeFiles/cmTC_97743.dir/build
+        gmake[1]: Entering directory '/home/kpango/go/src/github.com/kpango/NGT/CMakeFiles/CMakeScratch/TryCompile-gH0I1F'
+        Building C object CMakeFiles/cmTC_97743.dir/cmake_hdf5_test.c.o
+        /usr/bin/clang   -I/include:-I/include:-I/usr/local/opt/openssl/include:  -MD -MT CMakeFiles/cmTC_97743.dir/cmake_hdf5_test.c.o -MF CMakeFiles/cmTC_97743.dir/cmake_hdf5_test.c.o.d -o CMakeFiles/cmTC_97743.dir/cmake_hdf5_test.c.o -c /home/kpango/go/src/github.com/kpango/NGT/tests/ngtaq/CMakeFiles/hdf5/cmake_hdf5_test.c
+        /home/kpango/go/src/github.com/kpango/NGT/tests/ngtaq/CMakeFiles/hdf5/cmake_hdf5_test.c:1:10: fatal error: 'hdf5.h' file not found
+            1 | #include <hdf5.h>
+              |          ^~~~~~~~
+        1 error generated.
+        gmake[1]: *** [CMakeFiles/cmTC_97743.dir/build.make:82: CMakeFiles/cmTC_97743.dir/cmake_hdf5_test.c.o] Error 1
+        gmake[1]: Leaving directory '/home/kpango/go/src/github.com/kpango/NGT/CMakeFiles/CMakeScratch/TryCompile-gH0I1F'
+        gmake: *** [Makefile:134: cmTC_97743/fast] Error 2
+        
+      exitCode: 2
+...
+
+---
+events:
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "/usr/share/cmake-4.2/Modules/FindHDF5.cmake:409 (try_compile)"
+      - "/usr/share/cmake-4.2/Modules/FindHDF5.cmake:776 (_HDF5_test_regular_compiler_C)"
+      - "tests/ngtaq/CMakeLists.txt:46 (find_package)"
+    directories:
+      source: "/home/kpango/go/src/github.com/kpango/NGT/CMakeFiles/CMakeScratch/TryCompile-r6A6Ba"
+      binary: "/home/kpango/go/src/github.com/kpango/NGT/CMakeFiles/CMakeScratch/TryCompile-r6A6Ba"
+    cmakeVariables:
+      CMAKE_CXX_COMPILER_CLANG_SCAN_DEPS: "/usr/bin/clang-scan-deps-21"
+      CMAKE_C_FLAGS: "-I/include:-I/include:-I/usr/local/opt/openssl/include:"
+      CMAKE_C_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: ""
+    buildResult:
+      variable: "HDF5_C_COMPILER_NO_INTERROGATE"
+      cached: true
+      stdout: |
+        Change Dir: '/home/kpango/go/src/github.com/kpango/NGT/CMakeFiles/CMakeScratch/TryCompile-r6A6Ba'
+        
+        Run Build Command(s): /usr/bin/cmake -E env VERBOSE=1 /usr/bin/gmake -f Makefile cmTC_1567d/fast
+        /usr/bin/gmake  -f CMakeFiles/cmTC_1567d.dir/build.make CMakeFiles/cmTC_1567d.dir/build
+        gmake[1]: Entering directory '/home/kpango/go/src/github.com/kpango/NGT/CMakeFiles/CMakeScratch/TryCompile-r6A6Ba'
+        Building C object CMakeFiles/cmTC_1567d.dir/cmake_hdf5_test.c.o
+        /usr/bin/clang   -I/include:-I/include:-I/usr/local/opt/openssl/include:  -MD -MT CMakeFiles/cmTC_1567d.dir/cmake_hdf5_test.c.o -MF CMakeFiles/cmTC_1567d.dir/cmake_hdf5_test.c.o.d -o CMakeFiles/cmTC_1567d.dir/cmake_hdf5_test.c.o -c /home/kpango/go/src/github.com/kpango/NGT/tests/ngtaq/CMakeFiles/hdf5/cmake_hdf5_test.c
+        /home/kpango/go/src/github.com/kpango/NGT/tests/ngtaq/CMakeFiles/hdf5/cmake_hdf5_test.c:1:10: fatal error: 'hdf5.h' file not found
+            1 | #include <hdf5.h>
+              |          ^~~~~~~~
+        1 error generated.
+        gmake[1]: *** [CMakeFiles/cmTC_1567d.dir/build.make:82: CMakeFiles/cmTC_1567d.dir/cmake_hdf5_test.c.o] Error 1
+        gmake[1]: Leaving directory '/home/kpango/go/src/github.com/kpango/NGT/CMakeFiles/CMakeScratch/TryCompile-r6A6Ba'
+        gmake: *** [Makefile:134: cmTC_1567d/fast] Error 2
+        
+      exitCode: 2
+...
+
+---
+events:
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "/usr/share/cmake-4.2/Modules/FindHDF5.cmake:409 (try_compile)"
+      - "/usr/share/cmake-4.2/Modules/FindHDF5.cmake:776 (_HDF5_test_regular_compiler_C)"
+      - "tests/ngtaq/CMakeLists.txt:46 (find_package)"
+    directories:
+      source: "/home/kpango/go/src/github.com/kpango/NGT/CMakeFiles/CMakeScratch/TryCompile-ny5una"
+      binary: "/home/kpango/go/src/github.com/kpango/NGT/CMakeFiles/CMakeScratch/TryCompile-ny5una"
+    cmakeVariables:
+      CMAKE_CXX_COMPILER_CLANG_SCAN_DEPS: "/usr/bin/clang-scan-deps-21"
+      CMAKE_C_FLAGS: "-I/include:-I/include:-I/usr/local/opt/openssl/include:"
+      CMAKE_C_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: ""
+    buildResult:
+      variable: "HDF5_C_COMPILER_NO_INTERROGATE"
+      cached: true
+      stdout: |
+        Change Dir: '/home/kpango/go/src/github.com/kpango/NGT/CMakeFiles/CMakeScratch/TryCompile-ny5una'
+        
+        Run Build Command(s): /usr/bin/cmake -E env VERBOSE=1 /usr/bin/gmake -f Makefile cmTC_a6653/fast
+        /usr/bin/gmake  -f CMakeFiles/cmTC_a6653.dir/build.make CMakeFiles/cmTC_a6653.dir/build
+        gmake[1]: Entering directory '/home/kpango/go/src/github.com/kpango/NGT/CMakeFiles/CMakeScratch/TryCompile-ny5una'
+        Building C object CMakeFiles/cmTC_a6653.dir/cmake_hdf5_test.c.o
+        /usr/bin/clang   -I/include:-I/include:-I/usr/local/opt/openssl/include:  -MD -MT CMakeFiles/cmTC_a6653.dir/cmake_hdf5_test.c.o -MF CMakeFiles/cmTC_a6653.dir/cmake_hdf5_test.c.o.d -o CMakeFiles/cmTC_a6653.dir/cmake_hdf5_test.c.o -c /home/kpango/go/src/github.com/kpango/NGT/tests/ngtaq/CMakeFiles/hdf5/cmake_hdf5_test.c
+        /home/kpango/go/src/github.com/kpango/NGT/tests/ngtaq/CMakeFiles/hdf5/cmake_hdf5_test.c:1:10: fatal error: 'hdf5.h' file not found
+            1 | #include <hdf5.h>
+              |          ^~~~~~~~
+        1 error generated.
+        gmake[1]: *** [CMakeFiles/cmTC_a6653.dir/build.make:82: CMakeFiles/cmTC_a6653.dir/cmake_hdf5_test.c.o] Error 1
+        gmake[1]: Leaving directory '/home/kpango/go/src/github.com/kpango/NGT/CMakeFiles/CMakeScratch/TryCompile-ny5una'
+        gmake: *** [Makefile:134: cmTC_a6653/fast] Error 2
+        
+      exitCode: 2
+...
+
+---
+events:
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "/usr/share/cmake-4.2/Modules/FindHDF5.cmake:409 (try_compile)"
+      - "/usr/share/cmake-4.2/Modules/FindHDF5.cmake:776 (_HDF5_test_regular_compiler_C)"
+      - "tests/ngtaq/CMakeLists.txt:46 (find_package)"
+    directories:
+      source: "/home/kpango/go/src/github.com/kpango/NGT/CMakeFiles/CMakeScratch/TryCompile-xTrJRa"
+      binary: "/home/kpango/go/src/github.com/kpango/NGT/CMakeFiles/CMakeScratch/TryCompile-xTrJRa"
+    cmakeVariables:
+      CMAKE_CXX_COMPILER_CLANG_SCAN_DEPS: "/usr/bin/clang-scan-deps-21"
+      CMAKE_C_FLAGS: "-I/include:-I/include:-I/usr/local/opt/openssl/include:"
+      CMAKE_C_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: ""
+    buildResult:
+      variable: "HDF5_C_COMPILER_NO_INTERROGATE"
+      cached: true
+      stdout: |
+        Change Dir: '/home/kpango/go/src/github.com/kpango/NGT/CMakeFiles/CMakeScratch/TryCompile-xTrJRa'
+        
+        Run Build Command(s): /usr/bin/cmake -E env VERBOSE=1 /usr/bin/gmake -f Makefile cmTC_46022/fast
+        /usr/bin/gmake  -f CMakeFiles/cmTC_46022.dir/build.make CMakeFiles/cmTC_46022.dir/build
+        gmake[1]: Entering directory '/home/kpango/go/src/github.com/kpango/NGT/CMakeFiles/CMakeScratch/TryCompile-xTrJRa'
+        Building C object CMakeFiles/cmTC_46022.dir/cmake_hdf5_test.c.o
+        /usr/bin/clang   -I/include:-I/include:-I/usr/local/opt/openssl/include:  -MD -MT CMakeFiles/cmTC_46022.dir/cmake_hdf5_test.c.o -MF CMakeFiles/cmTC_46022.dir/cmake_hdf5_test.c.o.d -o CMakeFiles/cmTC_46022.dir/cmake_hdf5_test.c.o -c /home/kpango/go/src/github.com/kpango/NGT/tests/ngtaq/CMakeFiles/hdf5/cmake_hdf5_test.c
+        /home/kpango/go/src/github.com/kpango/NGT/tests/ngtaq/CMakeFiles/hdf5/cmake_hdf5_test.c:1:10: fatal error: 'hdf5.h' file not found
+            1 | #include <hdf5.h>
+              |          ^~~~~~~~
+        1 error generated.
+        gmake[1]: *** [CMakeFiles/cmTC_46022.dir/build.make:82: CMakeFiles/cmTC_46022.dir/cmake_hdf5_test.c.o] Error 1
+        gmake[1]: Leaving directory '/home/kpango/go/src/github.com/kpango/NGT/CMakeFiles/CMakeScratch/TryCompile-xTrJRa'
+        gmake: *** [Makefile:134: cmTC_46022/fast] Error 2
+        
+      exitCode: 2
+...
+
+---
+events:
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "/usr/share/cmake-4.2/Modules/FindHDF5.cmake:409 (try_compile)"
+      - "/usr/share/cmake-4.2/Modules/FindHDF5.cmake:776 (_HDF5_test_regular_compiler_C)"
+      - "tests/ngtaq/CMakeLists.txt:46 (find_package)"
+    directories:
+      source: "/home/kpango/go/src/github.com/kpango/NGT/CMakeFiles/CMakeScratch/TryCompile-iJvxst"
+      binary: "/home/kpango/go/src/github.com/kpango/NGT/CMakeFiles/CMakeScratch/TryCompile-iJvxst"
+    cmakeVariables:
+      CMAKE_CXX_COMPILER_CLANG_SCAN_DEPS: "/usr/bin/clang-scan-deps-21"
+      CMAKE_C_FLAGS: "-I/include:-I/include:-I/usr/local/opt/openssl/include:"
+      CMAKE_C_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: ""
+    buildResult:
+      variable: "HDF5_C_COMPILER_NO_INTERROGATE"
+      cached: true
+      stdout: |
+        Change Dir: '/home/kpango/go/src/github.com/kpango/NGT/CMakeFiles/CMakeScratch/TryCompile-iJvxst'
+        
+        Run Build Command(s): /usr/bin/cmake -E env VERBOSE=1 /usr/bin/gmake -f Makefile cmTC_6fe12/fast
+        /usr/bin/gmake  -f CMakeFiles/cmTC_6fe12.dir/build.make CMakeFiles/cmTC_6fe12.dir/build
+        gmake[1]: Entering directory '/home/kpango/go/src/github.com/kpango/NGT/CMakeFiles/CMakeScratch/TryCompile-iJvxst'
+        Building C object CMakeFiles/cmTC_6fe12.dir/cmake_hdf5_test.c.o
+        /usr/bin/clang   -I/include:-I/include:-I/usr/local/opt/openssl/include:  -MD -MT CMakeFiles/cmTC_6fe12.dir/cmake_hdf5_test.c.o -MF CMakeFiles/cmTC_6fe12.dir/cmake_hdf5_test.c.o.d -o CMakeFiles/cmTC_6fe12.dir/cmake_hdf5_test.c.o -c /home/kpango/go/src/github.com/kpango/NGT/tests/ngtaq/CMakeFiles/hdf5/cmake_hdf5_test.c
+        /home/kpango/go/src/github.com/kpango/NGT/tests/ngtaq/CMakeFiles/hdf5/cmake_hdf5_test.c:1:10: fatal error: 'hdf5.h' file not found
+            1 | #include <hdf5.h>
+              |          ^~~~~~~~
+        1 error generated.
+        gmake[1]: *** [CMakeFiles/cmTC_6fe12.dir/build.make:82: CMakeFiles/cmTC_6fe12.dir/cmake_hdf5_test.c.o] Error 1
+        gmake[1]: Leaving directory '/home/kpango/go/src/github.com/kpango/NGT/CMakeFiles/CMakeScratch/TryCompile-iJvxst'
+        gmake: *** [Makefile:134: cmTC_6fe12/fast] Error 2
+        
+      exitCode: 2
+...

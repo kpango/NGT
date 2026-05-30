@@ -30,6 +30,7 @@ foreach(TEST_SRC
     test_kmeans
     test_pca
     test_adc_distance
+    patch_tombstones
 )
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${TEST_SRC}.cpp")
         add_executable(${TEST_SRC} ${TEST_SRC}.cpp)
@@ -53,8 +54,17 @@ if(NOT HDF5_FOUND)
 endif()
 
 if(HDF5_FOUND)
-    message(STATUS "HDF5 found: ${HDF5_C_LIBRARIES} -- building ann_bench and build_ngtaqv2_ann")
-    foreach(HDF5_SRC ann_bench build_ngtaqv2_ann)
+    message(STATUS "HDF5 found: ${HDF5_C_LIBRARIES} -- building ann_bench, build_ngtaqv2_ann, qg/qbg tools")
+    foreach(HDF5_SRC
+        ann_bench
+        build_ngtaqv2_ann
+        build_ngt_ann
+        diag_ids
+        qg_build
+        qg_bench
+        qbg_build
+        qbg_bench
+    )
         if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${HDF5_SRC}.cpp")
             add_executable(${HDF5_SRC} ${HDF5_SRC}.cpp)
             target_include_directories(${HDF5_SRC} PRIVATE ${HDF5_INCLUDE_DIRS})
@@ -63,5 +73,5 @@ if(HDF5_FOUND)
         endif()
     endforeach()
 else()
-    message(WARNING "HDF5 not found -- skipping ann_bench and build_ngtaqv2_ann")
+    message(WARNING "HDF5 not found -- skipping ann_bench, build_ngtaqv2_ann, and qg/qbg tools")
 endif()

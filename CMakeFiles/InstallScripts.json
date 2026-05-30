@@ -1,0 +1,19 @@
+{
+	"InstallScripts" : 
+	[
+		"/home/kpango/go/src/github.com/kpango/NGT/cmake_install.cmake",
+		"/home/kpango/go/src/github.com/kpango/NGT/lib/cmake_install.cmake",
+		"/home/kpango/go/src/github.com/kpango/NGT/lib/NGT/cmake_install.cmake",
+		"/home/kpango/go/src/github.com/kpango/NGT/bin/cmake_install.cmake",
+		"/home/kpango/go/src/github.com/kpango/NGT/bin/ngt/cmake_install.cmake",
+		"/home/kpango/go/src/github.com/kpango/NGT/bin/qbg/cmake_install.cmake",
+		"/home/kpango/go/src/github.com/kpango/NGT/samples/cmake_install.cmake",
+		"/home/kpango/go/src/github.com/kpango/NGT/samples/hamming-uint8/cmake_install.cmake",
+		"/home/kpango/go/src/github.com/kpango/NGT/samples/l2-uint8/cmake_install.cmake",
+		"/home/kpango/go/src/github.com/kpango/NGT/samples/l2-uint8-range-search/cmake_install.cmake",
+		"/home/kpango/go/src/github.com/kpango/NGT/samples/cosine-float/cmake_install.cmake",
+		"/home/kpango/go/src/github.com/kpango/NGT/samples/jaccard-sparse/cmake_install.cmake",
+		"/home/kpango/go/src/github.com/kpango/NGT/tests/ngtaq/cmake_install.cmake"
+	],
+	"Parallel" : false
+}
