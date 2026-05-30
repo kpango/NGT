@@ -1,7 +1,7 @@
 // tests/ngtaq/ann_bench.cpp
 // Unified ANN-Benchmarks benchmark for NGTAQv2.
 // Usage: ann_bench <aq_index_dir> <hdf5_path> [k=10] [gamma_enq=0.20] [gamma_term=0.40]
-//                  [rerank_factor=3] [n_threads=4]
+//                  [rerank_factor=3] [n_threads=4] [n_probe=0]
 //
 // Queries are zero-padded to D_eff (same as training).
 // Angular/Cosine: queries are L2-normalized before search (handled inside searchV2).
@@ -28,7 +28,7 @@ int main(int argc, char** argv) {
     if (argc < 3) {
         fprintf(stderr,
             "Usage: %s <aq_index_dir> <hdf5_path> [k=10] [gamma_enq=0.20]"
-            " [gamma_term=0.40] [rerank_factor=3] [n_threads=4]\n",
+            " [gamma_term=0.40] [rerank_factor=3] [n_threads=4] [n_probe=0]\n",
             argv[0]);
         return 1;
     }
@@ -39,11 +39,13 @@ int main(int argc, char** argv) {
     float gamma_term    = (argc > 5) ? std::stof(argv[5]) : 0.40f;
     int   rerank_factor = (argc > 6) ? std::stoi(argv[6]) : 3;
     int   n_threads     = (argc > 7) ? std::stoi(argv[7]) : 4;
+    int   n_probe       = (argc > 8) ? std::stoi(argv[8]) : 0;
 
     // Load AQv2 index
     fprintf(stderr, "[Load] AQv2 from: %s\n", idx_dir);
     NGTAQ::NGTAQIndex idx = NGTAQ::NGTAQIndex::load(std::string(idx_dir) + "/aqindex");
     idx.loadV2(idx_dir);
+    if (n_probe > 0) idx.setNProbe(n_probe);
     const int D_eff = idx.dEff();
 
     // Load test queries + ground truth
@@ -105,8 +107,8 @@ int main(int argc, char** argv) {
     printf("=== ANN-Benchmarks Result ===\n");
     printf("Index   : %s\n", idx_dir);
     printf("Dataset : %s  nq=%d  D=%d  D_eff=%d\n", hdf5_path, nq, D, D_eff);
-    printf("Config  : k=%d  gamma_enq=%.3f  gamma_term=%.3f  rerank_factor=%d  threads=%d\n",
-        k, gamma_enq, gamma_term, rerank_factor, n_threads);
+    printf("Config  : k=%d  gamma_enq=%.3f  gamma_term=%.3f  rerank_factor=%d  threads=%d  n_probe=%d\n",
+        k, gamma_enq, gamma_term, rerank_factor, n_threads, n_probe);
     printf("recall@%d  = %.4f%s\n", k, recall, recall >= 0.99 ? "  *** >=0.99 ***" : "");
     printf("agg_QPS   = %.0f\n", qps);
     printf("P50(us)   = %.1f\n", p50);
