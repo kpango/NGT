@@ -11,6 +11,7 @@
 #include "NGT/NGTAQ/PCAProjector.h"
 #include "NGT/NGTAQ/ADCTable.h"
 #include "NGT/NGTAQ/ADCDistance.h"
+#include "NGT/NGTAQ/GlobalPQ4.h"
 
 #include <fstream>
 #include <memory>
@@ -136,6 +137,19 @@ public:
     // no per-cluster LUT rebuild. Requires hasGlobalPQ().
     float globalPQDist(uint32_t node_id, const float* lut, float q_norm_sq) const;
 
+    // ---- Stage B/C: 16-centroid (4-bit) GLOBAL PQ for batch vpshufb routing ----
+    // hasGPQ4(): a 16-centroid global PQ codebook + per-node contiguous neighbor-code
+    // store are present (built by fromNGTv2, persisted by saveV2/loadV2).
+    bool hasGPQ4() const { return has_gpq4_ && graph_ && graph_->hasGPQ4(); }
+
+    // Build the per-query uint8 batch LUT from a raw (unrotated) query. Rotates with the
+    // index SRHT, fills `lut` (interleaved planes), and returns ||q_rot||^2. Requires
+    // a 16-centroid codebook (has_gpq4_). If `ip_out` != nullptr, also writes the
+    // dequantized float IP table [M_PQ*16] (for single-node gpq4Dist scoring).
+    float buildGlobalLUT16(const std::vector<float>& query,
+                           NGT::NGTAQ::GlobalPQ4LUT& lut,
+                           float* ip_out = nullptr) const;
+
     // Accessors for raw fp16 vectors and dimension (used by standalone benchmarks).
     // Elements are fp16-packed; decode with NGT::NGTAQ::fp16_to_float.
     const uint16_t* rawFlat() const { return raw_flat_.empty() ? nullptr : raw_flat_.data(); }
@@ -207,6 +221,27 @@ private:
     std::vector<float>   global_pq_codebook_T_;  // [M_PQ][D_sub][256] transposed (fast LUT build)
     std::vector<uint8_t> global_codes_;          // [N*M_PQ] per-vector global PQ codes
     std::vector<float>   global_pq_norm_sq_;     // [N] ||reconstructed rotated PQ vector||^2 per node
+
+    // ---- Stage B/C: 16-centroid (4-bit) GLOBAL PQ for batch vpshufb routing ----
+    // The K=16 codebook is REQUIRED for the single-shuffle 16-entry lookup (the K=256
+    // global PQ above is incompatible with vpshufb). Per-node 4-bit codes + recon-norms
+    // live in the SoAGraph contiguous neighbor-code store (graph_->buildGPQ4).
+    bool                 has_gpq4_ = false;
+    std::vector<float>   gpq4_codebook_;    // [M_PQ][16][D_sub] row-major (rotated vectors)
+    std::vector<float>   gpq4_codebook_T_;  // [M_PQ][D_sub][16] transposed (fast LUT build)
+    std::vector<uint8_t> gpq4_codes_;       // [N*M_PQ] per-node 4-bit codes (single-node scoring)
+    std::vector<float>   gpq4_norm_sq_;     // [N] per-node reconstructed-norm^2
+
+    // Single-node batch-PQ distance (seeds / expansion): ||q_rot - x_pq16||^2 via the
+    // node's own 4-bit code, scored against the per-query LUT's dequantized float table.
+    // `ip_table` is the M*16 float IP table from gpq4_ip_table (NOT the uint8 LUT).
+    float gpq4Dist(uint32_t node_id, const float* ip_table, float q_norm_sq) const {
+        const int M_PQ = (m_pq_ > 0) ? m_pq_ : 16;
+        const uint8_t* codes = gpq4_codes_.data() + (size_t)node_id * M_PQ;
+        float ip = 0.f;
+        for (int s = 0; s < M_PQ; ++s) ip += ip_table[(size_t)s * NGT::NGTAQ::GPQ4_K + codes[s]];
+        return q_norm_sq + gpq4_norm_sq_[node_id] - 2.0f * ip;
+    }
 
     // Lazy-built inverted list + cluster neighbor table for cluster-aware seeding.
     // Built once on first searchV2 call; unique_ptr keeps NGTAQIndex movable (once_flag is non-movable).

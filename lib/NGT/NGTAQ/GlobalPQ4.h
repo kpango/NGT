@@ -75,6 +75,36 @@ struct GlobalPQ4LUT {
     }
 };
 
+// Build the per-subspace float inner-product table ip[sub*16 + code] =
+//   <q_rot_sub, centroid_{sub,code}> from the transposed codebook [M][D_sub][16].
+// D_sub = 8 fixed (matches the rest of the pipeline). K = 16.
+inline void gpq4_ip_table(const float* q_rot, int M, const float* cb_T /* [M][8][16] */,
+                          int D_sub, float* ip /* [M*16] */) {
+    for (int s = 0; s < M; ++s) {
+        const float* q  = q_rot + (size_t)s * D_sub;
+        const float* cb = cb_T  + (size_t)s * D_sub * GPQ4_K;
+        float* out = ip + (size_t)s * GPQ4_K;
+#if defined(__AVX2__) && defined(__FMA__)
+        // 16 codes = two __m256 accumulators; FMA over D_sub dims.
+        __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps();
+        for (int d = 0; d < D_sub; ++d) {
+            __m256 qd = _mm256_set1_ps(q[d]);
+            const float* c = cb + (size_t)d * GPQ4_K;
+            a0 = _mm256_fmadd_ps(qd, _mm256_loadu_ps(c),     a0);
+            a1 = _mm256_fmadd_ps(qd, _mm256_loadu_ps(c + 8), a1);
+        }
+        _mm256_storeu_ps(out,     a0);
+        _mm256_storeu_ps(out + 8, a1);
+#else
+        for (int c = 0; c < GPQ4_K; ++c) {
+            float dot = 0.f;
+            for (int d = 0; d < D_sub; ++d) dot += q[d] * cb[(size_t)d * GPQ4_K + c];
+            out[c] = dot;
+        }
+#endif
+    }
+}
+
 // Build the per-query LUT from the per-subspace float inner-product table.
 //   ip[sub*16 + code] = <q_rot_sub, centroid_{sub,code}>
 // Global scale = max_sub((max-min)/255); per-subspace offset = min_sub.

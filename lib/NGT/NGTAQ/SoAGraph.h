@@ -201,6 +201,11 @@ public:
         v2_tier1_n_      = fresh.v2_tier1_n_;
         v2_tier2_n_      = fresh.v2_tier2_n_;
         v2_rec_stride_   = fresh.v2_rec_stride_;
+        // GPQ4 store is keyed on pre-compaction node IDs + edge layout; invalidate it.
+        // Caller must rebuildGPQ4() after rebuild() if batch routing is in use.
+        gpq4_m_ = 0;
+        gpq4_offsets_.clear();
+        gpq4_blocks_.clear();
     }
 
     // RW lock for external thread safety
@@ -360,6 +365,79 @@ public:
     int  v2Tier2N()    const { return v2_tier2_n_; }
     int  v2RecStride() const { return v2_rec_stride_; }
 
+    // ---- Stage B: GPQ4 contiguous per-node neighbor-code store ----
+    // For each node, its neighbors' 16-centroid (4-bit) global PQ codes are arranged
+    // block-16 transposed + uint4-packed (mirrors NGTQ arrangeQuantizedObject), with
+    // each neighbor's reconstructed-norm^2 stored inline as fp16. One node's blocks are
+    // contiguous → a single prefetch covers codes AND norms (no gather in the kernel).
+    //
+    // Per-block layout (bytes): [ (M/2)*16 code-plane bytes ][ 16 × fp16 norm = 32 bytes ].
+    //   block_bytes = M*8 + 32.   A node with n_nbrs neighbors uses ceil(n_nbrs/16) blocks.
+    // gpq4_offsets_[id] = starting BLOCK index for node id's store (units of blocks).
+
+    int gpq4M() const { return gpq4_m_; }
+    bool hasGPQ4() const { return !gpq4_blocks_.empty() && gpq4_m_ > 0; }
+    size_t gpq4BlockBytes() const { return (size_t)gpq4_m_ * 8 + 32; }
+
+    // Build the neighbor-code store from a per-node global 4-bit code table and per-node
+    // reconstructed-norm^2. Call after finalizeCSR() (edges final). M = #subspaces.
+    //   node_codes[id*M + s] = 4-bit global PQ code of node id, subspace s.
+    //   node_norm_sq[id]     = ||reconstructed rotated PQ vector||^2 of node id.
+    void buildGPQ4(int M, const uint8_t* node_codes, const float* node_norm_sq);
+
+    // Pointer to node id's contiguous neighbor blocks (codes+norms). nullptr if absent.
+    const uint8_t* gpq4Blocks(uint32_t id) const {
+        if (!hasGPQ4() || (size_t)id + 1 >= gpq4_offsets_.size()) return nullptr;
+        return gpq4_blocks_.data() + (size_t)gpq4_offsets_[id] * gpq4BlockBytes();
+    }
+    // Number of 16-blocks stored for node id (== ceil(n_nbrs/16)).
+    uint32_t gpq4NumBlocks(uint32_t id) const {
+        if ((size_t)id + 1 >= gpq4_offsets_.size()) return 0;
+        return gpq4_offsets_[id + 1] - gpq4_offsets_[id];
+    }
+    void prefetchGPQ4(uint32_t id) const {
+        if (!hasGPQ4() || (size_t)id + 1 >= gpq4_offsets_.size()) return;
+        const uint8_t* p = gpq4_blocks_.data() + (size_t)gpq4_offsets_[id] * gpq4BlockBytes();
+        const uint8_t* e = gpq4_blocks_.data() + (size_t)gpq4_offsets_[id + 1] * gpq4BlockBytes();
+        for (const uint8_t* c = p; c < e; c += 64) __builtin_prefetch(c, 0, 2);
+    }
+
+    void saveGPQ4(const std::string& path) const {
+        FILE* f = fopen(path.c_str(), "wb");
+        if (!f) throw std::runtime_error("SoAGraph::saveGPQ4: cannot open " + path);
+        uint64_t n_off = gpq4_offsets_.size();
+        uint64_t n_blk_bytes = gpq4_blocks_.size();
+        uint32_t hdr[2] = {(uint32_t)gpq4_m_, 0};
+        fwrite(hdr, sizeof(hdr), 1, f);
+        fwrite(&n_off, sizeof(n_off), 1, f);
+        fwrite(gpq4_offsets_.data(), sizeof(uint32_t), n_off, f);
+        fwrite(&n_blk_bytes, sizeof(n_blk_bytes), 1, f);
+        fwrite(gpq4_blocks_.data(), 1, n_blk_bytes, f);
+        fclose(f);
+    }
+    // Returns true if the file was present and loaded.
+    bool loadGPQ4(const std::string& path) {
+        FILE* f = fopen(path.c_str(), "rb");
+        if (!f) return false;
+        uint32_t hdr[2] = {0, 0};
+        if (fread(hdr, sizeof(hdr), 1, f) != 1) { fclose(f); return false; }
+        gpq4_m_ = (int)hdr[0];
+        uint64_t n_off = 0;
+        if (fread(&n_off, sizeof(n_off), 1, f) != 1) { fclose(f); return false; }
+        gpq4_offsets_.resize(n_off);
+        if (n_off && fread(gpq4_offsets_.data(), sizeof(uint32_t), n_off, f) != n_off) {
+            fclose(f); gpq4_offsets_.clear(); gpq4_m_ = 0; return false;
+        }
+        uint64_t n_blk_bytes = 0;
+        if (fread(&n_blk_bytes, sizeof(n_blk_bytes), 1, f) != 1) { fclose(f); return false; }
+        gpq4_blocks_.resize(n_blk_bytes);
+        if (n_blk_bytes && fread(gpq4_blocks_.data(), 1, n_blk_bytes, f) != n_blk_bytes) {
+            fclose(f); gpq4_blocks_.clear(); gpq4_offsets_.clear(); gpq4_m_ = 0; return false;
+        }
+        fclose(f);
+        return true;
+    }
+
     void saveV2Records(const std::string& path) const {
         FILE* f = fopen(path.c_str(), "wb");
         if (!f) throw std::runtime_error("SoAGraph::saveV2Records: cannot open " + path);
@@ -417,6 +495,53 @@ private:
     int v2_tier2_n_    = 16;   // D_eff / 8  (16 for D_eff=128)
     int v2_rec_stride_ = 38;   // tier1+tier2+norm+centroid = D_eff/4+6
     std::vector<PackedV2Node>             packed_v2_;  // DiskANN-style packed layout
+
+    // Stage B: GPQ4 contiguous neighbor-code store (see buildGPQ4 / gpq4Blocks).
+    int                   gpq4_m_ = 0;          // #subspaces (0 = absent)
+    std::vector<uint32_t> gpq4_offsets_;        // [N+1] starting block index per node
+    std::vector<uint8_t>  gpq4_blocks_;         // flat: blocks of (M*8 + 32) bytes
 };
+
+inline void SoAGraph::buildGPQ4(int M, const uint8_t* node_codes, const float* node_norm_sq) {
+    finalizeCSR();
+    gpq4_m_ = M;
+    constexpr uint32_t BLK = 16;  // neighbors per SIMD block
+    const size_t N = state_.size();
+    const size_t blk_bytes = (size_t)M * 8 + 32;
+    const int planes = (M + 1) / 2;
+    // 1. Count blocks per node → offsets.
+    gpq4_offsets_.assign(N + 1, 0);
+    for (size_t i = 0; i < N; ++i) {
+        uint32_t nn = offsets_[i + 1] - offsets_[i];
+        gpq4_offsets_[i + 1] = gpq4_offsets_[i] + (nn + BLK - 1) / BLK;
+    }
+    const size_t total_blocks = gpq4_offsets_[N];
+    gpq4_blocks_.assign(total_blocks * blk_bytes, 0);
+    // 2. Fill each node's blocks.
+    for (size_t i = 0; i < N; ++i) {
+        uint32_t b = offsets_[i];
+        uint32_t nn = offsets_[i + 1] - b;
+        uint8_t* base = gpq4_blocks_.data() + (size_t)gpq4_offsets_[i] * blk_bytes;
+        for (uint32_t blk = 0; blk * BLK < nn; ++blk) {
+            uint8_t* blkp = base + (size_t)blk * blk_bytes;
+            uint8_t* codep = blkp;                 // code planes
+            uint16_t* normp = reinterpret_cast<uint16_t*>(blkp + (size_t)planes * 16);
+            int n_real = (int)std::min<uint32_t>(BLK, nn - blk * BLK);
+            for (int n = 0; n < n_real; ++n) {
+                uint32_t nbr = edge_ids_[b + blk * BLK + n];
+                const uint8_t* nc = node_codes + (size_t)nbr * M;
+                for (int s = 0; s < M; ++s) {
+                    const int plane = s / 2;
+                    const int half  = (s & 1) * 8;
+                    const uint8_t code = nc[s] & 0x0f;
+                    uint8_t* dst = codep + (size_t)plane * 16 + half + (n / 2);
+                    if (n & 1) *dst |= (code << 4);
+                    else       *dst |= code;
+                }
+                normp[n] = NGT::NGTAQ::float_to_fp16(node_norm_sq[nbr]);
+            }
+        }
+    }
+}
 
 } // namespace NGTAQ

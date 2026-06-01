@@ -740,6 +740,43 @@ NGTAQIndex NGTAQIndex::fromNGTv2(const std::string& ngt_path, const Property& pr
         fprintf(stderr, "[NGTAQv2] GLOBAL PQ done.\n");
     }
 
+    // ---- 7c. GLOBAL PQ-16 tier (Stage B/C): K=16 (4-bit) codebook over rotated vectors ----
+    // REQUIRED for the QG-style vpshufb batch kernel (single _mm256_shuffle_epi8 = 16-entry
+    // lookup). Same training shape as the K=256 global PQ but K=16; per-node 4-bit codes +
+    // reconstructed-norm^2 feed the SoAGraph contiguous neighbor-code store (built below).
+    std::vector<float> gpq4_cb((size_t)M_PQ * NGT::NGTAQ::GPQ4_K * D_sub, 0.f);
+    std::vector<uint8_t> gpq4_codes(N * (size_t)M_PQ, 0);
+    std::vector<float>   gpq4_norm_sq(N, 0.f);
+    {
+        fprintf(stderr, "[NGTAQv2] Training %d GLOBAL PQ-16 sub-codebooks (K=16) on rotated vectors...\n", M_PQ);
+        for (int sub = 0; sub < M_PQ; ++sub) {
+            std::vector<float> sub_data(N * (size_t)D_sub);
+            for (size_t i = 0; i < N; ++i)
+                memcpy(sub_data.data() + i*D_sub,
+                       rotated.data() + i*D + sub*D_sub,
+                       (size_t)D_sub * sizeof(float));
+            NGT::NGTAQ::KMeansCentering sub_km(NGT::NGTAQ::GPQ4_K, D_sub,
+                                               seed ^ (0x4B16C0DEULL + (uint64_t)sub));
+            sub_km.train(sub_data.data(), N, 262144, 50);
+            for (int code = 0; code < NGT::NGTAQ::GPQ4_K; ++code)
+                memcpy(gpq4_cb.data() + (sub*NGT::NGTAQ::GPQ4_K + code)*D_sub,
+                       sub_km.centroid(code),
+                       (size_t)D_sub * sizeof(float));
+        }
+        #pragma omp parallel for schedule(static)
+        for (size_t i = 0; i < N; ++i) {
+            if (is_hole[i]) continue;
+            const float* xr = rotated.data() + i*D;
+            uint8_t* codes = gpq4_codes.data() + i*(size_t)M_PQ;
+            float rns = 0.f;
+            for (int sub = 0; sub < M_PQ; ++sub)
+                codes[sub] = NGT::NGTAQ::gpq4_encode_sub(
+                    xr + sub*D_sub, gpq4_cb.data() + (size_t)sub*NGT::NGTAQ::GPQ4_K*D_sub, D_sub, rns);
+            gpq4_norm_sq[i] = rns;
+        }
+        fprintf(stderr, "[NGTAQv2] GLOBAL PQ-16 done.\n");
+    }
+
     // ---- 8. Encode all vectors into VectorRecord ----
     // Build the BQ-compatible SoAGraph (needed for existing graph infra + v1 compat)
     BinaryQuantizer bq;
@@ -874,6 +911,22 @@ NGTAQIndex NGTAQIndex::fromNGTv2(const std::string& ngt_path, const Property& pr
     }
     idx.has_global_pq_ = true;
 
+    // GLOBAL PQ-16 tier (Stage B/C): codebook (+ transposed) + contiguous neighbor store.
+    // buildGPQ4 reads the FINAL CSR edges (resetEdges already ran above), so the per-node
+    // neighbor blocks reflect the pruned graph used at search time.
+    idx.gpq4_codebook_ = std::move(gpq4_cb);
+    {
+        idx.gpq4_codebook_T_.resize((size_t)M_PQ * D_sub * NGT::NGTAQ::GPQ4_K);
+        NGT::NGTAQ::build_tier2_codebook_T(
+            idx.gpq4_codebook_.data(), M_PQ, NGT::NGTAQ::GPQ4_K, D_sub,
+            idx.gpq4_codebook_T_.data());
+    }
+    idx.graph_->buildGPQ4(M_PQ, gpq4_codes.data(), gpq4_norm_sq.data());
+    idx.gpq4_codes_   = std::move(gpq4_codes);    // flat per-node codes (seeds/expansion)
+    idx.gpq4_norm_sq_ = std::move(gpq4_norm_sq);
+    idx.has_gpq4_ = true;
+    fprintf(stderr, "[NGTAQv2] GPQ4 neighbor-code store built (M=%d).\n", M_PQ);
+
     idx.is_angular_ = (prop.metric == NGT::ObjectSpace::DistanceTypeAngle ||
                        prop.metric == NGT::ObjectSpace::DistanceTypeCosine);
     idx.d_eff_ = D;
@@ -928,6 +981,42 @@ float NGTAQIndex::globalPQDist(uint32_t node_id, const float* lut, float q_norm_
     float ip = NGT::NGTAQ::tier2_adc_pq_m(lut, codes, M_PQ);
     // ||q_rot - x_rot_pq||^2 = ||q_rot||^2 + ||x_rot_pq||^2 - 2<q_rot, x_rot_pq>.
     return q_norm_sq + global_pq_norm_sq_[node_id] - 2.0f * ip;
+}
+
+// ---------------------------------------------------------------------------
+// Stage B/C: build the per-query uint8 batch LUT (K=16) and return ||q_rot||^2.
+// ---------------------------------------------------------------------------
+float NGTAQIndex::buildGlobalLUT16(const std::vector<float>& query,
+                                   NGT::NGTAQ::GlobalPQ4LUT& lut,
+                                   float* ip_out) const {
+    const int D      = (d_eff_ > 0) ? d_eff_ : prop_.dimension;
+    const int M_PQ   = (m_pq_ > 0) ? m_pq_ : 16;
+    const int D_sub  = 8;
+    const int D_orig = (int)query.size();
+
+    static thread_local std::vector<float> q_norm_tl;
+    const float* q_src = query.data();
+    if (is_angular_) {
+        q_norm_tl.assign(query.begin(), query.begin() + std::min(D_orig, D));
+        float n2 = 0.f;
+        for (float x : q_norm_tl) n2 += x * x;
+        if (n2 > 1e-12f) { float inv = 1.f/std::sqrt(n2); for (float& x : q_norm_tl) x *= inv; }
+        q_src = q_norm_tl.data();
+    }
+    static thread_local std::vector<float> q_padded_tl, q_rot_tl, ip_tl;
+    q_padded_tl.assign(static_cast<size_t>(D), 0.f);
+    std::copy(q_src, q_src + std::min(D_orig, D), q_padded_tl.begin());
+    q_rot_tl.resize(static_cast<size_t>(D));
+    srht_v2_->apply(q_padded_tl.data(), q_rot_tl.data());
+
+    ip_tl.resize((size_t)M_PQ * NGT::NGTAQ::GPQ4_K);
+    NGT::NGTAQ::gpq4_ip_table(q_rot_tl.data(), M_PQ, gpq4_codebook_T_.data(), D_sub, ip_tl.data());
+    NGT::NGTAQ::gpq4_build_lut(ip_tl.data(), M_PQ, lut);
+    if (ip_out) std::copy(ip_tl.begin(), ip_tl.end(), ip_out);
+
+    float q_norm_sq = 0.f;
+    for (int d = 0; d < D; ++d) q_norm_sq += q_rot_tl[d] * q_rot_tl[d];
+    return q_norm_sq;
 }
 
 // ---------------------------------------------------------------------------
@@ -1191,7 +1280,20 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
         const char* e = std::getenv("AQ_USE_GLOBAL_ROUTING");
         return e && std::atoi(e) != 0;
     }();
-    const bool use_global_pq = has_global_pq_ && use_global_env;
+    // Stage C-full: QG-style 16-wide vpshufb BATCH routing. AQ_BATCH_ROUTING=1 opts in
+    // (requires a meta_version>=3 index with the K=16 GPQ4 store). When on, the popped
+    // node's WHOLE neighbor block is scored in one _mm256_shuffle_epi8 pass over a single
+    // shared per-query LUT — no per-neighbor maybe_rebuild_adc, no gather. The fp16 exact
+    // rerank below recovers true k-NN. Implies global routing for seeds/popped/expansion
+    // (single-node gpq4Dist with the same codebook), so d_k uses one consistent metric.
+    static const bool use_batch_env = [] {
+        const char* e = std::getenv("AQ_BATCH_ROUTING");
+        return e && std::atoi(e) != 0;
+    }();
+    const bool use_batch = hasGPQ4() && use_batch_env;
+    // Batch implies global-PQ semantics (no per-cluster ADC); legacy global PQ (K=256)
+    // is the fallback opt-in. They are mutually exclusive; batch wins if both set.
+    const bool use_global_pq = (has_global_pq_ && use_global_env) && !use_batch;
 
     static thread_local std::vector<float> global_lut_tl;
     float q_ns_global = 0.f;
@@ -1199,9 +1301,26 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
         global_lut_tl.resize(static_cast<size_t>(M_PQ) * 256);
         q_ns_global = buildGlobalLUT(query, global_lut_tl.data());
     }
+    // Batch (K=16) LUT + dequantized float IP table (the latter for single-node seeds).
+    static thread_local NGT::NGTAQ::GlobalPQ4LUT batch_lut_tl;
+    static thread_local std::vector<float> batch_ip_tl;
+    float q_ns_batch = 0.f;
+    if (use_batch) {
+        batch_ip_tl.resize((size_t)M_PQ * NGT::NGTAQ::GPQ4_K);
+        q_ns_batch = buildGlobalLUT16(query, batch_lut_tl, batch_ip_tl.data());
+    }
     auto route_dist = [&](uint32_t id) -> float {
         return globalPQDist(id, global_lut_tl.data(), q_ns_global);
     };
+    // Single-node batch-PQ distance (seeds / popped-fallback / expansion).
+    auto batch_dist1 = [&](uint32_t id) -> float {
+        return gpq4Dist(id, batch_ip_tl.data(), q_ns_batch);
+    };
+    // Unified single-node "coarse route" used wherever route_dist was used: batch wins.
+    auto coarse_dist = [&](uint32_t id) -> float {
+        return use_batch ? batch_dist1(id) : route_dist(id);
+    };
+    const bool use_coarse = use_batch || use_global_pq;  // any single-LUT coarse routing
 
     AQ_ADD(setup);  // [AQ_PROFILE] query-encode + ADC-init + initial tier-2 LUT (incl. one-time call_once)
 
@@ -1260,7 +1379,7 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
             // Global-PQ: skip the per-cluster rebuild entirely — score with the single
             //     global LUT (route_dist) so seeds are ranked by the SAME metric the DABS
             //     loop uses, giving a consistent d_k initialization.
-            if (is_angular_ && !use_global_pq) {
+            if (is_angular_ && !use_coarse) {
                 maybe_rebuild_adc(cid_p);
                 NGT::NGTAQ::build_tier2_lut_fast_m(q_res_tl.data(), M_PQ,
                                                     tier2_codebook_T_.data(),
@@ -1312,8 +1431,8 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
                 uint32_t ep = members[mi];
                 if (ep >= N || graph_->isTombstone(ep)) continue;
                 float d_approx;
-                if (use_global_pq) {
-                    d_approx = route_dist(ep);
+                if (use_coarse) {
+                    d_approx = coarse_dist(ep);
                 } else {
                     auto rec = graph_->getRecordConstView(ep);
                     float norm_x = NGT::NGTAQ::fp16_to_float(rec.norm_fp16());
@@ -1369,8 +1488,8 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
                 if (is_visited(s.id)) continue;
                 mark_visited(s.id);
                 float d;
-                if (use_global_pq) {
-                    d = route_dist(s.id);
+                if (use_coarse) {
+                    d = coarse_dist(s.id);
                 } else {
                     auto rec = graph_->getRecordConstView(s.id);
                     maybe_rebuild_adc(rec.centroid_id());
@@ -1383,8 +1502,8 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
             // Angular only: restore t2_lut_tl and ADC to initial cluster.
             // The DABS termination gate (two-gate tier-2 check) uses t2_lut_tl with the
             // initial-cluster residual. L2 never rebuilt LUT/ADC during seeding → no restore.
-            // Global-PQ never touched per-cluster ADC/LUT during seeding → no restore.
-            if (is_angular_ && !use_global_pq) {
+            // Coarse routing (global-PQ / batch) never touched per-cluster ADC/LUT → no restore.
+            if (is_angular_ && !use_coarse) {
                 NGT::NGTAQ::build_tier2_lut_fast_m(q_res_init_tl.data(), M_PQ,
                                                     tier2_codebook_T_.data(),
                                                     t2_lut_tl.data());
@@ -1418,8 +1537,10 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
         // Prefetch next-popped node's data while we process current node
         if (!cand_q.empty()) {
             uint32_t nxt = cand_q.top().second;
-            graph_->prefetchRecord(nxt);
-            graph_->prefetchNeighbors(nxt);
+            // Batch mode reads the GPQ4 block (codes+norms) of the next node, not its
+            // V2 record; prefetch that instead to hide its DRAM latency.
+            if (use_batch) { graph_->prefetchGPQ4(nxt); graph_->prefetchNeighbors(nxt); }
+            else           { graph_->prefetchRecord(nxt); graph_->prefetchNeighbors(nxt); }
         }
         // Prefetch current node's neighbor list (hides CSR access latency)
         graph_->prefetchNeighbors(x);
@@ -1439,8 +1560,8 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
         // on tier-1 with a suitably large gamma_term (≥0.50 recommended for angular).
         if (dk_tracker.size() >= static_cast<size_t>(k_beam) &&
             dist_x > (1.f + gamma_term) * d_k) {
-            if (use_global_pq) {
-                break;  // global-PQ: dist_x and d_k share one metric → single gate, no 2-gate
+            if (use_coarse) {
+                break;  // coarse routing: dist_x and d_k share one metric → single gate
             } else if (!is_angular_) {
                 float nx2  = NGT::NGTAQ::fp16_to_float(rec_x.norm_fp16());
                 float t2ip = NGT::NGTAQ::tier2_adc_pq_m(t2_lut_tl.data(), rec_x.tier2(), M_PQ);
@@ -1453,8 +1574,10 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
         }
 
         float d_approx;
-        if (use_global_pq) {
-            d_approx = route_dist(x);
+        if (use_coarse) {
+            // x's queue priority dist_x IS its coarse distance (set when enqueued by the
+            // batch kernel / coarse_dist), so reuse it — no recompute, no gather.
+            d_approx = dist_x;
         } else {
             maybe_rebuild_adc(rec_x.centroid_id());
             d_approx = adc_dist(rec_x);
@@ -1477,6 +1600,49 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
 
         auto neighbors = graph_->getNeighbors(x);
         const size_t n_nbrs = neighbors.size();
+
+        // ── Stage C-full: QG-style vpshufb BATCH routing ─────────────────────────
+        // Score ALL of x's neighbors in one shuffle pass over its CONTIGUOUS block
+        // store (codes + recon-norms co-located), then enqueue. No per-neighbor
+        // maybe_rebuild_adc, no record-view touch, no gather — the whole point.
+        if (use_batch) {
+            const uint8_t* blocks = graph_->gpq4Blocks(x);
+            const uint32_t nblk   = graph_->gpq4NumBlocks(x);
+            if (blocks && nblk > 0) {
+                graph_->prefetchGPQ4(x);
+                const size_t blk_bytes = graph_->gpq4BlockBytes();
+                const int planes = (graph_->gpq4M() + 1) / 2;
+                static thread_local std::vector<float> block_ip_tl;
+                block_ip_tl.resize((size_t)nblk * 16);
+                for (uint32_t b = 0; b < nblk; ++b)
+                    NGT::NGTAQ::gpq4_batch_ip(blocks + (size_t)b * blk_bytes,
+                                              batch_lut_tl, block_ip_tl.data() + (size_t)b * 16);
+                const float* normp_base = nullptr;  // per-block, recomputed below
+                for (size_t ni = 0; ni < n_nbrs; ++ni) {
+                    uint32_t u = neighbors[ni];
+                    if (u >= N || graph_->isTombstone(u)) continue;
+                    if (is_visited(u)) continue;
+                    mark_visited(u);
+                    const uint32_t b = (uint32_t)(ni / 16), pos = (uint32_t)(ni % 16);
+                    const uint8_t* blkp = blocks + (size_t)b * blk_bytes;
+                    const uint16_t* normp =
+                        reinterpret_cast<const uint16_t*>(blkp + (size_t)planes * 16);
+                    float ip   = block_ip_tl[(size_t)b * 16 + pos];
+                    float nsq  = NGT::NGTAQ::fp16_to_float(normp[pos]);
+                    float d_u  = q_ns_batch + nsq - 2.0f * ip;
+                    if (static_cast<int>(dk_tracker.size()) >= k_beam &&
+                        d_u > (1.f + gamma_enq) * d_k)
+                        continue;
+                    cand_q.push({d_u, u});
+                    graph_->prefetchOffset(u);
+                }
+                (void)normp_base;
+                continue;  // neighbor sweep done for x
+            }
+            // No block store for x (shouldn't happen for an active node) → fall through
+            // to the generic coarse path below.
+        }
+
         // Sliding-window prefetch (PFDIST=8): issue record prefetch 8 iterations ahead.
         // With 8-slot ADC cache, hit-path cost ~10ns → 8×10=80ns look-ahead covers DRAM
         // (~100ns). Bulk (n_nbrs=20-40 simultaneous) overloads the CPU LSQ/MSHR, competing
@@ -1503,16 +1669,16 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
             if (u >= N || graph_->isTombstone(u)) continue;
             if (is_visited(u)) continue;
             mark_visited(u);
-            // Global-PQ scores any node with one LUT (no per-cluster ADC), so the
+            // Coarse routing scores any node with one LUT (no per-cluster ADC), so the
             // centroid_id read (a record-view touch) and the cluster sort below are
             // both unnecessary — store a dummy cid and skip the sort.
-            uint32_t cid_u = use_global_pq ? 0u
-                                            : graph_->getRecordConstView(u).centroid_id();
+            uint32_t cid_u = use_coarse ? 0u
+                                         : graph_->getRecordConstView(u).centroid_id();
             nbr_buf_tl.push_back({cid_u, u});
         }
         // Sort by cluster id → contiguous per-cluster runs (small n_nbrs, ~20-64).
-        // Global-PQ needs no per-cluster batching, so the sort is pure overhead → skip.
-        if (!use_global_pq)
+        // Coarse routing needs no per-cluster batching, so the sort is pure overhead → skip.
+        if (!use_coarse)
             std::sort(nbr_buf_tl.begin(), nbr_buf_tl.end(),
                       [](const NbrCand& a, const NbrCand& b){ return a.cid < b.cid; });
 
@@ -1521,8 +1687,8 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
         for (const auto& nc : nbr_buf_tl) {
             uint32_t u = nc.id;
             float d_u;
-            if (use_global_pq) {
-                d_u = route_dist(u);
+            if (use_coarse) {
+                d_u = coarse_dist(u);
             } else {
                 auto rec_u = graph_->getRecordConstView(u);
                 maybe_rebuild_adc(nc.cid);
@@ -1590,7 +1756,10 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
     // top-10 sit within global-PQ top-200=92.8%, top-500=98.2%, top-1000=99.4%), so the
     // exact-rerank pool needs a wide floor (~1000) to recover true k-NN. AQ_REFINE_MULT
     // still drives it higher when set (k_beam*mult overrides the floor when larger).
-    const size_t refine_floor = use_global_pq ? (size_t)1000 : (size_t)0;
+    // Batch (K=16) routing is coarser still than K=256 global PQ, so it needs a wider
+    // exact-rerank pool to recover true k-NN. AQ_REFINE_MULT still overrides when larger.
+    const size_t refine_floor = use_batch ? (size_t)2000
+                                          : (use_global_pq ? (size_t)1000 : (size_t)0);
     const size_t refine_n = std::max<size_t>(
         std::max<size_t>(static_cast<size_t>(k_beam) * refine_mult, refine_floor),
         static_cast<size_t>(k_out) * static_cast<size_t>(rerank_factor > 0 ? rerank_factor : 1));
@@ -1616,8 +1785,8 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
                 if (is_visited(u)) continue;
                 mark_visited(u);
                 float d_u;
-                if (use_global_pq) {
-                    d_u = route_dist(u);
+                if (use_coarse) {
+                    d_u = coarse_dist(u);
                 } else {
                     auto rec_u = graph_->getRecordConstView(u);
                     maybe_rebuild_adc(rec_u.centroid_id());
@@ -1987,13 +2156,34 @@ void NGTAQIndex::saveV2(const std::string& dir) const {
                     global_pq_norm_sq_.size() * sizeof(float));
         }
     }
+    // GLOBAL PQ-16 tier (Stage B/C): K=16 codebook + per-node contiguous neighbor store.
+    // Written only when present; loadV2 keys on meta version (slot 3 >= 3).
+    const bool save_gpq4 = has_gpq4_ && graph_ && graph_->hasGPQ4();
+    if (save_gpq4) {
+        {
+            std::ofstream f(dir + "/v2_gpq4_codebook.bin", std::ios::binary);
+            f.write(reinterpret_cast<const char*>(gpq4_codebook_.data()),
+                    gpq4_codebook_.size() * sizeof(float));
+        }
+        {
+            // Flat per-node codes + recon norms (single-node seed/expansion scoring).
+            std::ofstream f(dir + "/v2_gpq4_codes.bin", std::ios::binary);
+            uint64_t n = (uint64_t)gpq4_norm_sq_.size();
+            f.write(reinterpret_cast<const char*>(&n), sizeof(n));
+            f.write(reinterpret_cast<const char*>(gpq4_codes_.data()),
+                    gpq4_codes_.size() * sizeof(uint8_t));
+            f.write(reinterpret_cast<const char*>(gpq4_norm_sq_.data()),
+                    gpq4_norm_sq_.size() * sizeof(float));
+        }
+        graph_->saveGPQ4(dir + "/v2_gpq4_store.bin");
+    }
     // Metadata: is_angular_, d_eff_, m_pq_, meta_version.
-    // meta_version: 1 = no global PQ (legacy), 2 = global PQ files present.
+    // meta_version: 1 = no global PQ (legacy), 2 = K=256 global PQ, 3 = + K=16 GPQ4 store.
     {
         std::string meta_path = dir + "/v2_meta.bin";
         FILE* f = fopen(meta_path.c_str(), "wb");
         if (f) {
-            int32_t meta_version = has_global_pq_ ? 2 : 1;
+            int32_t meta_version = save_gpq4 ? 3 : (has_global_pq_ ? 2 : 1);
             int32_t meta[4] = {(int32_t)is_angular_, d_eff_, m_pq_, meta_version};
             fwrite(meta, sizeof(meta), 1, f);
             fclose(f);
@@ -2095,6 +2285,40 @@ void NGTAQIndex::loadV2(const std::string& dir) {
                 global_pq_codebook_.data(), M_cb, 256, D_sub,
                 global_pq_codebook_T_.data());
             has_global_pq_ = (fc.good() || fc.eof()) && (fx.good() || fx.eof());
+        }
+    }
+    // GLOBAL PQ-16 tier (Stage B/C): present iff meta_version >= 3. Old indices fall back
+    // (has_gpq4_ stays false → legacy/global routing) instead of crashing.
+    has_gpq4_ = false;
+    if (meta_version >= 3) {
+        const int M_cb  = m_pq_;
+        const int D_sub = 8;
+        std::ifstream fc(dir + "/v2_gpq4_codebook.bin", std::ios::binary);
+        if (fc) {
+            gpq4_codebook_.resize((size_t)M_cb * NGT::NGTAQ::GPQ4_K * D_sub);
+            fc.read(reinterpret_cast<char*>(gpq4_codebook_.data()),
+                    gpq4_codebook_.size() * sizeof(float));
+            gpq4_codebook_T_.resize(gpq4_codebook_.size());
+            NGT::NGTAQ::build_tier2_codebook_T(
+                gpq4_codebook_.data(), M_cb, NGT::NGTAQ::GPQ4_K, D_sub,
+                gpq4_codebook_T_.data());
+            bool codes_ok = false;
+            {
+                std::ifstream fx(dir + "/v2_gpq4_codes.bin", std::ios::binary);
+                if (fx) {
+                    uint64_t n = 0;
+                    fx.read(reinterpret_cast<char*>(&n), sizeof(n));
+                    gpq4_codes_.resize((size_t)n * M_cb);
+                    gpq4_norm_sq_.resize((size_t)n);
+                    fx.read(reinterpret_cast<char*>(gpq4_codes_.data()),
+                            gpq4_codes_.size() * sizeof(uint8_t));
+                    fx.read(reinterpret_cast<char*>(gpq4_norm_sq_.data()),
+                            gpq4_norm_sq_.size() * sizeof(float));
+                    codes_ok = (fx.good() || fx.eof());
+                }
+            }
+            bool store_ok = graph_->loadGPQ4(dir + "/v2_gpq4_store.bin");
+            has_gpq4_ = (fc.good() || fc.eof()) && codes_ok && store_ok && graph_->hasGPQ4();
         }
     }
     is_v2_ = true;
