@@ -445,8 +445,9 @@ NGTAQIndex NGTAQIndex::load(const std::string& path) {
     //    oldest (pre-magic):       first 4 bytes = dimension (small int) → rejected (rebuild required).
     Property prop;
     memset(&prop, 0, sizeof(prop));
-    prop.k_clusters      = 0;   // default: use select_k(N)
-    prop.n_cluster_seeds = 32;  // default
+    prop.k_clusters       = 0;   // default: use select_k(N)
+    prop.n_cluster_seeds  = 32;  // default
+    prop.seeds_per_cluster = 64; // default for pre-cap indices (trailing field absent in old files)
 
     uint32_t maybe_magic;
     is.read(reinterpret_cast<char*>(&maybe_magic), 4);
@@ -1178,14 +1179,19 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
     // route_dist(id) returns an approx sq-L2 via the node's global PQ code; the d_k
     // tracker, enqueue gate (gamma_enq) and termination gate (gamma_term) all use this
     // single consistent metric. fp16 exact rerank below still recovers true k-NN.
-    // AQ_NO_GLOBAL=1 forces the legacy per-cluster ADC path even when the index has a
-    // global PQ tier — an A/B kill-switch for measuring the Stage C-lite speedup on the
-    // SAME index/config. Default (unset): route on global PQ when available.
-    static const bool no_global_env = [] {
-        const char* e = std::getenv("AQ_NO_GLOBAL");
+    //
+    // DEFAULT = OFF (legacy per-cluster routing). Empirically the global-PQ-routed DABS
+    // is 1.4-1.9x SLOWER iso-recall than the legacy per-cluster path: the coarse global
+    // codebook routes worse per visit, and the legacy 8-slot ADC cache + neighbor-cluster
+    // bucketing already made maybe_rebuild_adc cheap. The global-PQ path is kept reachable
+    // behind an opt-in flag (documented dead-end; may revisit for a batch ADC kernel).
+    // AQ_USE_GLOBAL_ROUTING=1 opts INTO global-PQ routing on a Stage-A index; unset (or 0)
+    // uses the LEGACY per-cluster ADC path — byte-identical in behavior to commit 99af263.
+    static const bool use_global_env = [] {
+        const char* e = std::getenv("AQ_USE_GLOBAL_ROUTING");
         return e && std::atoi(e) != 0;
     }();
-    const bool use_global_pq = has_global_pq_ && !no_global_env;
+    const bool use_global_pq = has_global_pq_ && use_global_env;
 
     static thread_local std::vector<float> global_lut_tl;
     float q_ns_global = 0.f;
@@ -1262,15 +1268,46 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
             }
             const float q_ns  = is_angular_ ? adc.q_norm_sq : q_norm_sq_initial;
             const float* lut_p = is_angular_ ? t2_lut_probe.data() : t2_lut_tl.data();
-            // Score all members of this cluster with the correct LUT
+            // Per-cluster seed cap.
+            //   L2:      already bounded at N_CLUSTER_SEEDS (legacy behavior, unchanged).
+            //   Angular: legacy scanned ALL members of every probed cluster (~20k seeds/query
+            //            for GloVe). The full-cluster tier-2 SCAN — not just the resulting beam
+            //            flood — is the QPS floor (A/B: at np=20 the scan pins QPS at ~600
+            //            regardless of max_visits). We bound the seeds CONTRIBUTED per cluster
+            //            to `seed_cap` while still probing all n_probe clusters (coverage
+            //            preserved). Members are not pre-sorted, so two strategies exist:
+            //              (default) scan only the FIRST `seed_cap` members — skips the
+            //                  full-cluster scan entirely. ~5x QPS at near-iso-recall (GloVe
+            //                  r≈0.77: 528→2238 QPS) since the scan no longer dominates.
+            //              (AQ_SEED_CAP_TOPK=1) SCORE all members, keep the top-`seed_cap` by
+            //                  tier-2 LUT estimate. Slightly higher recall per visit but pays
+            //                  the full scan, so it stays at the ~600 QPS floor — opt-in only.
+            //   seeds_per_cluster == 0 ⇒ unbounded (legacy full-cluster scan).
+            static const bool seed_cap_topk = [] {
+                const char* e = std::getenv("AQ_SEED_CAP_TOPK");
+                return e && std::atoi(e) != 0;
+            }();
+            const int seed_cap = prop_.seeds_per_cluster;
+            const bool angular_capped =
+                is_angular_ && seed_cap > 0 &&
+                members.size() > static_cast<size_t>(seed_cap);
+            // For L2: scan ≤ N_CLUSTER_SEEDS. For angular: default scans only the first
+            // `seed_cap` members; AQ_SEED_CAP_TOPK scans the full cluster (to keep top-k).
             const size_t take = is_angular_
-                ? members.size()                                         // scan full cluster for angular
-                : std::min(members.size(), static_cast<size_t>(N_CLUSTER_SEEDS)); // limit for L2
+                ? ((angular_capped && !seed_cap_topk)
+                       ? static_cast<size_t>(seed_cap)
+                       : members.size())
+                : std::min(members.size(), static_cast<size_t>(N_CLUSTER_SEEDS));
             // Prefetch only what we'll score: avoids cache pollution for L2 (full-cluster
             // prefetch evicts DABS hot data from L1/L2 when only 32/N_CLUSTER_SEEDS are used).
             for (size_t mi = 0; mi < take; ++mi) {
                 if (members[mi] < N) graph_->prefetchRecord(members[mi]);
             }
+            // The score-all-keep-topK path needs a per-cluster staging buffer. The default
+            // scan-first path (and L2) push directly into `scored` (no extra trim pass).
+            const bool stage_topk = angular_capped && seed_cap_topk;
+            static thread_local std::vector<SeedScore> clus_buf;
+            if (stage_topk) { clus_buf.clear(); clus_buf.reserve(take); }
             for (size_t mi = 0; mi < take; ++mi) {
                 uint32_t ep = members[mi];
                 if (ep >= N || graph_->isTombstone(ep)) continue;
@@ -1283,7 +1320,19 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
                     float t2_ip  = NGT::NGTAQ::tier2_adc_pq_m(lut_p, rec.tier2(), M_PQ);
                     d_approx = q_ns + norm_x * norm_x - 2.0f * t2_ip;
                 }
-                scored.push_back({d_approx, ep});
+                (stage_topk ? clus_buf : scored).push_back({d_approx, ep});
+            }
+            // Strategy (a): keep this cluster's best `seed_cap` seeds (smallest d_approx).
+            if (stage_topk) {
+                if (clus_buf.size() > static_cast<size_t>(seed_cap)) {
+                    std::nth_element(clus_buf.begin(),
+                                     clus_buf.begin() + seed_cap,
+                                     clus_buf.end(),
+                                     [](const SeedScore& a, const SeedScore& b){
+                                         return a.score < b.score; });
+                    clus_buf.resize(static_cast<size_t>(seed_cap));
+                }
+                scored.insert(scored.end(), clus_buf.begin(), clus_buf.end());
             }
         }
 

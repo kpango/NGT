@@ -38,6 +38,15 @@ public:
         int    n_cluster_seeds  = 32;  // seeds per cluster for DABS warm-start (larger → tighter d_k init)
         NGT::ObjectSpace::DistanceType metric =
             NGT::ObjectSpace::DistanceTypeL2;
+        // Angular only: cap on SEEDS scored/enqueued per probed cluster. Angular seeding
+        // otherwise scans ALL members of each of n_probe clusters (~20k seeds/query for
+        // GloVe), which floods the DABS beam and pins QPS. Bounding seeds per cluster
+        // (while still probing n_probe clusters for COVERAGE) is the primary angular
+        // recall-QPS knob. 0 = unbounded (legacy: scan full cluster). L2 is unaffected
+        // (it already caps at n_cluster_seeds). Placed LAST so the serialized Property
+        // layout stays positionally compatible with pre-cap index files (load() defaults
+        // this to 64 when the trailing field is absent).
+        int    seeds_per_cluster = 64;
     };
 
     // Build from an existing NGT float32 index.
@@ -56,6 +65,10 @@ public:
 
     // Override cluster seed count at search time (not thread-safe while searchV2 is running).
     void setNClusterSeeds(int n) { prop_.n_cluster_seeds = n; }
+
+    // Override per-cluster angular seed cap at search time (not thread-safe while
+    // searchV2 is running). 0 = unbounded (legacy full-cluster scan). See Property.
+    void setSeedsPerCluster(int n) { prop_.seeds_per_cluster = n; }
 
     // Override n_probe (number of clusters to probe) at search time.
     // 0 = use default (is_angular ? 20 : 3). Higher values improve recall at cost of QPS.

@@ -29,7 +29,9 @@ int main(int argc, char** argv) {
         fprintf(stderr,
             "Usage: %s <aq_index_dir> <hdf5_path> [k=10] [gamma_enq=0.20]"
             " [gamma_term=0.40] [rerank_factor=3] [n_threads=4] [n_probe=0]"
-            " [max_visits=0]\n",
+            " [max_visits=0] [seeds_per_cluster=-1]\n"
+            "  seeds_per_cluster: angular per-cluster seed cap. -1=use index default,"
+            " 0=unbounded (legacy full scan), >0=cap.\n",
             argv[0]);
         return 1;
     }
@@ -42,12 +44,14 @@ int main(int argc, char** argv) {
     int   n_threads     = (argc > 7) ? std::stoi(argv[7]) : 4;
     int   n_probe       = (argc > 8) ? std::stoi(argv[8]) : 0;
     int   max_visits    = (argc > 9) ? std::stoi(argv[9]) : 0;
+    int   seeds_per_cluster = (argc > 10) ? std::stoi(argv[10]) : -1;
 
     // Load AQv2 index
     fprintf(stderr, "[Load] AQv2 from: %s\n", idx_dir);
     NGTAQ::NGTAQIndex idx = NGTAQ::NGTAQIndex::load(std::string(idx_dir) + "/aqindex");
     idx.loadV2(idx_dir);
     if (n_probe > 0) idx.setNProbe(n_probe);
+    if (seeds_per_cluster >= 0) idx.setSeedsPerCluster(seeds_per_cluster);
     const int D_eff = idx.dEff();
 
     // Load test queries + ground truth
@@ -109,8 +113,8 @@ int main(int argc, char** argv) {
     printf("=== ANN-Benchmarks Result ===\n");
     printf("Index   : %s\n", idx_dir);
     printf("Dataset : %s  nq=%d  D=%d  D_eff=%d\n", hdf5_path, nq, D, D_eff);
-    printf("Config  : k=%d  gamma_enq=%.3f  gamma_term=%.3f  rerank_factor=%d  threads=%d  n_probe=%d  max_visits=%d\n",
-        k, gamma_enq, gamma_term, rerank_factor, n_threads, n_probe, max_visits);
+    printf("Config  : k=%d  gamma_enq=%.3f  gamma_term=%.3f  rerank_factor=%d  threads=%d  n_probe=%d  max_visits=%d  seeds_per_cluster=%d\n",
+        k, gamma_enq, gamma_term, rerank_factor, n_threads, n_probe, max_visits, seeds_per_cluster);
     printf("recall@%d  = %.4f%s\n", k, recall, recall >= 0.99 ? "  *** >=0.99 ***" : "");
     printf("agg_QPS   = %.0f\n", qps);
     printf("P50(us)   = %.1f\n", p50);
