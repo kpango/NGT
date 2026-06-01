@@ -1402,11 +1402,15 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
     // L2 data: DABS with 3 neighbor clusters is highly effective.
     const int n_probe = (n_probe_override_ > 0) ? n_probe_override_
                                                  : (is_angular_ ? 20 : 3);
+    struct SeedScore { float score; uint32_t id; };
     {
         // Build list of clusters to probe: primary cluster + top-(n_probe-1) neighbors.
         // cluster_neighbors_v2_[active_cid] is sorted by cluster-centroid L2 distance.
-        std::vector<uint32_t> probe_clusters;
-        probe_clusters.reserve(static_cast<size_t>(n_probe));
+        // thread_local buffers: the seed phase ran ~12-19us/query and these two vectors
+        // were heap-allocated+freed EVERY query (probe_clusters ~n_probe, scored reserve
+        // n_probe*200). Reuse persistent thread_local storage instead.
+        static thread_local std::vector<uint32_t> probe_clusters;
+        probe_clusters.clear();
         probe_clusters.push_back(initial_cid);  // primary cluster first
         if (initial_cid < cluster_neighbors_v2_.size()) {
             for (uint32_t c2 : cluster_neighbors_v2_[initial_cid]) {
@@ -1415,14 +1419,18 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
             }
         }
 
-        struct SeedScore { float score; uint32_t id; };
-        std::vector<SeedScore> scored;
-        scored.reserve(static_cast<size_t>(n_probe) * 200);
+        static thread_local std::vector<SeedScore> scored;
+        scored.clear();
+        if (scored.capacity() < static_cast<size_t>(n_probe) * 200)
+            scored.reserve(static_cast<size_t>(n_probe) * 200);
 
         // Score seeds from each probed cluster with the CORRECT centroid's LUT.
         // For each cluster c_i: rebuild ADC → build LUT(c_i) → score all members.
+        // The tier-2 probe LUT is only used by the angular per-cluster path
+        // (is_angular_ && !use_coarse); skip the M_PQ*256 alloc for the batch path.
         static thread_local std::vector<float> t2_lut_probe;
-        t2_lut_probe.resize(static_cast<size_t>(M_PQ) * 256);
+        if (is_angular_ && !use_coarse)
+            t2_lut_probe.resize(static_cast<size_t>(M_PQ) * 256);
         for (uint32_t cid_p : probe_clusters) {
             if (cid_p >= cluster_members_v2_.size()) continue;
             const auto& members = cluster_members_v2_[cid_p];
@@ -1481,6 +1489,12 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
             if (!use_coarse) {
                 for (size_t mi = 0; mi < take; ++mi)
                     if (members[mi] < N) graph_->prefetchRecord(members[mi]);
+            } else if (use_batch) {
+                // Batch seed scoring (gpq4Dist) gathers gpq4_norm_sq_[member] — a random
+                // 4MB-array access that misses cache on every seed. Prefetch them up front
+                // so the per-seed code-lookup loop overlaps the DRAM latency.
+                for (size_t mi = 0; mi < take; ++mi)
+                    if (members[mi] < N) __builtin_prefetch(&gpq4_norm_sq_[members[mi]], 0, 1);
             }
             // The score-all-keep-topK path needs a per-cluster staging buffer. The default
             // scan-first path (and L2) push directly into `scored` (no extra trim pass).
