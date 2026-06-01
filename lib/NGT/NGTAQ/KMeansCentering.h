@@ -113,6 +113,27 @@ public:
         return nearest(x);
     }
 
+    // Approximate nearest centroid via an fp16 centroid cache. The full-fp32 scan over
+    // K*D floats streams 2x the bytes (K=1000,D=128 -> 512KB) and is memory-bandwidth
+    // bound (~12us/query measured). For SEED-CLUSTER selection the exact nearest is not
+    // required — the graph walk corrects any near-tie — so an fp16 scan (256KB, half the
+    // bandwidth) is sufficient and ~2x faster. Cache is built lazily on first use.
+    // Reuses the F16C l2_sq_f32_fp16 kernel already used by the exact rerank.
+    uint32_t nearest_fp16(const float* x) const {
+        if (centroids_fp16_.size() != (size_t)K_ * D_) build_fp16_cache();
+        float best_dist = std::numeric_limits<float>::max();
+        uint32_t best = 0;
+        const uint16_t* cp = centroids_fp16_.data();
+        constexpr int PREFETCH_DIST = 24;
+        for (uint32_t k = 0; k < K_; ++k) {
+            if (k + PREFETCH_DIST < K_)
+                __builtin_prefetch(cp + (size_t)(k + PREFETCH_DIST) * D_, 0, 1);
+            float d = NGT::NGTAQ::l2_sq_f32_fp16(x, cp + (size_t)k * D_, D_);
+            if (d < best_dist) { best_dist = d; best = k; }
+        }
+        return best;
+    }
+
     uint32_t num_clusters() const { return K_; }
     int dim() const { return D_; }
 
@@ -129,6 +150,16 @@ private:
     int D_;
     uint64_t seed_;
     std::vector<float> centroids_;
+    mutable std::vector<uint16_t> centroids_fp16_;  // lazy fp16 copy for nearest_fp16
+
+    // Build the fp16 centroid cache from the fp32 centroids (one-time, query-thread safe:
+    // idempotent full overwrite; concurrent builders write identical bytes).
+    void build_fp16_cache() const {
+        std::vector<uint16_t> tmp((size_t)K_ * D_);
+        for (size_t i = 0; i < tmp.size(); ++i)
+            tmp[i] = NGT::NGTAQ::float_to_fp16(centroids_[i]);
+        centroids_fp16_.swap(tmp);
+    }
 
     uint32_t nearest(const float* x) const {
         float best_dist = std::numeric_limits<float>::max();

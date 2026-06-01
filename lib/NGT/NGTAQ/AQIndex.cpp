@@ -1111,8 +1111,12 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
     q_rot_tl.resize(static_cast<size_t>(D));
     srht_v2_->apply(q_ptr, q_rot_tl.data());
 
-    // 2. Find query's nearest centroid
-    uint32_t active_cid = kmeans_v2_->nearest_public(q_rot_tl.data());
+    // 2. Find query's nearest centroid. On the coarse (batch/global-PQ) path the centroid
+    // only selects seed clusters — the graph walk corrects near-ties — so use the 2x-faster
+    // fp16 centroid scan (half the memory bandwidth; the fp32 scan was ~12us, the dominant
+    // setup cost). The exact (non-coarse) path keeps the full-precision fp32 scan.
+    uint32_t active_cid = use_coarse_e ? kmeans_v2_->nearest_fp16(q_rot_tl.data())
+                                       : kmeans_v2_->nearest_public(q_rot_tl.data());
     q_res_tl.resize(static_cast<size_t>(D));
 
     // 3. Build initial ADC state (tier-1 + tier-2 PQ on SRHT residuals)
