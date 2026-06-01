@@ -65,6 +65,7 @@ if(HDF5_FOUND)
         qg_bench
         qbg_build
         qbg_bench
+        test_global_pq
     )
         if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${HDF5_SRC}.cpp")
             add_executable(${HDF5_SRC} ${HDF5_SRC}.cpp)

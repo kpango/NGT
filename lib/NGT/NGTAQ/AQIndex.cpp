@@ -688,6 +688,57 @@ NGTAQIndex NGTAQIndex::fromNGTv2(const std::string& ngt_path, const Property& pr
     }
     fprintf(stderr, "[NGTAQv2] PQ sub-codebooks done.\n");
 
+    // ---- 7b. GLOBAL PQ tier: one codebook over the ROTATED vectors directly ----
+    // (Stage A) Unlike tier-2 (per-cluster residuals), this trains M_PQ sub-codebooks
+    // on the SRHT-rotated vectors WITHOUT centroid subtraction. A single per-query LUT
+    // can then score ANY node via its global code — no per-cluster LUT rebuild.
+    // Layout matches tier-2: global_cb[(sub*256 + code)*D_sub + dim].
+    std::vector<float> global_cb((size_t)M_PQ * K_PQ * D_sub, 0.f);
+    std::vector<uint8_t> global_codes(N * (size_t)M_PQ, 0);
+    std::vector<float>   global_norm_sq(N, 0.f);
+    {
+        fprintf(stderr, "[NGTAQv2] Training %d GLOBAL PQ sub-codebooks on rotated vectors...\n", M_PQ);
+        for (int sub = 0; sub < M_PQ; ++sub) {
+            std::vector<float> sub_data(N * (size_t)D_sub);
+            for (size_t i = 0; i < N; ++i)
+                memcpy(sub_data.data() + i*D_sub,
+                       rotated.data() + i*D + sub*D_sub,
+                       (size_t)D_sub * sizeof(float));
+            NGT::NGTAQ::KMeansCentering sub_km(K_PQ, D_sub, seed ^ (0x5EED9001ULL + (uint64_t)sub));
+            sub_km.train(sub_data.data(), N, 262144, 50);
+            for (int code = 0; code < K_PQ; ++code)
+                memcpy(global_cb.data() + (sub*K_PQ + code)*D_sub,
+                       sub_km.centroid(code),
+                       (size_t)D_sub * sizeof(float));
+        }
+        // Encode each rotated vector's global PQ code + reconstructed squared norm.
+        // Independent per vector → parallelize (mirrors the build's other O(N) passes).
+        #pragma omp parallel for schedule(static)
+        for (size_t i = 0; i < N; ++i) {
+            if (is_hole[i]) continue;  // holes keep code 0 / norm 0
+            const float* xr = rotated.data() + i*D;
+            uint8_t* codes = global_codes.data() + i*(size_t)M_PQ;
+            float recon_norm_sq = 0.f;
+            for (int sub = 0; sub < M_PQ; ++sub) {
+                const float* sv = xr + sub*D_sub;
+                float best_d = std::numeric_limits<float>::max();
+                uint8_t best_code = 0;
+                for (int code = 0; code < K_PQ; ++code) {
+                    const float* c = global_cb.data() + (sub*K_PQ + code) * D_sub;
+                    float dist = 0.f;
+                    for (int dd = 0; dd < D_sub; ++dd) { float df = sv[dd]-c[dd]; dist += df*df; }
+                    if (dist < best_d) { best_d = dist; best_code = (uint8_t)code; }
+                }
+                codes[sub] = best_code;
+                // accumulate ||reconstructed sub-vector||^2 (centroid the code points to)
+                const float* bc = global_cb.data() + (sub*K_PQ + best_code) * D_sub;
+                for (int dd = 0; dd < D_sub; ++dd) recon_norm_sq += bc[dd]*bc[dd];
+            }
+            global_norm_sq[i] = recon_norm_sq;
+        }
+        fprintf(stderr, "[NGTAQv2] GLOBAL PQ done.\n");
+    }
+
     // ---- 8. Encode all vectors into VectorRecord ----
     // Build the BQ-compatible SoAGraph (needed for existing graph infra + v1 compat)
     BinaryQuantizer bq;
@@ -810,6 +861,18 @@ NGTAQIndex NGTAQIndex::fromNGTv2(const std::string& ngt_path, const Property& pr
     }
     idx.v2_entry_points_ = idx.entry_points_;  // reuse existing entry points for v2
 
+    // GLOBAL PQ tier (Stage A): codebook + transposed copy + per-vector codes/norms.
+    idx.global_pq_codebook_ = std::move(global_cb);
+    idx.global_codes_       = std::move(global_codes);
+    idx.global_pq_norm_sq_  = std::move(global_norm_sq);
+    {
+        idx.global_pq_codebook_T_.resize((size_t)M_PQ * D_sub * K_PQ);
+        NGT::NGTAQ::build_tier2_codebook_T(
+            idx.global_pq_codebook_.data(), M_PQ, K_PQ, D_sub,
+            idx.global_pq_codebook_T_.data());
+    }
+    idx.has_global_pq_ = true;
+
     idx.is_angular_ = (prop.metric == NGT::ObjectSpace::DistanceTypeAngle ||
                        prop.metric == NGT::ObjectSpace::DistanceTypeCosine);
     idx.d_eff_ = D;
@@ -817,6 +880,53 @@ NGTAQIndex NGTAQIndex::fromNGTv2(const std::string& ngt_path, const Property& pr
 
     fprintf(stderr, "[NGTAQv2] Build complete. N=%zu K=%u\n", N, K);
     return idx;
+}
+
+// ---------------------------------------------------------------------------
+// Stage A: GLOBAL PQ routing tier — single per-query LUT scores any node.
+// ---------------------------------------------------------------------------
+float NGTAQIndex::buildGlobalLUT(const std::vector<float>& query, float* lut) const {
+    if (!has_global_pq_)
+        throw std::runtime_error("buildGlobalLUT: index has no global PQ tier");
+    const int D      = (d_eff_ > 0) ? d_eff_ : prop_.dimension;
+    const int M_PQ   = (m_pq_ > 0) ? m_pq_ : 16;
+    const int D_orig = (int)query.size();
+
+    // Angular/Cosine: L2-normalize the query exactly as searchV2 does, so the rotated
+    // query lives in the same space as the (normalized→rotated) stored vectors.
+    static thread_local std::vector<float> q_norm_tl;
+    const float* q_src = query.data();
+    if (is_angular_) {
+        q_norm_tl.assign(query.begin(), query.begin() + std::min(D_orig, D));
+        float n2 = 0.f;
+        for (float x : q_norm_tl) n2 += x * x;
+        if (n2 > 1e-12f) { float inv = 1.f/std::sqrt(n2); for (float& x : q_norm_tl) x *= inv; }
+        q_src = q_norm_tl.data();
+    }
+
+    // Zero-pad to D, then SRHT-rotate (codebook was trained on rotated vectors directly).
+    static thread_local std::vector<float> q_padded_tl, q_rot_tl;
+    q_padded_tl.assign(static_cast<size_t>(D), 0.f);
+    std::copy(q_src, q_src + std::min(D_orig, D), q_padded_tl.begin());
+    q_rot_tl.resize(static_cast<size_t>(D));
+    srht_v2_->apply(q_padded_tl.data(), q_rot_tl.data());
+
+    // LUT[sub][code] = <q_rot_sub, global_centroid_sub>. Reuse the tier-2 fast builder.
+    NGT::NGTAQ::build_tier2_lut_fast_m(q_rot_tl.data(), M_PQ,
+                                        global_pq_codebook_T_.data(), lut);
+
+    float q_norm_sq = 0.f;
+    for (int d = 0; d < D; ++d) q_norm_sq += q_rot_tl[d] * q_rot_tl[d];
+    return q_norm_sq;
+}
+
+float NGTAQIndex::globalPQDist(uint32_t node_id, const float* lut, float q_norm_sq) const {
+    const int M_PQ = (m_pq_ > 0) ? m_pq_ : 16;
+    const uint8_t* codes = global_codes_.data() + (size_t)node_id * M_PQ;
+    // <q_rot, x_rot_pq> via the global LUT (one LUT scores any node).
+    float ip = NGT::NGTAQ::tier2_adc_pq_m(lut, codes, M_PQ);
+    // ||q_rot - x_rot_pq||^2 = ||q_rot||^2 + ||x_rot_pq||^2 - 2<q_rot, x_rot_pq>.
+    return q_norm_sq + global_pq_norm_sq_[node_id] - 2.0f * ip;
 }
 
 // ---------------------------------------------------------------------------
@@ -1742,12 +1852,32 @@ void NGTAQIndex::saveV2(const std::string& dir) const {
         f.write(reinterpret_cast<const char*>(tier2_codebook_.data()),
                 tier2_codebook_.size() * sizeof(float));
     }
-    // New metadata: is_angular_, d_eff_, m_pq_
+    // GLOBAL PQ tier (Stage A): codebook (row-major) + per-vector codes + recon norms.
+    // Written only when present; loadV2 keys on the meta version (slot 3 == 2).
+    if (has_global_pq_) {
+        {
+            std::ofstream f(dir + "/v2_global_pq.bin", std::ios::binary);
+            f.write(reinterpret_cast<const char*>(global_pq_codebook_.data()),
+                    global_pq_codebook_.size() * sizeof(float));
+        }
+        {
+            std::ofstream f(dir + "/v2_global_codes.bin", std::ios::binary);
+            uint64_t n = (uint64_t)global_pq_norm_sq_.size();
+            f.write(reinterpret_cast<const char*>(&n), sizeof(n));
+            f.write(reinterpret_cast<const char*>(global_codes_.data()),
+                    global_codes_.size() * sizeof(uint8_t));
+            f.write(reinterpret_cast<const char*>(global_pq_norm_sq_.data()),
+                    global_pq_norm_sq_.size() * sizeof(float));
+        }
+    }
+    // Metadata: is_angular_, d_eff_, m_pq_, meta_version.
+    // meta_version: 1 = no global PQ (legacy), 2 = global PQ files present.
     {
         std::string meta_path = dir + "/v2_meta.bin";
         FILE* f = fopen(meta_path.c_str(), "wb");
         if (f) {
-            int32_t meta[4] = {(int32_t)is_angular_, d_eff_, m_pq_, 0};
+            int32_t meta_version = has_global_pq_ ? 2 : 1;
+            int32_t meta[4] = {(int32_t)is_angular_, d_eff_, m_pq_, meta_version};
             fwrite(meta, sizeof(meta), 1, f);
             fclose(f);
         }
@@ -1789,17 +1919,20 @@ void NGTAQIndex::loadV2(const std::string& dir) {
         f.read(reinterpret_cast<char*>(eig.data()),  eig.size()  * sizeof(float));
         pca_v2_->set_state(std::move(comp), std::move(mean), std::move(eig));
     }
-    // New metadata: is_angular_, d_eff_, m_pq_ (optional — may not exist in old indices)
+    // New metadata: is_angular_, d_eff_, m_pq_, meta_version (optional in old indices).
     // Must be read BEFORE codebook so M_cb and D_sub are known.
+    // meta_version: <2 (or absent) = no global PQ; >=2 = global PQ files present.
+    int32_t meta_version = 1;
     {
         std::string meta_path = dir + "/v2_meta.bin";
         FILE* f = fopen(meta_path.c_str(), "rb");
         if (f) {
-            int32_t meta[4] = {0, 0, 16, 0};
+            int32_t meta[4] = {0, 0, 16, 1};
             if (fread(meta, sizeof(meta), 1, f) == 1) {
-                is_angular_ = (bool)meta[0];
-                d_eff_      = meta[1];
-                m_pq_       = meta[2];
+                is_angular_  = (bool)meta[0];
+                d_eff_       = meta[1];
+                m_pq_        = meta[2];
+                meta_version = meta[3];
             }
             fclose(f);
         }
@@ -1819,6 +1952,33 @@ void NGTAQIndex::loadV2(const std::string& dir) {
         NGT::NGTAQ::build_tier2_codebook_T(
             tier2_codebook_.data(), M_cb, 256, D_sub,
             tier2_codebook_T_.data());
+    }
+    // GLOBAL PQ tier (Stage A): present iff meta_version >= 2. Old indices fall back
+    // (has_global_pq_ stays false) instead of crashing.
+    has_global_pq_ = false;
+    if (meta_version >= 2) {
+        const int M_cb  = m_pq_;
+        const int D_sub = 8;
+        std::ifstream fc(dir + "/v2_global_pq.bin", std::ios::binary);
+        std::ifstream fx(dir + "/v2_global_codes.bin", std::ios::binary);
+        if (fc && fx) {
+            global_pq_codebook_.resize((size_t)M_cb * 256 * D_sub);
+            fc.read(reinterpret_cast<char*>(global_pq_codebook_.data()),
+                    global_pq_codebook_.size() * sizeof(float));
+            uint64_t n = 0;
+            fx.read(reinterpret_cast<char*>(&n), sizeof(n));
+            global_codes_.resize((size_t)n * M_cb);
+            global_pq_norm_sq_.resize((size_t)n);
+            fx.read(reinterpret_cast<char*>(global_codes_.data()),
+                    global_codes_.size() * sizeof(uint8_t));
+            fx.read(reinterpret_cast<char*>(global_pq_norm_sq_.data()),
+                    global_pq_norm_sq_.size() * sizeof(float));
+            global_pq_codebook_T_.resize(global_pq_codebook_.size());
+            NGT::NGTAQ::build_tier2_codebook_T(
+                global_pq_codebook_.data(), M_cb, 256, D_sub,
+                global_pq_codebook_T_.data());
+            has_global_pq_ = (fc.good() || fc.eof()) && (fx.good() || fx.eof());
+        }
     }
     is_v2_ = true;
 }

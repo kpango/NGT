@@ -107,6 +107,22 @@ public:
     int  dEff()      const { return d_eff_ > 0 ? d_eff_ : prop_.dimension; }
     int  mPQ()       const { return m_pq_; }
 
+    // ---- Stage A: GLOBAL PQ routing tier ----
+    // One PQ codebook trained over ALL SRHT-rotated vectors (no per-cluster residual),
+    // so a single per-query LUT scores ANY node. Foundation for batch DABS routing.
+    bool hasGlobalPQ() const { return has_global_pq_; }
+
+    // Build one global LUT from a raw (unrotated, unnormalized) query.
+    // Rotates the query with the index SRHT internally, then fills lut (M_PQ*256 floats).
+    // Returns ||q_rot||^2 (== ||q||^2, SRHT is orthogonal) for use by globalPQDist().
+    // Caller must pre-size lut to mPQ()*256. Requires hasGlobalPQ().
+    float buildGlobalLUT(const std::vector<float>& query, float* lut) const;
+
+    // Approximate squared-L2 distance from the query (whose LUT + q_norm_sq came from
+    // buildGlobalLUT) to node_id, via its global PQ code. One LUT scores any node —
+    // no per-cluster LUT rebuild. Requires hasGlobalPQ().
+    float globalPQDist(uint32_t node_id, const float* lut, float q_norm_sq) const;
+
     // Accessors for raw fp16 vectors and dimension (used by standalone benchmarks).
     // Elements are fp16-packed; decode with NGT::NGTAQ::fp16_to_float.
     const uint16_t* rawFlat() const { return raw_flat_.empty() ? nullptr : raw_flat_.data(); }
@@ -171,6 +187,13 @@ private:
     std::vector<float>                        tier2_codebook_;   // [M][K][D_sub] = row-major (original layout)
     std::vector<float>                        tier2_codebook_T_; // [M][D_sub][K] = transposed (for fast AVX2 LUT build)
     std::vector<uint32_t>                     v2_entry_points_;
+
+    // ---- Stage A: GLOBAL PQ tier (one codebook over all rotated vectors) ----
+    bool                                      has_global_pq_ = false;
+    std::vector<float>   global_pq_codebook_;    // [M_PQ][256][D_sub] row-major (trained on rotated vectors)
+    std::vector<float>   global_pq_codebook_T_;  // [M_PQ][D_sub][256] transposed (fast LUT build)
+    std::vector<uint8_t> global_codes_;          // [N*M_PQ] per-vector global PQ codes
+    std::vector<float>   global_pq_norm_sq_;     // [N] ||reconstructed rotated PQ vector||^2 per node
 
     // Lazy-built inverted list + cluster neighbor table for cluster-aware seeding.
     // Built once on first searchV2 call; unique_ptr keeps NGTAQIndex movable (once_flag is non-movable).
