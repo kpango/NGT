@@ -28,6 +28,12 @@ if( ${UNIX} )
 	# NGTAQ requires C++17 (shared_mutex, unordered_dense, etc.)
 	target_compile_features(ngt PRIVATE cxx_std_17)
 	target_compile_features(ngtstatic PRIVATE cxx_std_17)
+	# Diagnostic: -DAQ_PROFILE=ON compiles searchV2 per-region timers (AQIndex.cpp)
+	# into the ngt library. Off by default; normal builds are unaffected.
+	if(AQ_PROFILE)
+		target_compile_definitions(ngt PRIVATE AQ_PROFILE)
+		target_compile_definitions(ngtstatic PRIVATE AQ_PROFILE)
+	endif()
 	add_dependencies(ngt ngtstatic)
         if(NOT DEFINED NGT_QBG_DISABLED OR (NOT ${NGT_QBG_DISABLED}))
 		# Use CMake-resolved BLAS/LAPACK variables set by find_package() in the top-level CMakeLists.

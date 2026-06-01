@@ -71,6 +71,12 @@ if(HDF5_FOUND)
             target_include_directories(${HDF5_SRC} PRIVATE ${HDF5_INCLUDE_DIRS})
             target_link_libraries(${HDF5_SRC} ngt ${HDF5_C_LIBRARIES})
             target_compile_features(${HDF5_SRC} PRIVATE cxx_std_17)
+            # Diagnostic: -DAQ_PROFILE=ON enables searchV2 per-region timers (off by
+            # default; normal builds unaffected). AQ_PROFILE is defined on the ngt lib
+            # (where searchV2 lives) so the #ifdef-gated timers compile in.
+            if(AQ_PROFILE)
+                target_compile_definitions(${HDF5_SRC} PRIVATE AQ_PROFILE)
+            endif()
         endif()
     endforeach()
 else()

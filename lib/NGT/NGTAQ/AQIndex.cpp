@@ -18,6 +18,27 @@
 #include <stdexcept>
 // unordered_set removed: visited tracking uses flat bitvector (see searchV2)
 
+// ---------------------------------------------------------------------------
+// AQ_PROFILE: compile-time-gated per-region timers for searchV2 (diagnostic).
+// Zero effect on normal builds (macros expand to nothing when AQ_PROFILE undefined).
+// Accumulates per-region microseconds into thread_local counters, printed once at
+// thread/process exit to stderr.
+// ---------------------------------------------------------------------------
+#ifdef AQ_PROFILE
+#include <chrono>
+namespace { struct AqProf { double seed=0,dabs=0,refine=0,expand=0,rerank=0,setup=0; long n=0;
+  ~AqProf(){ if(n) fprintf(stderr,
+    "[AQ_PROFILE] n=%ld setup=%.1f seed=%.1f dabs=%.1f refine=%.1f expand=%.1f rerank=%.1f us/query\n",
+    n, setup/n, seed/n, dabs/n, refine/n, expand/n, rerank/n); } };
+  thread_local AqProf g_aqprof; }
+#define AQ_T0() auto _t=std::chrono::steady_clock::now()
+#define AQ_ADD(f) do{auto _e=std::chrono::steady_clock::now(); \
+  g_aqprof.f+=std::chrono::duration<double,std::micro>(_e-_t).count(); _t=_e;}while(0)
+#else
+#define AQ_T0()
+#define AQ_ADD(f)
+#endif
+
 namespace NGTAQ {
 
 // ---------------------------------------------------------------------------
@@ -811,6 +832,8 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
     if (static_cast<int>(query.size()) < prop_.dimension)
         throw std::invalid_argument("searchV2: query dimension mismatch");
 
+    AQ_T0();  // [AQ_PROFILE] start timing the searchV2 body (after early-return guards)
+
     // rerank_factor: widen beam by searching for k_beam candidates, return top k_out.
     // rerank_factor <= 1: standard behavior (k_beam == k).
     // rerank_factor >  1: search k*rerank_factor internally, trim to k at output.
@@ -1024,6 +1047,8 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
                                         tier2_codebook_T_.data(),
                                         t2_lut_tl.data());
 
+    AQ_ADD(setup);  // [AQ_PROFILE] query-encode + ADC-init + initial tier-2 LUT (incl. one-time call_once)
+
     // Cluster-aware seeding: probe top-n_probe nearest clusters with PER-CLUSTER ADC.
     //
     // Root cause of angular data failure (NYTimes-256, GloVe-100):
@@ -1155,6 +1180,8 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
         }
     }
 
+    AQ_ADD(seed);  // [AQ_PROFILE] region (a): cluster-probe seeding + seed enqueue
+
     while (!cand_q.empty()) {
         auto [dist_x, x] = cand_q.top(); cand_q.pop();
 
@@ -1256,6 +1283,8 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
         }
     }
 
+    AQ_ADD(dabs);  // [AQ_PROFILE] region (b): DABS beam-search loop
+
     // Select top candidates by approximate score for exact L2 reranking.
     // BQ ADC noise ~44% causes true NNs to appear at high ADC ranks; k_beam*15 was
     // too aggressive and threw away genuine neighbors.  k_beam*100 keeps a much
@@ -1265,6 +1294,8 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
         std::nth_element(results.begin(), results.begin() + refine_n, results.end());
         results.resize(refine_n);
     }
+
+    AQ_ADD(refine);  // [AQ_PROFILE] region (c): nth_element on results (refine_n = k_beam*100)
 
     // 1-hop expansion from top-EXPAND_N candidates (all metrics).
     // For angular DABS: ANNG edges bridge inter-cluster gaps; expanding top seeds
@@ -1287,6 +1318,8 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
             }
         }
     }
+
+    AQ_ADD(expand);  // [AQ_PROFILE] region (d): EXPAND_N 1-hop expansion
 
     // Exact L2 refinement: l2_sq_avx2 for D=128 ≈ 5ns/vector × 150 = 0.75μs.
     // Store squared distances to avoid redundant sqrts during sort; take sqrt only
@@ -1315,6 +1348,11 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
     final_results.resize(out_n);
     // Now apply sqrt to the top-k distances (deferred from above).
     for (auto& r : final_results) r.distance = std::sqrt(r.distance);
+
+    AQ_ADD(rerank);  // [AQ_PROFILE] region (e): exact-L2 rerank + partial_sort
+#ifdef AQ_PROFILE
+    ++g_aqprof.n;  // count this timed searchV2 call (only reached past early-return guards)
+#endif
     return final_results;
 }
 
