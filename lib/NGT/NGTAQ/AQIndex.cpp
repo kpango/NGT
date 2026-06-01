@@ -1232,6 +1232,30 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
         : std::numeric_limits<size_t>::max();
     size_t n_visits = 0;
 
+    // Bounded-ef candidate frontier (coarse/batch path only). The unbounded min-heap
+    // pushed ~10x more candidates than it ever popped within visit_budget (measured ~556
+    // pushes per 30 visits): every wasted push pays an O(log n) heapify on a heap that
+    // grows to ~500. We cap the LIVE frontier to `ef` entries by tracking the ef-th best
+    // candidate distance in a small max-heap (ef_gate); once the frontier is full, a
+    // candidate worse than the current ef-th best is dropped before it ever enters the
+    // exploration heap. This shrinks the heap (cheaper push/pop) and skips the heapify of
+    // hopeless candidates. ef defaults to a multiple of the visit budget (enough slack
+    // that recall is preserved) and is overridable via AQ_EF for the recall-QPS sweep.
+    static const int ef_env = [] {
+        const char* e = std::getenv("AQ_EF");
+        return e ? std::atoi(e) : 0;
+    }();
+    // ef ≈ the visit budget is the sweet spot: the frontier never usefully holds more
+    // live candidates than nodes we will pop, so capping at ~visit_budget cuts the bulk of
+    // the wasted heapify (~556 pushes -> ~mv) while preserving recall (verified iso-recall
+    // across the curve). Floor at 2*k_beam for tiny budgets. AQ_EF overrides for sweeps.
+    const size_t ef_cap =
+        (ef_env > 0) ? static_cast<size_t>(ef_env)
+        : (max_visits > 0 ? std::max<size_t>(static_cast<size_t>(k_beam) * 2,
+                                             static_cast<size_t>(max_visits))
+                          : std::numeric_limits<size_t>::max());
+    std::priority_queue<float> ef_gate;  // max-heap of the ef best candidate distances
+
     // ADC state cache: skip get_residual + q_norm_sq loop + build_tier1_query on
     // repeated visits to the same cluster.
     // Thread_local flat int8 buffer (ADC_SLOTS × D) + scalar metadata avoids
@@ -1734,12 +1758,15 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
                     if (static_cast<int>(dk_tracker.size()) >= k_beam &&
                         d_u > (1.f + gamma_enq) * d_k)
                         continue;
-                    // No prefetchOffset(u) here: the batch beam pushes ~10x more
-                    // candidates than it pops within visit_budget (measured: ~556 pushes
-                    // for 30 visits at mv=30), so prefetching offsets_[u] on every push is
-                    // mostly wasted memory traffic for nodes never visited. The next
-                    // popped node is already prefetched at the top of the loop
-                    // (prefetchGPQ4(nxt) + prefetchNeighbors(nxt)).
+                    // Bounded-ef frontier: drop candidates that can't enter the ef-best
+                    // live set before the visit budget is exhausted, avoiding their heapify.
+                    if (ef_gate.size() >= ef_cap) {
+                        if (d_u >= ef_gate.top()) continue;  // worse than ef-th best → drop
+                        ef_gate.pop();                       // evict current worst
+                    }
+                    ef_gate.push(d_u);
+                    // No prefetchOffset(u) here: the next popped node is already prefetched
+                    // at the loop top (prefetchGPQ4(nxt) + prefetchNeighbors(nxt)).
                     cand_q.push({d_u, u});
                 }
                 continue;  // neighbor sweep done for x
