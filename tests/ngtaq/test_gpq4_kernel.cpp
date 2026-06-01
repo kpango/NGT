@@ -23,7 +23,7 @@ int main() {
     std::uniform_int_distribution<int> uc(0, 15);
 
     int fails = 0;
-    for (int M : {16, 32, 64, 18 /* odd */}) {
+    for (int M : {16, 32, 64, 128 /* QG-fine D_sub=1 */, 18 /* odd */}) {
         for (int trial = 0; trial < 200; ++trial) {
             // Random float IP table [M*16].
             std::vector<float> ip((size_t)M * 16);
