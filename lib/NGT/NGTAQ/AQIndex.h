@@ -90,10 +90,13 @@ public:
     // ADC search using routeV2(). Requires is_v2_ == true.
     // rerank_factor=0 or 1: standard beam width k (existing behavior).
     // rerank_factor>1: internally searches k*rerank_factor candidates, returns top k.
+    // rerank_factor<0: skip exact rerank entirely; return top-k by approx ADC distance.
+    // max_visits: HNSW ef-style cap on the number of DABS nodes popped/processed.
+    //   0 = unlimited (baseline behavior); >0 bounds the beam loop (primary recall-QPS knob).
     std::vector<SearchResult> searchV2(
         const std::vector<float>& query, int k,
         float gamma_enq = 0.2f, float gamma_term = 0.4f,
-        int rerank_factor = 0) const;
+        int rerank_factor = 0, int max_visits = 0) const;
 
     // Save/load v2 state to directory (separate from v1 state).
     void saveV2(const std::string& dir) const;

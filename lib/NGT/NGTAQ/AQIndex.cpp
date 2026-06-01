@@ -825,7 +825,7 @@ NGTAQIndex NGTAQIndex::fromNGTv2(const std::string& ngt_path, const Property& pr
 std::vector<SearchResult> NGTAQIndex::searchV2(
     const std::vector<float>& query, int k,
     float gamma_enq, float gamma_term,
-    int rerank_factor) const
+    int rerank_factor, int max_visits) const
 {
     if (!is_v2_)
         throw std::runtime_error("searchV2: call fromNGTv2() first");
@@ -969,6 +969,21 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
         t_vis[id >> 6] |= 1ULL << (id & 63);
     };
     float d_k = std::numeric_limits<float>::infinity();
+
+    // Visit-budget cap (HNSW ef-style): bound the number of DABS nodes we pop and
+    // process. Profiling showed the beam loop over-visits nodes (78-94% of query
+    // time), especially for angular data where the loose fast-path gate lets the
+    // queue drain far past the useful frontier. The cap is the primary recall-QPS
+    // knob: smaller → fewer visits → higher QPS at some recall cost.
+    //
+    // max_visits == 0 ⇒ unlimited (baseline behavior preserved exactly: angular
+    // high-recall configs genuinely pop >>6k nodes, so any fixed "generous" default
+    // like 200*k_beam silently clips recall). The knob is therefore strictly opt-in:
+    // pass max_visits > 0 to trade recall for QPS along the curve.
+    const size_t visit_budget = (max_visits > 0)
+        ? static_cast<size_t>(max_visits)
+        : std::numeric_limits<size_t>::max();
+    size_t n_visits = 0;
 
     // ADC state cache: skip get_residual + q_norm_sq loop + build_tier1_query on
     // repeated visits to the same cluster.
@@ -1183,6 +1198,11 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
     AQ_ADD(seed);  // [AQ_PROFILE] region (a): cluster-probe seeding + seed enqueue
 
     while (!cand_q.empty()) {
+        // Visit-budget cap: bound total processed nodes (primary recall-QPS knob).
+        // Checked before popping so the budget caps committed work regardless of
+        // how many far/tombstone nodes are skipped below.
+        if (n_visits >= visit_budget) break;
+
         auto [dist_x, x] = cand_q.top(); cand_q.pop();
 
         // Skip tombstoned (hole) nodes: zero-norm train vectors excluded during
@@ -1235,6 +1255,10 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
         maybe_rebuild_adc(rec_x.centroid_id());
         float d_approx = adc_dist(rec_x);
 
+        // Count this as a processed visit (it passed all termination gates and we
+        // are about to do its neighbor sweep — the expensive part the cap bounds).
+        ++n_visits;
+
         // Add ALL popped candidates to results for exact reranking.
         // We only use d_k for ROUTING termination, not for result filtering.
         results.push_back({d_approx, x});
@@ -1256,16 +1280,36 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
         for (size_t pf = 0; pf < std::min((size_t)PFDIST, n_nbrs); ++pf)
             graph_->prefetchRecord(neighbors[pf]);
 
+        // Pass 1: filter (tombstone/visited/OOB) + mark visited + read centroid_id.
+        // We bucket the surviving neighbors by centroid_id so maybe_rebuild_adc fires
+        // once per DISTINCT cluster instead of once per neighbor (QBG memoizes one LUT
+        // per subspace; QuantizedBlobGraph.h:1292-1298). The 8-slot ADC LRU thrashes
+        // when neighbors interleave clusters; sorting makes each cluster's run
+        // contiguous, so a node touching c clusters pays c rebuilds, not n_nbrs.
+        // Correctness: each neighbor is still scored under ITS OWN cluster's ADC state.
+        struct NbrCand { uint32_t cid; uint32_t id; };
+        static thread_local std::vector<NbrCand> nbr_buf_tl;
+        nbr_buf_tl.clear();
+        if (nbr_buf_tl.capacity() < n_nbrs) nbr_buf_tl.reserve(n_nbrs);
         for (size_t ni = 0; ni < n_nbrs; ++ni) {
             if (ni + PFDIST < n_nbrs)
                 graph_->prefetchRecord(neighbors[ni + PFDIST]);
-
             uint32_t u = neighbors[ni];
             if (u >= N || graph_->isTombstone(u)) continue;
             if (is_visited(u)) continue;
             mark_visited(u);
+            nbr_buf_tl.push_back({graph_->getRecordConstView(u).centroid_id(), u});
+        }
+        // Sort by cluster id → contiguous per-cluster runs (small n_nbrs, ~20-64).
+        std::sort(nbr_buf_tl.begin(), nbr_buf_tl.end(),
+                  [](const NbrCand& a, const NbrCand& b){ return a.cid < b.cid; });
+
+        // Pass 2: score each neighbor under its own cluster's ADC. maybe_rebuild_adc
+        // self-skips when cid == active_cid, so contiguous runs cost one rebuild each.
+        for (const auto& nc : nbr_buf_tl) {
+            uint32_t u = nc.id;
             auto rec_u = graph_->getRecordConstView(u);
-            maybe_rebuild_adc(rec_u.centroid_id());
+            maybe_rebuild_adc(nc.cid);
             float d_u = adc_dist(rec_u);
             // Skip hopeless candidates: when d_k is initialized, a node with
             // d_u > (1+gamma)*d_k would trigger the outer-loop termination as
@@ -1285,25 +1329,63 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
 
     AQ_ADD(dabs);  // [AQ_PROFILE] region (b): DABS beam-search loop
 
+    // Skip-rerank fast path (rerank_factor < 0): return top-k by approximate ADC
+    // distance, no exact L2 refinement. Cheap low-recall path (QBG/QG essence:
+    // trust the quantized distance when recall budget is tight).
+    if (rerank_factor < 0) {
+        const size_t out_n = std::min(static_cast<size_t>(k_out), results.size());
+        std::partial_sort(results.begin(), results.begin() + out_n, results.end());
+        std::vector<SearchResult> approx_results;
+        approx_results.reserve(out_n);
+        for (size_t i = 0; i < out_n; ++i) {
+            uint32_t id = results[i].second;
+            if (graph_->isTombstone(id)) continue;
+            approx_results.push_back({id, results[i].first, results[i].first});
+        }
+        AQ_ADD(refine);
+        AQ_ADD(expand);
+        AQ_ADD(rerank);
+#ifdef AQ_PROFILE
+        ++g_aqprof.n;
+#endif
+        return approx_results;
+    }
+
     // Select top candidates by approximate score for exact L2 reranking.
-    // BQ ADC noise ~44% causes true NNs to appear at high ADC ranks; k_beam*15 was
-    // too aggressive and threw away genuine neighbors.  k_beam*100 keeps a much
-    // wider ADC window so true NNs survive to the exact-distance stage.
-    const size_t refine_n = static_cast<size_t>(k_beam * 100);
+    // Bounded rerank window (QBG/QG essence): a multiple of the beam width is enough
+    // — the old k_beam*100 reranked far more than needed and rerank is <7% of query
+    // time, so shrinking it is ~free on QPS.
+    //   L2:      k_beam*15 sits at the knee — iso-recall while well-bounded.
+    //   Angular: true NNs are scattered much wider by BQ ADC noise (unit vectors have
+    //            no magnitude separation), so a tight window drops genuine neighbors
+    //            before exact rerank (k_beam*15 cost GloVe gt=0.90 ~4.5 recall pts).
+    //            Keep the original k_beam*100; rerank is only ~3% of angular query
+    //            time so this is still effectively free, and recall == baseline.
+    // Env override AQ_REFINE_MULT (read once) for sweeping the rerank window.
+    static const int refine_mult_env = [] {
+        const char* e = std::getenv("AQ_REFINE_MULT");
+        return e ? std::atoi(e) : 0;
+    }();
+    const size_t refine_mult = (refine_mult_env > 0)
+        ? static_cast<size_t>(refine_mult_env)
+        : (is_angular_ ? (size_t)100 : (size_t)15);
+    const size_t refine_n = std::max<size_t>(
+        static_cast<size_t>(k_beam) * refine_mult,
+        static_cast<size_t>(k_out) * static_cast<size_t>(rerank_factor > 0 ? rerank_factor : 1));
     if (results.size() > refine_n) {
         std::nth_element(results.begin(), results.begin() + refine_n, results.end());
         results.resize(refine_n);
     }
 
-    AQ_ADD(refine);  // [AQ_PROFILE] region (c): nth_element on results (refine_n = k_beam*100)
+    AQ_ADD(refine);  // [AQ_PROFILE] region (c): nth_element (refine_n = k_beam * {15 L2, 100 angular})
 
-    // 1-hop expansion from top-EXPAND_N candidates (all metrics).
-    // For angular DABS: ANNG edges bridge inter-cluster gaps; expanding top seeds
-    // finds true NNs in neighboring clusters not reached by beam search.
-    // EXPAND_N raised from 20→200: covers secondary cluster seeds whose true NNs
-    // are reachable 2 hops away from any of the top-200 ADC candidates.
+    // 1-hop expansion from top-EXPAND_N candidates.
+    // Angular DABS only: ANNG edges bridge inter-cluster gaps; expanding top seeds
+    // finds true NNs in neighboring clusters not reached by beam search. For L2 the
+    // beam already covers the local frontier (magnitude diversity keeps true NNs in
+    // the primary cluster), so expansion is wasted work → disabled (EXPAND_N=0).
     {
-        constexpr size_t EXPAND_N = 200;
+        const size_t EXPAND_N = is_angular_ ? 200 : 0;
         const size_t expand_from = std::min(EXPAND_N, results.size());
         for (size_t ei = 0; ei < expand_from; ++ei) {
             uint32_t node = results[ei].second;

@@ -1,7 +1,7 @@
 // tests/ngtaq/ann_bench.cpp
 // Unified ANN-Benchmarks benchmark for NGTAQv2.
 // Usage: ann_bench <aq_index_dir> <hdf5_path> [k=10] [gamma_enq=0.20] [gamma_term=0.40]
-//                  [rerank_factor=3] [n_threads=4] [n_probe=0]
+//                  [rerank_factor=3] [n_threads=4] [n_probe=0] [max_visits=0]
 //
 // Queries are zero-padded to D_eff (same as training).
 // Angular/Cosine: queries are L2-normalized before search (handled inside searchV2).
@@ -28,7 +28,8 @@ int main(int argc, char** argv) {
     if (argc < 3) {
         fprintf(stderr,
             "Usage: %s <aq_index_dir> <hdf5_path> [k=10] [gamma_enq=0.20]"
-            " [gamma_term=0.40] [rerank_factor=3] [n_threads=4] [n_probe=0]\n",
+            " [gamma_term=0.40] [rerank_factor=3] [n_threads=4] [n_probe=0]"
+            " [max_visits=0]\n",
             argv[0]);
         return 1;
     }
@@ -40,6 +41,7 @@ int main(int argc, char** argv) {
     int   rerank_factor = (argc > 6) ? std::stoi(argv[6]) : 3;
     int   n_threads     = (argc > 7) ? std::stoi(argv[7]) : 4;
     int   n_probe       = (argc > 8) ? std::stoi(argv[8]) : 0;
+    int   max_visits    = (argc > 9) ? std::stoi(argv[9]) : 0;
 
     // Load AQv2 index
     fprintf(stderr, "[Load] AQv2 from: %s\n", idx_dir);
@@ -68,7 +70,7 @@ int main(int argc, char** argv) {
     // Warmup
     const int WARMUP = std::min(200, nq);
     for (int qi = 0; qi < WARMUP; ++qi)
-        idx.searchV2(queries[qi % nq], k, gamma_enq, gamma_term, rerank_factor);
+        idx.searchV2(queries[qi % nq], k, gamma_enq, gamma_term, rerank_factor, max_visits);
 
     // Parallel benchmark
     std::vector<std::vector<int>>  results(nq);
@@ -84,7 +86,7 @@ int main(int argc, char** argv) {
                 int qi = next_qi.fetch_add(1, std::memory_order_relaxed);
                 if (qi >= nq) break;
                 const double t0 = now_us();
-                auto sr = idx.searchV2(queries[qi], k, gamma_enq, gamma_term, rerank_factor);
+                auto sr = idx.searchV2(queries[qi], k, gamma_enq, gamma_term, rerank_factor, max_visits);
                 const double t1 = now_us();
                 latencies[qi] = t1 - t0;
                 results[qi].resize(sr.size());
@@ -107,8 +109,8 @@ int main(int argc, char** argv) {
     printf("=== ANN-Benchmarks Result ===\n");
     printf("Index   : %s\n", idx_dir);
     printf("Dataset : %s  nq=%d  D=%d  D_eff=%d\n", hdf5_path, nq, D, D_eff);
-    printf("Config  : k=%d  gamma_enq=%.3f  gamma_term=%.3f  rerank_factor=%d  threads=%d  n_probe=%d\n",
-        k, gamma_enq, gamma_term, rerank_factor, n_threads, n_probe);
+    printf("Config  : k=%d  gamma_enq=%.3f  gamma_term=%.3f  rerank_factor=%d  threads=%d  n_probe=%d  max_visits=%d\n",
+        k, gamma_enq, gamma_term, rerank_factor, n_threads, n_probe, max_visits);
     printf("recall@%d  = %.4f%s\n", k, recall, recall >= 0.99 ? "  *** >=0.99 ***" : "");
     printf("agg_QPS   = %.0f\n", qps);
     printf("P50(us)   = %.1f\n", p50);
