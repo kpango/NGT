@@ -1639,6 +1639,15 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
                 graph_->prefetchGPQ4(x);
                 const size_t blk_bytes = graph_->gpq4BlockBytes();
                 static thread_local std::vector<float> block_ip_tl;
+                // Prefetch the per-neighbor reconstructed-norm gather targets BEFORE the
+                // vpshufb pass. nsq lives in gpq4_norm_sq_ (N floats = 4MB), accessed
+                // randomly by neighbor id → a near-guaranteed cache miss on the critical
+                // path of every scored neighbor. Issuing the loads up front lets the
+                // block-IP shuffle below hide their DRAM latency.
+                for (size_t ni = 0; ni < n_nbrs; ++ni) {
+                    uint32_t u = neighbors[ni];
+                    if (u < N) __builtin_prefetch(&gpq4_norm_sq_[u], 0, 1);
+                }
                 block_ip_tl.resize((size_t)nblk * 16);
                 for (uint32_t b = 0; b < nblk; ++b)
                     NGT::NGTAQ::gpq4_batch_ip(blocks + (size_t)b * blk_bytes,
