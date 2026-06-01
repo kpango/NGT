@@ -63,6 +63,8 @@ if(HDF5_FOUND)
         build_ngtaqv2_ann
         build_ngt_ann
         diag_ids
+        diag_batch_dist
+        diag_route_rank
         qg_build
         qg_bench
         qbg_build

@@ -1611,24 +1611,23 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
             if (blocks && nblk > 0) {
                 graph_->prefetchGPQ4(x);
                 const size_t blk_bytes = graph_->gpq4BlockBytes();
-                const int planes = (graph_->gpq4M() + 1) / 2;
                 static thread_local std::vector<float> block_ip_tl;
                 block_ip_tl.resize((size_t)nblk * 16);
                 for (uint32_t b = 0; b < nblk; ++b)
                     NGT::NGTAQ::gpq4_batch_ip(blocks + (size_t)b * blk_bytes,
                                               batch_lut_tl, block_ip_tl.data() + (size_t)b * 16);
-                const float* normp_base = nullptr;  // per-block, recomputed below
                 for (size_t ni = 0; ni < n_nbrs; ++ni) {
                     uint32_t u = neighbors[ni];
                     if (u >= N || graph_->isTombstone(u)) continue;
                     if (is_visited(u)) continue;
                     mark_visited(u);
                     const uint32_t b = (uint32_t)(ni / 16), pos = (uint32_t)(ni % 16);
-                    const uint8_t* blkp = blocks + (size_t)b * blk_bytes;
-                    const uint16_t* normp =
-                        reinterpret_cast<const uint16_t*>(blkp + (size_t)planes * 16);
                     float ip   = block_ip_tl[(size_t)b * 16 + pos];
-                    float nsq  = NGT::NGTAQ::fp16_to_float(normp[pos]);
+                    // Per-neighbor reconstructed-norm^2: the block's fp16 norm OVERFLOWS
+                    // (SIFT recon norms ~2e5 >> fp16 max 65504 → +inf → every neighbor
+                    // pruned → beam never expands → recall collapse). Read the exact
+                    // float norm from gpq4_norm_sq_ instead (single cheap gather).
+                    float nsq  = gpq4_norm_sq_[u];
                     float d_u  = q_ns_batch + nsq - 2.0f * ip;
                     if (static_cast<int>(dk_tracker.size()) >= k_beam &&
                         d_u > (1.f + gamma_enq) * d_k)
@@ -1636,7 +1635,6 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
                     cand_q.push({d_u, u});
                     graph_->prefetchOffset(u);
                 }
-                (void)normp_base;
                 continue;  // neighbor sweep done for x
             }
             // No block store for x (shouldn't happen for an active node) → fall through
