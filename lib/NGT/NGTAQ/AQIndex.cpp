@@ -1659,8 +1659,13 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
                     if (static_cast<int>(dk_tracker.size()) >= k_beam &&
                         d_u > (1.f + gamma_enq) * d_k)
                         continue;
+                    // No prefetchOffset(u) here: the batch beam pushes ~10x more
+                    // candidates than it pops within visit_budget (measured: ~556 pushes
+                    // for 30 visits at mv=30), so prefetching offsets_[u] on every push is
+                    // mostly wasted memory traffic for nodes never visited. The next
+                    // popped node is already prefetched at the top of the loop
+                    // (prefetchGPQ4(nxt) + prefetchNeighbors(nxt)).
                     cand_q.push({d_u, u});
-                    graph_->prefetchOffset(u);
                 }
                 continue;  // neighbor sweep done for x
             }
