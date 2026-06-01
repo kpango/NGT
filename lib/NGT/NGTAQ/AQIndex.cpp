@@ -1172,6 +1172,31 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
                                         tier2_codebook_T_.data(),
                                         t2_lut_tl.data());
 
+    // Stage C-lite: GLOBAL-PQ routing. Build ONE LUT per query (good for ANY node)
+    // so the DABS loop never rebuilds a per-cluster ADC table — the per-neighbor
+    // maybe_rebuild_adc that dominated the loop (78-94% of query time) is eliminated.
+    // route_dist(id) returns an approx sq-L2 via the node's global PQ code; the d_k
+    // tracker, enqueue gate (gamma_enq) and termination gate (gamma_term) all use this
+    // single consistent metric. fp16 exact rerank below still recovers true k-NN.
+    // AQ_NO_GLOBAL=1 forces the legacy per-cluster ADC path even when the index has a
+    // global PQ tier — an A/B kill-switch for measuring the Stage C-lite speedup on the
+    // SAME index/config. Default (unset): route on global PQ when available.
+    static const bool no_global_env = [] {
+        const char* e = std::getenv("AQ_NO_GLOBAL");
+        return e && std::atoi(e) != 0;
+    }();
+    const bool use_global_pq = has_global_pq_ && !no_global_env;
+
+    static thread_local std::vector<float> global_lut_tl;
+    float q_ns_global = 0.f;
+    if (use_global_pq) {
+        global_lut_tl.resize(static_cast<size_t>(M_PQ) * 256);
+        q_ns_global = buildGlobalLUT(query, global_lut_tl.data());
+    }
+    auto route_dist = [&](uint32_t id) -> float {
+        return globalPQDist(id, global_lut_tl.data(), q_ns_global);
+    };
+
     AQ_ADD(setup);  // [AQ_PROFILE] query-encode + ADC-init + initial tier-2 LUT (incl. one-time call_once)
 
     // Cluster-aware seeding: probe top-n_probe nearest clusters with PER-CLUSTER ADC.
@@ -1226,7 +1251,10 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
             // Angular: rebuild ADC + tier-2 LUT per cluster for accurate cross-cluster scoring.
             // L2: initial-cluster LUT is accurate (magnitude diversity makes cross-cluster
             //     residual error negligible for seeding); skip expensive per-cluster rebuild.
-            if (is_angular_) {
+            // Global-PQ: skip the per-cluster rebuild entirely — score with the single
+            //     global LUT (route_dist) so seeds are ranked by the SAME metric the DABS
+            //     loop uses, giving a consistent d_k initialization.
+            if (is_angular_ && !use_global_pq) {
                 maybe_rebuild_adc(cid_p);
                 NGT::NGTAQ::build_tier2_lut_fast_m(q_res_tl.data(), M_PQ,
                                                     tier2_codebook_T_.data(),
@@ -1246,10 +1274,15 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
             for (size_t mi = 0; mi < take; ++mi) {
                 uint32_t ep = members[mi];
                 if (ep >= N || graph_->isTombstone(ep)) continue;
-                auto rec = graph_->getRecordConstView(ep);
-                float norm_x = NGT::NGTAQ::fp16_to_float(rec.norm_fp16());
-                float t2_ip  = NGT::NGTAQ::tier2_adc_pq_m(lut_p, rec.tier2(), M_PQ);
-                float d_approx = q_ns + norm_x * norm_x - 2.0f * t2_ip;
+                float d_approx;
+                if (use_global_pq) {
+                    d_approx = route_dist(ep);
+                } else {
+                    auto rec = graph_->getRecordConstView(ep);
+                    float norm_x = NGT::NGTAQ::fp16_to_float(rec.norm_fp16());
+                    float t2_ip  = NGT::NGTAQ::tier2_adc_pq_m(lut_p, rec.tier2(), M_PQ);
+                    d_approx = q_ns + norm_x * norm_x - 2.0f * t2_ip;
+                }
                 scored.push_back({d_approx, ep});
             }
         }
@@ -1286,9 +1319,14 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
             for (const auto& s : scored) {
                 if (is_visited(s.id)) continue;
                 mark_visited(s.id);
-                auto rec = graph_->getRecordConstView(s.id);
-                maybe_rebuild_adc(rec.centroid_id());
-                float d = adc_dist(rec);
+                float d;
+                if (use_global_pq) {
+                    d = route_dist(s.id);
+                } else {
+                    auto rec = graph_->getRecordConstView(s.id);
+                    maybe_rebuild_adc(rec.centroid_id());
+                    d = adc_dist(rec);
+                }
                 cand_q.push({d, s.id});
                 graph_->prefetchOffset(s.id);
             }
@@ -1296,7 +1334,8 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
             // Angular only: restore t2_lut_tl and ADC to initial cluster.
             // The DABS termination gate (two-gate tier-2 check) uses t2_lut_tl with the
             // initial-cluster residual. L2 never rebuilt LUT/ADC during seeding → no restore.
-            if (is_angular_) {
+            // Global-PQ never touched per-cluster ADC/LUT during seeding → no restore.
+            if (is_angular_ && !use_global_pq) {
                 NGT::NGTAQ::build_tier2_lut_fast_m(q_res_init_tl.data(), M_PQ,
                                                     tier2_codebook_T_.data(),
                                                     t2_lut_tl.data());
@@ -1351,7 +1390,9 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
         // on tier-1 with a suitably large gamma_term (≥0.50 recommended for angular).
         if (dk_tracker.size() >= static_cast<size_t>(k_beam) &&
             dist_x > (1.f + gamma_term) * d_k) {
-            if (!is_angular_) {
+            if (use_global_pq) {
+                break;  // global-PQ: dist_x and d_k share one metric → single gate, no 2-gate
+            } else if (!is_angular_) {
                 float nx2  = NGT::NGTAQ::fp16_to_float(rec_x.norm_fp16());
                 float t2ip = NGT::NGTAQ::tier2_adc_pq_m(t2_lut_tl.data(), rec_x.tier2(), M_PQ);
                 float d_t2 = q_norm_sq_initial + nx2 * nx2 - 2.0f * t2ip;
@@ -1362,8 +1403,13 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
             }
         }
 
-        maybe_rebuild_adc(rec_x.centroid_id());
-        float d_approx = adc_dist(rec_x);
+        float d_approx;
+        if (use_global_pq) {
+            d_approx = route_dist(x);
+        } else {
+            maybe_rebuild_adc(rec_x.centroid_id());
+            d_approx = adc_dist(rec_x);
+        }
 
         // Count this as a processed visit (it passed all termination gates and we
         // are about to do its neighbor sweep — the expensive part the cap bounds).
@@ -1408,19 +1454,31 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
             if (u >= N || graph_->isTombstone(u)) continue;
             if (is_visited(u)) continue;
             mark_visited(u);
-            nbr_buf_tl.push_back({graph_->getRecordConstView(u).centroid_id(), u});
+            // Global-PQ scores any node with one LUT (no per-cluster ADC), so the
+            // centroid_id read (a record-view touch) and the cluster sort below are
+            // both unnecessary — store a dummy cid and skip the sort.
+            uint32_t cid_u = use_global_pq ? 0u
+                                            : graph_->getRecordConstView(u).centroid_id();
+            nbr_buf_tl.push_back({cid_u, u});
         }
         // Sort by cluster id → contiguous per-cluster runs (small n_nbrs, ~20-64).
-        std::sort(nbr_buf_tl.begin(), nbr_buf_tl.end(),
-                  [](const NbrCand& a, const NbrCand& b){ return a.cid < b.cid; });
+        // Global-PQ needs no per-cluster batching, so the sort is pure overhead → skip.
+        if (!use_global_pq)
+            std::sort(nbr_buf_tl.begin(), nbr_buf_tl.end(),
+                      [](const NbrCand& a, const NbrCand& b){ return a.cid < b.cid; });
 
         // Pass 2: score each neighbor under its own cluster's ADC. maybe_rebuild_adc
         // self-skips when cid == active_cid, so contiguous runs cost one rebuild each.
         for (const auto& nc : nbr_buf_tl) {
             uint32_t u = nc.id;
-            auto rec_u = graph_->getRecordConstView(u);
-            maybe_rebuild_adc(nc.cid);
-            float d_u = adc_dist(rec_u);
+            float d_u;
+            if (use_global_pq) {
+                d_u = route_dist(u);
+            } else {
+                auto rec_u = graph_->getRecordConstView(u);
+                maybe_rebuild_adc(nc.cid);
+                d_u = adc_dist(rec_u);
+            }
             // Skip hopeless candidates: when d_k is initialized, a node with
             // d_u > (1+gamma)*d_k would trigger the outer-loop termination as
             // soon as it's popped — it can never contribute to the top-k result.
@@ -1479,8 +1537,13 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
     const size_t refine_mult = (refine_mult_env > 0)
         ? static_cast<size_t>(refine_mult_env)
         : (is_angular_ ? (size_t)100 : (size_t)15);
+    // Global-PQ routing is slightly looser than per-cluster tier-2 (Stage A: exact
+    // top-10 sit within global-PQ top-200=92.8%, top-500=98.2%, top-1000=99.4%), so the
+    // exact-rerank pool needs a wide floor (~1000) to recover true k-NN. AQ_REFINE_MULT
+    // still drives it higher when set (k_beam*mult overrides the floor when larger).
+    const size_t refine_floor = use_global_pq ? (size_t)1000 : (size_t)0;
     const size_t refine_n = std::max<size_t>(
-        static_cast<size_t>(k_beam) * refine_mult,
+        std::max<size_t>(static_cast<size_t>(k_beam) * refine_mult, refine_floor),
         static_cast<size_t>(k_out) * static_cast<size_t>(rerank_factor > 0 ? rerank_factor : 1));
     if (results.size() > refine_n) {
         std::nth_element(results.begin(), results.begin() + refine_n, results.end());
@@ -1503,9 +1566,14 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
                 if (u >= static_cast<uint32_t>(N) || graph_->isTombstone(u)) continue;
                 if (is_visited(u)) continue;
                 mark_visited(u);
-                auto rec_u = graph_->getRecordConstView(u);
-                maybe_rebuild_adc(rec_u.centroid_id());
-                float d_u = adc_dist(rec_u);
+                float d_u;
+                if (use_global_pq) {
+                    d_u = route_dist(u);
+                } else {
+                    auto rec_u = graph_->getRecordConstView(u);
+                    maybe_rebuild_adc(rec_u.centroid_id());
+                    d_u = adc_dist(rec_u);
+                }
                 results.push_back({d_u, u});
             }
         }
