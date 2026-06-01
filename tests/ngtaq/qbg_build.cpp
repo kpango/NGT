@@ -71,6 +71,18 @@ int main(int argc, char** argv) {
     // ── Step 3: Create QBG index skeleton ────────────────────────────────
     QBG::BuildParameters bp;
     bp.creation.genuineDimension   = static_cast<size_t>(D);
+    // QBG's global codebook ObjectSpace pads the working dimension up to a
+    // multiple of 16 (getPaddedDimension()), but the genuine object list stores
+    // vectors at genuineDimension. If genuineDimension is not already 16-aligned
+    // (e.g. GloVe D=100 -> padded 112), Phase 3 residual generation compares the
+    // unpadded object (100) against the padded codebook dim (112) and throws
+    // "The dimensionalities are inconsitent. 100:112". The official `qbg create`
+    // CLI avoids this by setting the working `dimension` to the 16-aligned value
+    // while keeping genuineDimension at the true data dim (QbgCli.cpp:158-162).
+    // 16-aligned datasets (SIFT 128, NYTimes 256, GIST 960, FashionMNIST 784)
+    // worked only by coincidence; replicate the CLI's padding here so non-aligned
+    // dims (GloVe 100) build correctly too.
+    bp.creation.dimension          = ((static_cast<size_t>(D) + 15) / 16) * 16;
     bp.creation.dimensionOfSubvector = static_cast<size_t>(D_sub);
     bp.creation.distanceType       = NGTQ::DistanceType::DistanceTypeL2;
     bp.creation.dataType           = NGTQ::DataTypeFloat;

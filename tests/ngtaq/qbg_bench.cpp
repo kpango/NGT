@@ -60,23 +60,41 @@ static int ges_for(int probes) {
 //      top-k pool on SIFT) and sweep probes to trace a clean recall->QPS curve up
 //      to ~0.999. A couple of larger result_expansion points at the high end show
 //      the (small) extra recall available from a deeper rerank pool.
-static std::vector<OpPoint> build_sweep() {
+// max_probes caps numOfProbes at the number of global blobs in the index.
+// Requesting more probes than blobs forces the blob-graph search to return
+// (nearly) every blob; once size approaches the graph size the NGT search
+// returns a degenerate, lower-quality ordering, so recall stops improving and
+// can even decline -- a non-monotone tail unrelated to candidate quality. This
+// matters for small-blob indices (e.g. NYTimes-256 has only ~290 blobs for 290K
+// vectors at the default maxSize=1000), whereas GloVe (1183 blobs) never hits
+// the cap within the sweep. Capping keeps the curve monotone to the index's
+// real recall ceiling and avoids the misleading over-probed regime.
+static std::vector<OpPoint> build_sweep(int max_probes) {
     std::vector<OpPoint> pts;
+    int last_capped = -1;  // dedup probe points collapsed onto the cap
+    auto add = [&](int p, float re) {
+        int cp = (p > max_probes) ? max_probes : p;
+        // Skip a point only when it duplicates the previous capped value at the
+        // same regime (avoids repeated identical rows at the cap).
+        if (cp == last_capped && re == pts.back().result_expansion) return;
+        pts.push_back({cp, ges_for(cp), re});
+        if (cp != p) last_capped = cp; else last_capped = -1;
+    };
 
     // 1) PQ-only ceiling (no refinement) -- the high-QPS / low-recall regime.
     static const int PQ_PROBES[] = {1, 2, 3, 5, 10, 20, 50, 100};
-    for (int p : PQ_PROBES)
-        pts.push_back({p, ges_for(p), 0.0f});
+    for (int p : PQ_PROBES) add(p, 0.0f);
 
     // 2) Refinement-reranked curve at a fixed result_expansion: clean monotone
-    //    recall up to ~0.999.
+    //    recall up to the index's ceiling.
+    last_capped = -1;
     static const int RE_PROBES[] = {2, 4, 8, 16, 32, 48, 64, 96, 128, 192, 256};
-    for (int p : RE_PROBES)
-        pts.push_back({p, ges_for(p), 2.0f});
+    for (int p : RE_PROBES) add(p, 2.0f);
 
     // 3) Deeper-rerank points at the high-recall end (diminishing returns).
-    pts.push_back({128, ges_for(128), 5.0f});
-    pts.push_back({256, ges_for(256), 5.0f});
+    last_capped = -1;
+    add(128, 5.0f);
+    add(256, 5.0f);
 
     return pts;
 }
@@ -143,7 +161,13 @@ int main(int argc, char** argv) {
         }
     }
 
-    const std::vector<OpPoint> sweep = build_sweep();
+    // Cap numOfProbes at the number of global blobs (repository is 1-based, so
+    // subtract 1). Over-probing past the blob count yields a degenerate,
+    // non-monotone recall tail (see build_sweep).
+    const size_t repoSize  = index.getQuantizer().globalCodebookIndex.getObjectRepositorySize();
+    const int    numBlobs  = repoSize > 1 ? (int)(repoSize - 1) : (int)repoSize;
+    fprintf(stderr, "  global blobs=%d (numOfProbes capped at this)\n", numBlobs);
+    const std::vector<OpPoint> sweep = build_sweep(numBlobs);
 
     for (const OpPoint& op : sweep) {
         const int   probes = op.probes;
