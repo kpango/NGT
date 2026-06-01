@@ -1,0 +1,10 @@
+# gist-960-euclidean (1T)  NGTAQ_maxrecall=0.9981  (pts: ngtaq=12 qbg=21 qg=39)
+ recall |    NGTAQ |      QBG |       QG |  vs max | verdict
+----------------------------------------------------------------
+   0.50 |      701 |     1088 |     9446 |   0.07x | LOSS
+   0.70 |      701 |      601 |     1648 |   0.43x | LOSS
+   0.80 |      440 |      314 |      N/A |   1.40x | win<2x
+   0.85 |      440 |      314 |      N/A |   1.40x | win<2x
+   0.90 |      206 |      220 |      N/A |   0.94x | LOSS
+   0.95 |      206 |       89 |      N/A |   2.31x | PASS>=2x
+   0.99 |       54 |      N/A |      N/A |     N/A | N/A
