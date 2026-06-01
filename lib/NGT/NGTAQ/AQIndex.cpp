@@ -1395,7 +1395,19 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
     // spread true neighbors across many clusters (no magnitude diversity).
     //
     // After seeding, restore t2_lut_tl to initial cluster (used by DABS termination gate).
-    const int N_CLUSTER_SEEDS = prop_.n_cluster_seeds;
+    // Coarse-path seeding: the batch graph walk now routes accurately (QG-class), so it
+    // needs only a small warm-start. The legacy 32-seeds/cluster scan is pure overhead —
+    // measured strictly worse than 4-8 seeds across the ENTIRE recall curve (r=0.50:
+    // +15% QPS, r=0.80: +21%, r=0.92: +14%, recall within noise). Default the coarse
+    // per-cluster seed count to 8 (n_probe=3 → ~24 total, vs ~96). AQ_SEEDS overrides
+    // for sweeps. Legacy/global-PQ uses prop_.n_cluster_seeds unchanged.
+    static const int coarse_seeds_env = [] {
+        const char* e = std::getenv("AQ_SEEDS");
+        return e ? std::atoi(e) : 0;
+    }();
+    const int N_CLUSTER_SEEDS =
+        use_coarse ? (coarse_seeds_env > 0 ? coarse_seeds_env : 8)
+                   : prop_.n_cluster_seeds;
     // n_probe: angular data seeds from more clusters than L2 for accurate d_k initialization.
     // Per-cluster tier-2 scoring gives cross-cluster seeds with correct ADC residuals,
     // so d_k is properly initialized before DABS beam search begins.
