@@ -1061,6 +1061,23 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
     const int M_PQ  = (m_pq_ > 0) ? m_pq_ : 16;
     const int D_orig = (int)query.size();
 
+    // Coarse-routing detection, hoisted ABOVE the per-query setup so we can skip the
+    // tier-1 ADC encode + tier-2 LUT build that the batch/global-PQ path never uses
+    // (all per-cluster ADC scoring is gated behind !use_coarse). Definitions of the
+    // env statics below reuse these. AQ_PROFILE showed setup (~20us) becomes the
+    // dominant fixed cost once dabs is lean, and tier-1/tier-2 encode is its bulk.
+    static const bool use_global_env_e = [] {
+        const char* e = std::getenv("AQ_USE_GLOBAL_ROUTING");
+        return e && std::atoi(e) != 0;
+    }();
+    static const bool use_batch_env_e = [] {
+        const char* e = std::getenv("AQ_BATCH_ROUTING");
+        return e && std::atoi(e) != 0;
+    }();
+    const bool use_batch_e  = hasGPQ4() && use_batch_env_e;
+    const bool use_global_e = (has_global_pq_ && use_global_env_e) && !use_batch_e;
+    const bool use_coarse_e = use_batch_e || use_global_e;
+
     // 0. Angular/Cosine: L2-normalize query (over D_orig dims)
     static thread_local std::vector<float> q_normalized_tl;
     const float* q_src = query.data();
@@ -1105,17 +1122,26 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
     NGT::NGTAQ::ADCQueryState& adc = adc_tl;
     adc.q_norm_sq = 0.f; adc.q_norm = 0.f; adc.q_sum = 0;
     float q_norm_sq = 0.f;
-    NGT::NGTAQ::compute_residual_and_tier1(
-        q_rot_tl.data(), kmeans_v2_->centroid(active_cid), D,
-        q_res_tl.data(), adc.q_norm_sq, adc.q_int8.data(), adc.q_sum);
-    adc.q_norm = std::sqrt(adc.q_norm_sq);
-    q_norm_sq = adc.q_norm_sq;
+    // Coarse routing (batch/global-PQ) scores every node through the single per-query
+    // PQ LUT (gpq4 vpshufb / global LUT); it never touches the per-cluster tier-1 ADC
+    // (adc_dist/maybe_rebuild_adc) nor the tier-2 LUT. So the tier-1 residual encode
+    // here — residual subtract + int8 quantize + norm over D dims — is dead work on the
+    // batch path. Skip it; the centroid was still needed for cluster-seed selection.
+    if (!use_coarse_e) {
+        NGT::NGTAQ::compute_residual_and_tier1(
+            q_rot_tl.data(), kmeans_v2_->centroid(active_cid), D,
+            q_res_tl.data(), adc.q_norm_sq, adc.q_int8.data(), adc.q_sum);
+        adc.q_norm = std::sqrt(adc.q_norm_sq);
+        q_norm_sq = adc.q_norm_sq;
+    }
     const float inv_sqrt_D = 1.f / std::sqrt((float)D);
 
     // Save initial cluster residual for tier-2 LUT build post-routing.
     // maybe_rebuild_adc overwrites q_res/q_norm_sq on cluster transitions.
+    // Coarse path never builds the tier-2 LUT, so skip the residual snapshot copy too.
     const uint32_t initial_cid = active_cid;
-    q_res_init_tl.assign(q_res_tl.begin(), q_res_tl.end());
+    if (!use_coarse_e)
+        q_res_init_tl.assign(q_res_tl.begin(), q_res_tl.end());
     const float q_norm_sq_initial = q_norm_sq;
 
     std::shared_lock<std::shared_mutex> lock(graph_->mutex());
@@ -1215,12 +1241,17 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
     };
     static thread_local std::vector<int8_t> adc_int8_tl;  // ADC_SLOTS * D int8 entries
     static thread_local std::array<ADCSlotMeta, ADC_SLOTS> adc_meta_tl;
-    adc_int8_tl.resize(static_cast<size_t>(ADC_SLOTS) * static_cast<size_t>(D));
-    for (auto& m : adc_meta_tl) m.cid = UINT32_MAX;
-    // Slot 0 = initial cluster (ADC state already computed above)
-    adc_meta_tl[0] = {active_cid, adc.q_norm_sq, adc.q_norm, adc.q_sum};
-    std::memcpy(adc_int8_tl.data(), adc.q_int8.data(), static_cast<size_t>(D));
     int adc_cache_hand = 1;
+    // The 8-slot per-cluster ADC cache is only consulted by maybe_rebuild_adc/adc_dist,
+    // both gated behind !use_coarse. Skip its per-query reset (resize + meta clear +
+    // memcpy of the D-byte tier-1 vector) on the batch/global-PQ path.
+    if (!use_coarse_e) {
+        adc_int8_tl.resize(static_cast<size_t>(ADC_SLOTS) * static_cast<size_t>(D));
+        for (auto& m : adc_meta_tl) m.cid = UINT32_MAX;
+        // Slot 0 = initial cluster (ADC state already computed above)
+        adc_meta_tl[0] = {active_cid, adc.q_norm_sq, adc.q_norm, adc.q_sum};
+        std::memcpy(adc_int8_tl.data(), adc.q_int8.data(), static_cast<size_t>(D));
+    }
 
     // Tier-1 routing: fast RaBitQ ADC for DABS beam search.
     // Tier-2 contributes via seeding (pre-sorts cluster candidates) AND d_k tracking:
@@ -1273,11 +1304,16 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
     // by tier-2 distance. Better seeds → routing converges faster → higher recall at
     // same gamma_term. Cost: 1 LUT build (~0.5μs AVX2) + N_seeds × 10ns ADC.
     // LUT built from q_res_initial (saved before routing modifies q_res).
+    // Coarse routing (batch/global-PQ) never reads t2_lut_tl: seeds are scored via
+    // coarse_dist, and the DABS termination gate uses the single coarse metric (break
+    // on use_coarse). Skip the 256*M_PQ LUT build entirely on the batch path.
     static thread_local std::vector<float> t2_lut_tl;
-    t2_lut_tl.resize(static_cast<size_t>(M_PQ) * 256);
-    NGT::NGTAQ::build_tier2_lut_fast_m(q_res_init_tl.data(), M_PQ,
-                                        tier2_codebook_T_.data(),
-                                        t2_lut_tl.data());
+    if (!use_coarse_e) {
+        t2_lut_tl.resize(static_cast<size_t>(M_PQ) * 256);
+        NGT::NGTAQ::build_tier2_lut_fast_m(q_res_init_tl.data(), M_PQ,
+                                            tier2_codebook_T_.data(),
+                                            t2_lut_tl.data());
+    }
 
     // Stage C-lite: GLOBAL-PQ routing. Build ONE LUT per query (good for ANY node)
     // so the DABS loop never rebuilds a per-cluster ADC table — the per-neighbor
