@@ -742,36 +742,52 @@ NGTAQIndex NGTAQIndex::fromNGTv2(const std::string& ngt_path, const Property& pr
 
     // ---- 7c. GLOBAL PQ-16 tier (Stage B/C): K=16 (4-bit) codebook over rotated vectors ----
     // REQUIRED for the QG-style vpshufb batch kernel (single _mm256_shuffle_epi8 = 16-entry
-    // lookup). Same training shape as the K=256 global PQ but K=16; per-node 4-bit codes +
-    // reconstructed-norm^2 feed the SoAGraph contiguous neighbor-code store (built below).
-    std::vector<float> gpq4_cb((size_t)M_PQ * NGT::NGTAQ::GPQ4_K * D_sub, 0.f);
-    std::vector<uint8_t> gpq4_codes(N * (size_t)M_PQ, 0);
+    // lookup). K=16; per-node 4-bit codes + reconstructed-norm^2 feed the SoAGraph
+    // contiguous neighbor-code store (built below).
+    //
+    // GPQ4 uses its OWN subspace dimension, DECOUPLED from the legacy tier-2 D_sub=8.
+    // QG (D<=400) defaults to D_sub=1 → M=D subspaces (fine routing); our coarse D_sub=8
+    // → M=D/8 caps skip-rerank routing recall at ~12%. AQ_GPQ4_DSUB selects D_sub
+    // (must divide D); default 2 (M=D/2) as the recall/size sweet spot. K stays 16.
+    int gpq4_dsub = 2;
+    {
+        const char* e = std::getenv("AQ_GPQ4_DSUB");
+        if (e) { int v = std::atoi(e); if (v > 0) gpq4_dsub = v; }
+        // Snap to a divisor of D so M*D_sub == D exactly (kernel/store assume this).
+        while (gpq4_dsub > 1 && (D % gpq4_dsub) != 0) --gpq4_dsub;
+        if (gpq4_dsub < 1) gpq4_dsub = 1;
+    }
+    const int GM   = D / gpq4_dsub;   // GPQ4 subspace count (e.g. D=128: dsub=2→M=64, dsub=1→M=128)
+    const int GDsub = gpq4_dsub;
+    std::vector<float> gpq4_cb((size_t)GM * NGT::NGTAQ::GPQ4_K * GDsub, 0.f);
+    std::vector<uint8_t> gpq4_codes(N * (size_t)GM, 0);
     std::vector<float>   gpq4_norm_sq(N, 0.f);
     {
-        fprintf(stderr, "[NGTAQv2] Training %d GLOBAL PQ-16 sub-codebooks (K=16) on rotated vectors...\n", M_PQ);
-        for (int sub = 0; sub < M_PQ; ++sub) {
-            std::vector<float> sub_data(N * (size_t)D_sub);
+        fprintf(stderr, "[NGTAQv2] Training %d GLOBAL PQ-16 sub-codebooks (K=16, D_sub=%d) on rotated vectors...\n",
+                GM, GDsub);
+        for (int sub = 0; sub < GM; ++sub) {
+            std::vector<float> sub_data(N * (size_t)GDsub);
             for (size_t i = 0; i < N; ++i)
-                memcpy(sub_data.data() + i*D_sub,
-                       rotated.data() + i*D + sub*D_sub,
-                       (size_t)D_sub * sizeof(float));
-            NGT::NGTAQ::KMeansCentering sub_km(NGT::NGTAQ::GPQ4_K, D_sub,
+                memcpy(sub_data.data() + i*GDsub,
+                       rotated.data() + i*D + sub*GDsub,
+                       (size_t)GDsub * sizeof(float));
+            NGT::NGTAQ::KMeansCentering sub_km(NGT::NGTAQ::GPQ4_K, GDsub,
                                                seed ^ (0x4B16C0DEULL + (uint64_t)sub));
             sub_km.train(sub_data.data(), N, 262144, 50);
             for (int code = 0; code < NGT::NGTAQ::GPQ4_K; ++code)
-                memcpy(gpq4_cb.data() + (sub*NGT::NGTAQ::GPQ4_K + code)*D_sub,
+                memcpy(gpq4_cb.data() + (sub*NGT::NGTAQ::GPQ4_K + code)*GDsub,
                        sub_km.centroid(code),
-                       (size_t)D_sub * sizeof(float));
+                       (size_t)GDsub * sizeof(float));
         }
         #pragma omp parallel for schedule(static)
         for (size_t i = 0; i < N; ++i) {
             if (is_hole[i]) continue;
             const float* xr = rotated.data() + i*D;
-            uint8_t* codes = gpq4_codes.data() + i*(size_t)M_PQ;
+            uint8_t* codes = gpq4_codes.data() + i*(size_t)GM;
             float rns = 0.f;
-            for (int sub = 0; sub < M_PQ; ++sub)
+            for (int sub = 0; sub < GM; ++sub)
                 codes[sub] = NGT::NGTAQ::gpq4_encode_sub(
-                    xr + sub*D_sub, gpq4_cb.data() + (size_t)sub*NGT::NGTAQ::GPQ4_K*D_sub, D_sub, rns);
+                    xr + sub*GDsub, gpq4_cb.data() + (size_t)sub*NGT::NGTAQ::GPQ4_K*GDsub, GDsub, rns);
             gpq4_norm_sq[i] = rns;
         }
         fprintf(stderr, "[NGTAQv2] GLOBAL PQ-16 done.\n");
@@ -915,17 +931,18 @@ NGTAQIndex NGTAQIndex::fromNGTv2(const std::string& ngt_path, const Property& pr
     // buildGPQ4 reads the FINAL CSR edges (resetEdges already ran above), so the per-node
     // neighbor blocks reflect the pruned graph used at search time.
     idx.gpq4_codebook_ = std::move(gpq4_cb);
+    idx.gpq4_m_pq_ = GM;    // GPQ4's OWN subspace count (decoupled from legacy m_pq_)
     {
-        idx.gpq4_codebook_T_.resize((size_t)M_PQ * D_sub * NGT::NGTAQ::GPQ4_K);
+        idx.gpq4_codebook_T_.resize((size_t)GM * GDsub * NGT::NGTAQ::GPQ4_K);
         NGT::NGTAQ::build_tier2_codebook_T(
-            idx.gpq4_codebook_.data(), M_PQ, NGT::NGTAQ::GPQ4_K, D_sub,
+            idx.gpq4_codebook_.data(), GM, NGT::NGTAQ::GPQ4_K, GDsub,
             idx.gpq4_codebook_T_.data());
     }
-    idx.graph_->buildGPQ4(M_PQ, gpq4_codes.data(), gpq4_norm_sq.data());
+    idx.graph_->buildGPQ4(GM, gpq4_codes.data(), gpq4_norm_sq.data());
     idx.gpq4_codes_   = std::move(gpq4_codes);    // flat per-node codes (seeds/expansion)
     idx.gpq4_norm_sq_ = std::move(gpq4_norm_sq);
     idx.has_gpq4_ = true;
-    fprintf(stderr, "[NGTAQv2] GPQ4 neighbor-code store built (M=%d).\n", M_PQ);
+    fprintf(stderr, "[NGTAQv2] GPQ4 neighbor-code store built (M=%d, D_sub=%d).\n", GM, GDsub);
 
     idx.is_angular_ = (prop.metric == NGT::ObjectSpace::DistanceTypeAngle ||
                        prop.metric == NGT::ObjectSpace::DistanceTypeCosine);
@@ -990,8 +1007,8 @@ float NGTAQIndex::buildGlobalLUT16(const std::vector<float>& query,
                                    NGT::NGTAQ::GlobalPQ4LUT& lut,
                                    float* ip_out) const {
     const int D      = (d_eff_ > 0) ? d_eff_ : prop_.dimension;
-    const int M_PQ   = (m_pq_ > 0) ? m_pq_ : 16;
-    const int D_sub  = 8;
+    const int M_PQ   = gpq4MPQ();          // GPQ4's own (fine) subspace count
+    const int D_sub  = (M_PQ > 0) ? D / M_PQ : 8;
     const int D_orig = (int)query.size();
 
     static thread_local std::vector<float> q_norm_tl;
@@ -1306,7 +1323,9 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
     static thread_local std::vector<float> batch_ip_tl;
     float q_ns_batch = 0.f;
     if (use_batch) {
-        batch_ip_tl.resize((size_t)M_PQ * NGT::NGTAQ::GPQ4_K);
+        // GPQ4 has its OWN (finer) subspace count — size by gpq4MPQ(), NOT the legacy
+        // M_PQ, or buildGlobalLUT16 overflows this buffer when gpq4MPQ() > m_pq_.
+        batch_ip_tl.resize((size_t)gpq4MPQ() * NGT::NGTAQ::GPQ4_K);
         q_ns_batch = buildGlobalLUT16(query, batch_lut_tl, batch_ip_tl.data());
     }
     auto route_dist = [&](uint32_t id) -> float {
@@ -2175,14 +2194,16 @@ void NGTAQIndex::saveV2(const std::string& dir) const {
         }
         graph_->saveGPQ4(dir + "/v2_gpq4_store.bin");
     }
-    // Metadata: is_angular_, d_eff_, m_pq_, meta_version.
-    // meta_version: 1 = no global PQ (legacy), 2 = K=256 global PQ, 3 = + K=16 GPQ4 store.
+    // Metadata: is_angular_, d_eff_, m_pq_, meta_version [, gpq4_m_pq_].
+    // meta_version: 1 = no global PQ (legacy), 2 = K=256 global PQ, 3 = K=16 GPQ4 store
+    //               (D_sub=8, gpq4_m_pq_ == m_pq_), 4 = GPQ4 with its OWN gpq4_m_pq_ (slot 4).
     {
         std::string meta_path = dir + "/v2_meta.bin";
         FILE* f = fopen(meta_path.c_str(), "wb");
         if (f) {
-            int32_t meta_version = save_gpq4 ? 3 : (has_global_pq_ ? 2 : 1);
-            int32_t meta[4] = {(int32_t)is_angular_, d_eff_, m_pq_, meta_version};
+            const int32_t gm = (gpq4_m_pq_ > 0) ? gpq4_m_pq_ : m_pq_;
+            int32_t meta_version = save_gpq4 ? 4 : (has_global_pq_ ? 2 : 1);
+            int32_t meta[5] = {(int32_t)is_angular_, d_eff_, m_pq_, meta_version, gm};
             fwrite(meta, sizeof(meta), 1, f);
             fclose(f);
         }
@@ -2228,16 +2249,21 @@ void NGTAQIndex::loadV2(const std::string& dir) {
     // Must be read BEFORE codebook so M_cb and D_sub are known.
     // meta_version: <2 (or absent) = no global PQ; >=2 = global PQ files present.
     int32_t meta_version = 1;
+    gpq4_m_pq_ = 0;  // 0 → fall back to m_pq_ (meta_version<4 indices: GPQ4 D_sub=8)
     {
         std::string meta_path = dir + "/v2_meta.bin";
         FILE* f = fopen(meta_path.c_str(), "rb");
         if (f) {
-            int32_t meta[4] = {0, 0, 16, 1};
-            if (fread(meta, sizeof(meta), 1, f) == 1) {
+            // Read up to 5 ints; old indices wrote 4. Slot 4 (gpq4_m_pq_) only present
+            // for meta_version>=4 — read it conditionally so 4-int files don't underflow.
+            int32_t meta[5] = {0, 0, 16, 1, 0};
+            size_t got = fread(meta, sizeof(int32_t), 5, f);
+            if (got >= 4) {
                 is_angular_  = (bool)meta[0];
                 d_eff_       = meta[1];
                 m_pq_        = meta[2];
                 meta_version = meta[3];
+                if (got >= 5 && meta_version >= 4 && meta[4] > 0) gpq4_m_pq_ = meta[4];
             }
             fclose(f);
         }
@@ -2289,8 +2315,10 @@ void NGTAQIndex::loadV2(const std::string& dir) {
     // (has_gpq4_ stays false → legacy/global routing) instead of crashing.
     has_gpq4_ = false;
     if (meta_version >= 3) {
-        const int M_cb  = m_pq_;
-        const int D_sub = 8;
+        // meta_version 3: gpq4_m_pq_ stayed 0 → gpq4MPQ() == m_pq_ (D_sub=8, old layout).
+        // meta_version 4: gpq4_m_pq_ was read above (finer M). D_sub derived from it.
+        const int M_cb  = gpq4MPQ();
+        const int D_sub = dEff() / M_cb;
         std::ifstream fc(dir + "/v2_gpq4_codebook.bin", std::ios::binary);
         if (fc) {
             gpq4_codebook_.resize((size_t)M_cb * NGT::NGTAQ::GPQ4_K * D_sub);

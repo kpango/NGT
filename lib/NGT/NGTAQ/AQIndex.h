@@ -120,6 +120,11 @@ public:
     bool isAngular() const { return is_angular_; }
     int  dEff()      const { return d_eff_ > 0 ? d_eff_ : prop_.dimension; }
     int  mPQ()       const { return m_pq_; }
+    // GPQ4 (batch vpshufb routing) subspace count — DECOUPLED from the legacy
+    // tier-2/global-PQ m_pq_ (which stays D/8). Finer M (smaller D_sub) → more
+    // accurate routing, matching QG's D_sub=1 → M=D default. K stays 16 (4-bit).
+    int  gpq4MPQ()   const { return gpq4_m_pq_ > 0 ? gpq4_m_pq_ : m_pq_; }
+    int  gpq4DSub()  const { int m = gpq4MPQ(); return m > 0 ? dEff() / m : 8; }
 
     // ---- Stage A: GLOBAL PQ routing tier ----
     // One PQ codebook trained over ALL SRHT-rotated vectors (no per-cluster residual),
@@ -227,16 +232,20 @@ private:
     // global PQ above is incompatible with vpshufb). Per-node 4-bit codes + recon-norms
     // live in the SoAGraph contiguous neighbor-code store (graph_->buildGPQ4).
     bool                 has_gpq4_ = false;
-    std::vector<float>   gpq4_codebook_;    // [M_PQ][16][D_sub] row-major (rotated vectors)
-    std::vector<float>   gpq4_codebook_T_;  // [M_PQ][D_sub][16] transposed (fast LUT build)
-    std::vector<uint8_t> gpq4_codes_;       // [N*M_PQ] per-node 4-bit codes (single-node scoring)
+    // GPQ4 uses its OWN subspace count (gpq4_m_pq_), independent of the legacy m_pq_.
+    // Finer = smaller D_sub = larger M = more vpshufb subspace iterations (QG-style).
+    // gpq4_d_sub_ = dEff() / gpq4_m_pq_. 0 → fall back to m_pq_ (old indices).
+    int                  gpq4_m_pq_ = 0;    // #subspaces for the K=16 batch PQ (0 = use m_pq_)
+    std::vector<float>   gpq4_codebook_;    // [gpq4_m_pq_][16][D_sub] row-major (rotated vectors)
+    std::vector<float>   gpq4_codebook_T_;  // [gpq4_m_pq_][D_sub][16] transposed (fast LUT build)
+    std::vector<uint8_t> gpq4_codes_;       // [N*gpq4_m_pq_] per-node 4-bit codes (single-node scoring)
     std::vector<float>   gpq4_norm_sq_;     // [N] per-node reconstructed-norm^2
 
     // Single-node batch-PQ distance (seeds / expansion): ||q_rot - x_pq16||^2 via the
     // node's own 4-bit code, scored against the per-query LUT's dequantized float table.
     // `ip_table` is the M*16 float IP table from gpq4_ip_table (NOT the uint8 LUT).
     float gpq4Dist(uint32_t node_id, const float* ip_table, float q_norm_sq) const {
-        const int M_PQ = (m_pq_ > 0) ? m_pq_ : 16;
+        const int M_PQ = gpq4MPQ();
         const uint8_t* codes = gpq4_codes_.data() + (size_t)node_id * M_PQ;
         float ip = 0.f;
         for (int s = 0; s < M_PQ; ++s) ip += ip_table[(size_t)s * NGT::NGTAQ::GPQ4_K + codes[s]];

@@ -17,7 +17,7 @@ int main(int argc, char** argv) {
     const char* h5 = argv[2];
     ::NGTAQ::NGTAQIndex idx = ::NGTAQ::NGTAQIndex::load(dir + "/aqindex");
     idx.loadV2(dir);
-    const int M = idx.mPQ(), Deff = idx.dEff();
+    const int M = idx.gpq4MPQ(), Deff = idx.dEff();  // GPQ4 store is gpq4MPQ()-wide
 
     // Load flat gpq4 codes + recon norms directly (private in index).
     std::ifstream f(dir + "/v2_gpq4_codes.bin", std::ios::binary);
