@@ -65,6 +65,7 @@ if(HDF5_FOUND)
         diag_ids
         diag_batch_dist
         diag_route_rank
+        diag_route_recall
         qg_build
         qg_bench
         qbg_build
