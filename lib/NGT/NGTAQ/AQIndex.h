@@ -160,6 +160,12 @@ public:
     const uint16_t* rawFlat() const { return raw_flat_.empty() ? nullptr : raw_flat_.data(); }
     int dim() const { return prop_.dimension; }
 
+    // Diagnostic-only accessors (validate the centroid-assignment accelerator offline).
+    const NGT::NGTAQ::KMeansCentering* kmeansForDiag() const { return kmeans_v2_.get(); }
+    // Rotate a raw (unpadded) query through the index SRHT into out[dEff()], matching
+    // the searchV2 setup (zero-pad to D, then SRHT apply). out must be sized dEff().
+    void rotateForDiag(const float* q, int q_dim, float* out) const;
+
     // Rebuild v2 graph edges from a (denser) NGT source index without re-training
     // SRHT/K-means/PCA/PQ (those are reused from the existing index).
     // Only the graph construction + entry point selection are re-run.

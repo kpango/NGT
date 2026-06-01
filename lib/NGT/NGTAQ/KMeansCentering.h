@@ -134,6 +134,53 @@ public:
         return best;
     }
 
+    // ── 2-level coarse quantizer over the K centroids ─────────────────────────────────
+    // Replaces the brute-force K-way query->centroid scan (the ~9us setup floor for the
+    // batch path) with: scan S super-centroids (S≈sqrt(K)), then exactly scan only the
+    // centroids assigned to the best `probe` super-centroids. Cost ≈ S + probe*(K/S)
+    // distance evals vs K. For K=1000, S=32, probe=4: ~32+128=160 vs 1000 (~6x fewer).
+    //
+    // Accuracy: probing the top-`probe` super-centroids (not just 1) makes the true
+    // nearest centroid almost always present in the candidate set; the final exact pass
+    // over those members guarantees the best among them. Built lazily on first use from
+    // the in-memory centroids (no serialization / format change).
+    uint32_t nearest_2level(const float* x, int probe = 4) const {
+        if (super_centroids_.empty()) build_2level();
+        if (S_ == 0) return nearest_fp16(x);  // degenerate (tiny K) → fall back
+        // 1. Scan S super-centroids, keep the top-`probe` nearest (small partial select).
+        constexpr int MAXP = 32;
+        int P = probe < 1 ? 1 : (probe > MAXP ? MAXP : probe);
+        if (P > (int)S_) P = (int)S_;
+        // best-`P` super-centroids by distance: simple insertion into a tiny array.
+        float bestd[MAXP]; uint32_t besti[MAXP];
+        for (int i = 0; i < P; ++i) { bestd[i] = std::numeric_limits<float>::max(); besti[i] = 0; }
+        for (uint32_t s = 0; s < S_; ++s) {
+            float d = NGT::NGTAQ::l2_sq(x, super_centroids_.data() + (size_t)s * D_, D_);
+            if (d < bestd[P - 1]) {
+                int j = P - 1;
+                while (j > 0 && bestd[j - 1] > d) { bestd[j] = bestd[j - 1]; besti[j] = besti[j - 1]; --j; }
+                bestd[j] = d; besti[j] = s;
+            }
+        }
+        // 2. Exact scan over the members of the top-`probe` super-centroids.
+        float best_dist = std::numeric_limits<float>::max();
+        uint32_t best = 0;
+        for (int i = 0; i < P; ++i) {
+            uint32_t s = besti[i];
+            const uint32_t lo = super_off_[s], hi = super_off_[s + 1];
+            for (uint32_t m = lo; m < hi; ++m) {
+                uint32_t c = super_members_[m];
+                float d = NGT::NGTAQ::l2_sq(x, centroids_.data() + (size_t)c * D_, D_);
+                if (d < best_dist) { best_dist = d; best = c; }
+            }
+        }
+        return best;
+    }
+
+    // Eagerly build the 2-level accelerator (call once at index init, under a guard, so
+    // the lazy in-nearest_2level build never races across query threads).
+    void buildCoarseQuantizer() const { if (super_centroids_.empty()) build_2level(); }
+
     uint32_t num_clusters() const { return K_; }
     int dim() const { return D_; }
 
@@ -152,6 +199,12 @@ private:
     std::vector<float> centroids_;
     mutable std::vector<uint16_t> centroids_fp16_;  // lazy fp16 copy for nearest_fp16
 
+    // 2-level coarse quantizer state (lazy, in-memory only).
+    mutable uint32_t              S_ = 0;            // number of super-centroids
+    mutable std::vector<float>    super_centroids_; // [S_*D_] super-centroid vectors
+    mutable std::vector<uint32_t> super_off_;       // [S_+1] CSR offsets into super_members_
+    mutable std::vector<uint32_t> super_members_;   // [K_] centroid ids grouped by super-centroid
+
     // Build the fp16 centroid cache from the fp32 centroids (one-time, query-thread safe:
     // idempotent full overwrite; concurrent builders write identical bytes).
     void build_fp16_cache() const {
@@ -159,6 +212,69 @@ private:
         for (size_t i = 0; i < tmp.size(); ++i)
             tmp[i] = NGT::NGTAQ::float_to_fp16(centroids_[i]);
         centroids_fp16_.swap(tmp);
+    }
+
+    // Build the 2-level coarse quantizer: a small k-means over the K centroids producing
+    // S≈sqrt(K) super-centroids, plus a CSR grouping of centroid ids by super-centroid.
+    // Idempotent full overwrite; the in-memory structure is rebuilt from centroids_ only.
+    void build_2level() const {
+        if (K_ < 64) { S_ = 0; return; }  // too few centroids to bother → caller falls back
+        uint32_t S = (uint32_t)std::lround(std::sqrt((double)K_));
+        if (S < 8) S = 8; if (S > 256) S = 256;
+        // k-means++ style init via stride sampling (deterministic), then a few Lloyd iters.
+        std::vector<float> sc((size_t)S * D_);
+        for (uint32_t s = 0; s < S; ++s) {
+            uint32_t src = (uint32_t)((uint64_t)s * K_ / S);
+            std::memcpy(sc.data() + (size_t)s * D_, centroids_.data() + (size_t)src * D_,
+                        (size_t)D_ * sizeof(float));
+        }
+        std::vector<uint32_t> assign(K_, 0);
+        std::vector<float> newc((size_t)S * D_);
+        std::vector<uint32_t> cnt(S);
+        for (int iter = 0; iter < 8; ++iter) {
+            bool changed = false;
+            for (uint32_t c = 0; c < K_; ++c) {
+                const float* cv = centroids_.data() + (size_t)c * D_;
+                float bd = std::numeric_limits<float>::max(); uint32_t bs = 0;
+                for (uint32_t s = 0; s < S; ++s) {
+                    float d = NGT::NGTAQ::l2_sq(cv, sc.data() + (size_t)s * D_, D_);
+                    if (d < bd) { bd = d; bs = s; }
+                }
+                if (assign[c] != bs) { assign[c] = bs; changed = true; }
+            }
+            if (!changed && iter > 0) break;
+            std::fill(newc.begin(), newc.end(), 0.f);
+            std::fill(cnt.begin(), cnt.end(), 0u);
+            for (uint32_t c = 0; c < K_; ++c) {
+                float* acc = newc.data() + (size_t)assign[c] * D_;
+                const float* cv = centroids_.data() + (size_t)c * D_;
+                for (int d = 0; d < D_; ++d) acc[d] += cv[d];
+                ++cnt[assign[c]];
+            }
+            for (uint32_t s = 0; s < S; ++s) {
+                if (cnt[s] == 0) {  // empty super-cluster: reseat on a far centroid
+                    std::memcpy(newc.data() + (size_t)s * D_,
+                                centroids_.data() + (size_t)(s % K_) * D_,
+                                (size_t)D_ * sizeof(float));
+                    continue;
+                }
+                float inv = 1.f / cnt[s];
+                float* acc = newc.data() + (size_t)s * D_;
+                for (int d = 0; d < D_; ++d) acc[d] *= inv;
+            }
+            sc.swap(newc);
+        }
+        // CSR grouping by super-centroid (final assignment).
+        std::vector<uint32_t> off(S + 1, 0);
+        for (uint32_t c = 0; c < K_; ++c) ++off[assign[c] + 1];
+        for (uint32_t s = 0; s < S; ++s) off[s + 1] += off[s];
+        std::vector<uint32_t> mem(K_);
+        std::vector<uint32_t> cur(off.begin(), off.end() - 1);
+        for (uint32_t c = 0; c < K_; ++c) mem[cur[assign[c]]++] = c;
+        super_centroids_.swap(sc);
+        super_off_.swap(off);
+        super_members_.swap(mem);
+        S_ = S;
     }
 
     uint32_t nearest(const float* x) const {

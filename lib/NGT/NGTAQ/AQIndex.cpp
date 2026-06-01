@@ -1036,6 +1036,14 @@ float NGTAQIndex::buildGlobalLUT16(const std::vector<float>& query,
     return q_norm_sq;
 }
 
+// Diagnostic: rotate a raw query through SRHT exactly as searchV2's setup does.
+void NGTAQIndex::rotateForDiag(const float* q, int q_dim, float* out) const {
+    const int D = (d_eff_ > 0) ? d_eff_ : prop_.dimension;
+    std::vector<float> padded(static_cast<size_t>(D), 0.f);
+    std::copy(q, q + std::min(q_dim, D), padded.begin());
+    srht_v2_->apply(padded.data(), out);
+}
+
 // ---------------------------------------------------------------------------
 // searchV2: ADC search with lazy centroid switch
 // ---------------------------------------------------------------------------
@@ -1112,10 +1120,18 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
     srht_v2_->apply(q_ptr, q_rot_tl.data());
 
     // 2. Find query's nearest centroid. On the coarse (batch/global-PQ) path the centroid
-    // only selects seed clusters — the graph walk corrects near-ties — so use the 2x-faster
-    // fp16 centroid scan (half the memory bandwidth; the fp32 scan was ~12us, the dominant
-    // setup cost). The exact (non-coarse) path keeps the full-precision fp32 scan.
-    uint32_t active_cid = use_coarse_e ? kmeans_v2_->nearest_fp16(q_rot_tl.data())
+    // only selects seed clusters — the graph walk corrects near-ties — so use the 2-level
+    // coarse quantizer (scan ~sqrt(K) super-centroids + the members of the top-`probe`,
+    // ~3.5x fewer distance evals than the brute K-way scan). probe=4 hits 96.6% exact
+    // agreement at ~3.6us vs ~9.8us fp16 / ~12.8us fp32 — the brute scan was the dominant
+    // setup cost. The exact (non-coarse) path keeps the full-precision fp32 scan.
+    // AQ_CQ_PROBE tunes the super-centroid probe count (accuracy/speed knob).
+    static const int cq_probe = [] {
+        const char* e = std::getenv("AQ_CQ_PROBE");
+        int v = e ? std::atoi(e) : 4;
+        return v > 0 ? v : 4;
+    }();
+    uint32_t active_cid = use_coarse_e ? kmeans_v2_->nearest_2level(q_rot_tl.data(), cq_probe)
                                        : kmeans_v2_->nearest_public(q_rot_tl.data());
     q_res_tl.resize(static_cast<size_t>(D));
 
@@ -1193,6 +1209,11 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
             for (int i = 0; i < take; ++i)
                 cluster_neighbors_v2_[c][i] = dists[i].second;
         }
+
+        // 3. Build the 2-level coarse-quantizer accelerator over the centroids here (under
+        // call_once) so the lazy in-method build never races across concurrent query
+        // threads. One sqrt(K)-way k-means on K centroids (~ms, one-time amortized).
+        kmeans_v2_->buildCoarseQuantizer();
     });
 
     // 4. DABS search with asymmetric PQ ADC + lazy centroid rebuild
