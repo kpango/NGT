@@ -1438,8 +1438,13 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
                 : std::min(members.size(), static_cast<size_t>(N_CLUSTER_SEEDS));
             // Prefetch only what we'll score: avoids cache pollution for L2 (full-cluster
             // prefetch evicts DABS hot data from L1/L2 when only 32/N_CLUSTER_SEEDS are used).
-            for (size_t mi = 0; mi < take; ++mi) {
-                if (members[mi] < N) graph_->prefetchRecord(members[mi]);
+            // Coarse (batch/global-PQ) seed scoring reads the node's per-node PQ code +
+            // recon-norm (gpq4_codes_/gpq4_norm_sq_ or global codes), NOT its V2 record.
+            // Prefetching the V2 record there is pure pollution — it evicts the DABS hot
+            // data and brings in bytes the seed scan never touches. Skip it for coarse.
+            if (!use_coarse) {
+                for (size_t mi = 0; mi < take; ++mi)
+                    if (members[mi] < N) graph_->prefetchRecord(members[mi]);
             }
             // The score-all-keep-topK path needs a per-cluster staging buffer. The default
             // scan-first path (and L2) push directly into `scored` (no extra trim pass).
@@ -1508,7 +1513,10 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
                 mark_visited(s.id);
                 float d;
                 if (use_coarse) {
-                    d = coarse_dist(s.id);
+                    // Coarse routing scored every seed above (s.score == coarse_dist(s.id),
+                    // a deterministic PQ-code lookup). Reuse it instead of recomputing —
+                    // the seed scan paid for it once already.
+                    d = s.score;
                 } else {
                     auto rec = graph_->getRecordConstView(s.id);
                     maybe_rebuild_adc(rec.centroid_id());
