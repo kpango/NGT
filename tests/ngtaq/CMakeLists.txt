@@ -32,6 +32,7 @@ foreach(TEST_SRC
     test_adc_distance
     patch_tombstones
     test_l2_fp16
+    test_gpq4_kernel
 )
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${TEST_SRC}.cpp")
         add_executable(${TEST_SRC} ${TEST_SRC}.cpp)
