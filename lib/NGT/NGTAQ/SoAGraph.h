@@ -133,12 +133,25 @@ public:
     void removeNode(uint32_t node_id) {
         assert(node_id < state_.size());
         state_[node_id] = TOMBSTONE;
+        any_tombstone_ = true; tombstone_scanned_ = true;  // keep the cache correct
     }
 
     bool isTombstone(uint32_t node_id) const {
         assert(node_id < state_.size());
         return state_[node_id] == TOMBSTONE;
     }
+
+    // True if ANY node is tombstoned. Lets the hot search loop skip the per-neighbor
+    // isTombstone() random gather into state_ (1 B/node, ~1 MB) when none exist — for a
+    // freshly built index (e.g. SIFT) this is the common case. Computed lazily, cached.
+    bool hasTombstones() const {
+        if (!tombstone_scanned_) {
+            any_tombstone_ = (std::find(state_.begin(), state_.end(), (State)TOMBSTONE) != state_.end());
+            tombstone_scanned_ = true;
+        }
+        return any_tombstone_;
+    }
+    void invalidateTombstoneCache() { tombstone_scanned_ = false; }
 
     size_t size() const { return state_.size(); }
 
@@ -200,6 +213,7 @@ public:
         // Move all data members individually — mutex_ cannot be moved/copied.
         words_           = fresh.words_;
         state_           = std::move(fresh.state_);
+        any_tombstone_ = false; tombstone_scanned_ = true;  // rebuild compacts out tombstones
         offsets_         = std::move(fresh.offsets_);
         edge_ids_        = std::move(fresh.edge_ids_);
         bq_data_         = std::move(fresh.bq_data_);
@@ -505,6 +519,8 @@ public:
 private:
     int                   words_;
     std::vector<State>    state_;
+    mutable bool          tombstone_scanned_ = false;  // hasTombstones() cache valid?
+    mutable bool          any_tombstone_     = false;  // cached scan result
     std::vector<uint32_t> offsets_;    // CSR offsets [N+1], sentinel appended by finalizeCSR()
     std::vector<uint32_t> edge_ids_;   // CSR edge data
     std::vector<uint64_t> bq_data_;    // interleaved BQ [N * 2 * words_]: [s0,m0,s1,m1,...]

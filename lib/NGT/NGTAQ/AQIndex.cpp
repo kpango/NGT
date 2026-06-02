@@ -26,17 +26,28 @@
 // ---------------------------------------------------------------------------
 #ifdef AQ_PROFILE
 #include <chrono>
-namespace { struct AqProf { double seed=0,dabs=0,refine=0,expand=0,rerank=0,setup=0; long n=0;
+namespace { struct AqProf { double seed=0,dabs=0,refine=0,expand=0,rerank=0,setup=0;
+  double srht=0,lut=0; double hops=0,npops=0; long n=0;
   ~AqProf(){ if(n) fprintf(stderr,
-    "[AQ_PROFILE] n=%ld setup=%.1f seed=%.1f dabs=%.1f refine=%.1f expand=%.1f rerank=%.1f us/query\n",
-    n, setup/n, seed/n, dabs/n, refine/n, expand/n, rerank/n); } };
+    "[AQ_PROFILE] n=%ld setup=%.1f (srht=%.1f lut=%.1f) seed=%.1f dabs=%.1f refine=%.1f expand=%.1f rerank=%.1f us/query | hops=%.1f npops=%.1f ns/hop=%.1f\n",
+    n, setup/n, srht/n, lut/n, seed/n, dabs/n, refine/n, expand/n, rerank/n,
+    hops/n, npops/n, hops>0?dabs*1000.0/hops:0.0); } };
   thread_local AqProf g_aqprof; }
-#define AQ_T0() auto _t=std::chrono::steady_clock::now()
+#define AQ_T0() auto _t=std::chrono::steady_clock::now(); auto _ts=_t
 #define AQ_ADD(f) do{auto _e=std::chrono::steady_clock::now(); \
   g_aqprof.f+=std::chrono::duration<double,std::micro>(_e-_t).count(); _t=_e;}while(0)
+// Sub-timers use an INDEPENDENT clock (_ts) so they don't disturb the main region (_t)
+// accumulation — they measure a slice within a region without double-counting.
+#define AQ_MARK() do{ _ts=std::chrono::steady_clock::now(); }while(0)
+#define AQ_SUB(f) do{auto _e=std::chrono::steady_clock::now(); \
+  g_aqprof.f+=std::chrono::duration<double,std::micro>(_e-_ts).count(); _ts=_e;}while(0)
+#define AQ_CNT(f,v) do{ g_aqprof.f += (double)(v); }while(0)
 #else
 #define AQ_T0()
 #define AQ_ADD(f)
+#define AQ_MARK()
+#define AQ_SUB(f)
+#define AQ_CNT(f,v)
 #endif
 
 namespace NGTAQ {
@@ -1252,7 +1263,9 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
 
     // 1. Rotate query
     q_rot_tl.resize(static_cast<size_t>(D));
+    AQ_MARK();  // [AQ_PROFILE] start SRHT sub-timer (within setup)
     srht_v2_->apply(q_ptr, q_rot_tl.data());
+    AQ_SUB(srht);  // [AQ_PROFILE] SRHT rotation cost
 
     // 2. Find query's nearest centroid. On the coarse (batch/global-PQ) path the centroid
     // only selects seed clusters — the graph walk corrects near-ties — so use the 2-level
@@ -1567,7 +1580,9 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
         // GPQ4 has its OWN (finer) subspace count — size by gpq4MPQ(), NOT the legacy
         // M_PQ, or buildGlobalLUT16 overflows this buffer when gpq4MPQ() > m_pq_.
         batch_ip_tl.resize((size_t)gpq4MPQ() * NGT::NGTAQ::GPQ4_K);
+        AQ_MARK();  // [AQ_PROFILE] start dist-LUT build sub-timer (within setup)
         q_ns_batch = buildGlobalLUT16(query, batch_lut_tl, batch_ip_tl.data(), use_dist_lut);
+        AQ_SUB(lut);  // [AQ_PROFILE] global dist-LUT build cost (incl. its internal SRHT)
     }
     // Tech 1: symmetric SQ8 in-loop routing distance. Encode the rotated query to int8 once
     // (per-vector symmetric max scale), then route every neighbor with a single signed-int8
@@ -1841,6 +1856,9 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
         // lines, one prefetch covers them) over the CSR offsets_->edge_ids_ indirection.
         // Only present when built at load via AQ_PACKED=1 (see loadV2).
         const bool use_packed = graph_->hasPackedV2();
+        // Skip the per-neighbor isTombstone() random gather into state_ (1 MB) when the
+        // index has no tombstones (the common case for a freshly built SIFT index).
+        const bool has_tomb = graph_->hasTombstones();
         while (lp.has_next()) {
             // Capture the frontier node's pool distance BEFORE pop advances the cursor —
             // it IS x's coarse (gpq4) score, so no recompute is needed for `results`.
@@ -1906,7 +1924,8 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
                 // No per-neighbor norm read, no IP->L2 assembly — the leanest per-hop path.
                 for (size_t ni = 0; ni < n_nbrs; ++ni) {
                     uint32_t u = nbr_ids[ni];
-                    if (u >= N || graph_->isTombstone(u)) continue;
+                    if (u >= N) continue;
+                    if (has_tomb && graph_->isTombstone(u)) continue;
                     if (is_visited(u)) continue;
                     mark_visited(u);
                     const uint32_t b = (uint32_t)(ni / 16), pos = (uint32_t)(ni % 16);
@@ -1938,6 +1957,8 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
             }
         }
         AQ_ADD(dabs);
+        AQ_CNT(hops, n_visits);            // [AQ_PROFILE] hops (popped nodes) per query
+        AQ_CNT(npops, results.size());     // [AQ_PROFILE] candidates handed to rerank
         goto post_dabs;  // skip the legacy cand_q loop entirely
     }
 
