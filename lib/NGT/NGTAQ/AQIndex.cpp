@@ -42,6 +42,63 @@ namespace { struct AqProf { double seed=0,dabs=0,refine=0,expand=0,rerank=0,setu
 namespace NGTAQ {
 
 // ---------------------------------------------------------------------------
+// LinearPool: pyglass-style ef-bounded sorted-array candidate frontier.
+// (port of glass/neighbor.hpp LinearPool, glass/searcher/graph_searcher.hpp loop)
+//
+// Replaces the DABS std::priority_queue + dk_tracker heap + ef_gate max-heap + the two
+// gamma-termination gates with a single flat, distance-sorted {id,dist} array of
+// capacity `ef`. The cursor `cur_` marks the exploration frontier; the candidate-order
+// "checked" bit is packed into id bit31. insert() = binary-search + memmove (and rewinds
+// cur_ when inserting before it, so a newly-found-closer node is auto re-explored).
+// has_next() == (cur_ < size_ && cur_ < ef_) is the ONLY termination test: no gamma
+// gates, no per-pop tier-2 gather. Visited tracking stays external (the existing t_vis
+// bitvector) so we don't double-allocate.
+struct AQLinearPool {
+    struct Node { uint32_t id; float dist; };  // id bit31 = "checked" (popped) flag
+    std::vector<Node> data_;                    // sorted ascending by dist, size capacity_+1
+    int size_ = 0, cur_ = 0, ef_ = 0, capacity_ = 0;
+
+    static constexpr uint32_t kMask = 0x7fffffffu;
+    static inline uint32_t rawid(uint32_t id)   { return id & kMask; }
+    static inline bool      checked(uint32_t id){ return (id >> 31) & 1u; }
+
+    void reset(int ef) {
+        ef_ = ef;
+        capacity_ = ef;            // pyglass uses cap=max(k,ef); ef caps the live frontier
+        size_ = cur_ = 0;
+        if ((int)data_.size() < capacity_ + 1) data_.resize(capacity_ + 1);
+    }
+
+    // Binary search for the insertion slot (first index with data_[i].dist > dist).
+    inline int find_bsearch(float dist) const {
+        int lo = 0, hi = size_;
+        while (lo < hi) { int mid = (lo + hi) >> 1;
+            if (data_[mid].dist > dist) hi = mid; else lo = mid + 1; }
+        return lo;
+    }
+
+    // Returns true if the candidate entered the pool (caller may then prefetch it).
+    inline bool insert(uint32_t u, float dist) {
+        if (size_ == capacity_ && dist >= data_[size_ - 1].dist) return false;
+        int lo = find_bsearch(dist);
+        std::memmove(&data_[lo + 1], &data_[lo], (size_ - lo) * sizeof(Node));
+        data_[lo] = {u, dist};
+        if (size_ < capacity_) ++size_;
+        if (lo < cur_) cur_ = lo;   // inserted before frontier → rewind for re-exploration
+        return true;
+    }
+
+    // Pop the current frontier node (marks it checked), advance cursor past checked nodes.
+    inline uint32_t pop() {
+        data_[cur_].id |= (1u << 31);
+        int pre = cur_;
+        while (cur_ < size_ && checked(data_[cur_].id)) ++cur_;
+        return rawid(data_[pre].id);
+    }
+    inline bool has_next() const { return cur_ < size_ && cur_ < ef_; }
+};
+
+// ---------------------------------------------------------------------------
 // Private constructor
 // ---------------------------------------------------------------------------
 NGTAQIndex::NGTAQIndex(Property prop, BinaryQuantizer bq,
@@ -1220,6 +1277,9 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
     using Entry = std::pair<float, uint32_t>;
     std::priority_queue<Entry, std::vector<Entry>, std::greater<Entry>> cand_q;
     std::priority_queue<float> dk_tracker;
+    // Tech 2: pyglass LinearPool replaces cand_q/dk_tracker/ef_gate + gamma gates on the
+    // BATCH path. thread_local so its backing array persists across queries (no malloc).
+    static thread_local AQLinearPool lp;
     // Thread-local results buffer: capacity persists across queries (no malloc on steady-state).
     static thread_local std::vector<std::pair<float, uint32_t>> results_tl;
     results_tl.clear();
@@ -1276,6 +1336,15 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
                                              static_cast<size_t>(max_visits))
                           : std::numeric_limits<size_t>::max());
     std::priority_queue<float> ef_gate;  // max-heap of the ef best candidate distances
+    // Tech 2: the LinearPool capacity == ef. ef collapses gamma_enq/gamma_term/max_visits
+    // into one knob: explore until the frontier cursor reaches ef (cur_ >= ef). When the
+    // caller passes no budget (max_visits==0, AQ_EF unset) fall back to a generous cap so
+    // recall isn't silently clipped. Floored at k_out so we can always return k results.
+    int lp_ef = (ef_env > 0) ? ef_env
+              : (max_visits > 0 ? std::max(k_beam * 2, max_visits)
+                                : 4096);
+    if (lp_ef < k_out) lp_ef = k_out;
+    if (use_batch_e) lp.reset(lp_ef);
 
     // ADC state cache: skip get_residual + q_norm_sq loop + build_tier1_query on
     // repeated visits to the same cluster.
@@ -1633,7 +1702,8 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
                     maybe_rebuild_adc(rec.centroid_id());
                     d = adc_dist(rec);
                 }
-                cand_q.push({d, s.id});
+                if (use_batch) lp.insert(s.id, d);     // Tech 2: seed the LinearPool
+                else           cand_q.push({d, s.id});
                 graph_->prefetchOffset(s.id);
             }
 
@@ -1651,6 +1721,60 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
     }
 
     AQ_ADD(seed);  // [AQ_PROFILE] region (a): cluster-probe seeding + seed enqueue
+
+    // ── Tech 2: pyglass LinearPool beam loop (BATCH path only) ────────────────────────
+    // Flat ef-bounded sorted frontier; termination is purely has_next() (cur_ < ef). No
+    // gamma fast-path gate, no two-gate tier-2 recompute, no dk_tracker heap, no ef_gate.
+    // Each popped node's neighbors are scored in one vpshufb pass; tombstoned/visited
+    // neighbors are skipped at INSERT (no per-pop tombstone check). Every popped node is
+    // appended to `results` for the existing exact-L2 rerank below.
+    if (use_batch) {
+        while (lp.has_next()) {
+            // Capture the frontier node's pool distance BEFORE pop advances the cursor —
+            // it IS x's coarse (gpq4) score, so no recompute is needed for `results`.
+            float dx = lp.data_[lp.cur_].dist;
+            uint32_t x = lp.pop();
+            // Prefetch the next frontier node's GPQ4 block + neighbor list while we work.
+            if (lp.cur_ < lp.size_) {
+                uint32_t nxt = AQLinearPool::rawid(lp.data_[lp.cur_].id);
+                graph_->prefetchGPQ4(nxt);
+                graph_->prefetchNeighbors(nxt);
+            }
+            results.push_back({dx, x});  // approximate score for the exact-L2 rerank below
+            ++n_visits;
+
+            const uint8_t* blocks = graph_->gpq4Blocks(x);
+            const uint32_t nblk   = graph_->gpq4NumBlocks(x);
+            if (!blocks || nblk == 0) continue;
+            graph_->prefetchGPQ4(x);
+            const size_t blk_bytes = graph_->gpq4BlockBytes();
+            auto neighbors = graph_->getNeighbors(x);
+            const size_t n_nbrs = neighbors.size();
+            static thread_local std::vector<float> block_ip_lp;
+            // Prefetch recon-norm gather targets before the vpshufb pass (4MB random gather).
+            for (size_t ni = 0; ni < n_nbrs; ++ni) {
+                uint32_t u = neighbors[ni];
+                if (u < N) __builtin_prefetch(&gpq4_norm_sq_[u], 0, 1);
+            }
+            block_ip_lp.resize((size_t)nblk * 16);
+            for (uint32_t b = 0; b < nblk; ++b)
+                NGT::NGTAQ::gpq4_batch_ip(blocks + (size_t)b * blk_bytes,
+                                          batch_lut_tl, block_ip_lp.data() + (size_t)b * 16);
+            for (size_t ni = 0; ni < n_nbrs; ++ni) {
+                uint32_t u = neighbors[ni];
+                if (u >= N || graph_->isTombstone(u)) continue;  // skip tombstone at INSERT
+                if (is_visited(u)) continue;
+                mark_visited(u);
+                const uint32_t b = (uint32_t)(ni / 16), pos = (uint32_t)(ni % 16);
+                float ip   = block_ip_lp[(size_t)b * 16 + pos];
+                float nsq  = gpq4_norm_sq_[u];
+                float d_u  = q_ns_batch + nsq - 2.0f * ip;
+                lp.insert(u, d_u);   // pool drops it if worse than the ef-th best
+            }
+        }
+        AQ_ADD(dabs);
+        goto post_dabs;  // skip the legacy cand_q loop entirely
+    }
 
     while (!cand_q.empty()) {
         // Visit-budget cap: bound total processed nodes (primary recall-QPS knob).
@@ -1864,6 +1988,8 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
     }
 
     AQ_ADD(dabs);  // [AQ_PROFILE] region (b): DABS beam-search loop
+
+post_dabs:  // Tech 2 batch LinearPool loop jumps here (skips the legacy cand_q loop)
 
     // Skip-rerank fast path (rerank_factor < 0): return top-k by approximate ADC
     // distance, no exact L2 refinement. Cheap low-recall path (QBG/QG essence:
