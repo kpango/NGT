@@ -1763,6 +1763,32 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
     const int n_probe = (n_probe_override_ > 0) ? n_probe_override_
                                                  : (is_angular_ ? 20 : 3);
     struct SeedScore { float score; uint32_t id; };
+    // Phase 3: graph-only entry (QG-style). When AQ_GRAPH_ENTRY=1 (coarse/batch path only),
+    // skip the IVF cluster-probe seeding entirely — no 2-level centroid scan, no per-cluster
+    // member scan — and seed the LinearPool from a small fixed set of entry points scored by
+    // the coarse (gpq4 dist-LUT) metric. Saves the ~6us setup+seed at the cost of warm-start
+    // quality (the now-accurate graph walk recovers it on L2; risky for angular / very low ef).
+    static const bool graph_entry = [] {
+        const char* e = std::getenv("AQ_GRAPH_ENTRY");
+        return e && std::atoi(e) != 0;
+    }();
+    if (graph_entry && use_batch) {
+        static thread_local std::vector<SeedScore> scored;
+        scored.clear();
+        for (uint32_t ep : entry_points_) {
+            if (ep >= N || graph_->isTombstone(ep)) continue;
+            scored.push_back({coarse_dist(ep), ep});
+        }
+        if (scored.empty() && N > 0) scored.push_back({coarse_dist(0u), 0u});
+        std::sort(scored.begin(), scored.end(),
+                  [](const SeedScore& a, const SeedScore& b){ return a.score < b.score; });
+        for (const auto& s : scored) {
+            if (is_visited(s.id)) continue;
+            mark_visited(s.id);
+            lp.insert(s.id, s.score);
+        }
+        goto seeds_done;  // skip the IVF seeding block below
+    }
     {
         // Build list of clusters to probe: primary cluster + top-(n_probe-1) neighbors.
         // cluster_neighbors_v2_[active_cid] is sorted by cluster-centroid L2 distance.
@@ -1949,6 +1975,8 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
             }
         }
     }
+
+seeds_done:  // Phase 3 graph-only entry jumps here, skipping the IVF seeding block
 
     AQ_ADD(seed);  // [AQ_PROFILE] region (a): cluster-probe seeding + seed enqueue
 
@@ -2341,9 +2369,19 @@ post_dabs:  // Tech 2 batch LinearPool loop jumps here (skips the legacy cand_q 
     // exact-rerank pool to recover true k-NN. AQ_REFINE_MULT still overrides when larger.
     const size_t refine_floor = use_batch ? (size_t)2000
                                           : (use_global_pq ? (size_t)1000 : (size_t)0);
-    const size_t refine_n = std::max<size_t>(
+    size_t refine_n = std::max<size_t>(
         std::max<size_t>(static_cast<size_t>(k_beam) * refine_mult, refine_floor),
         static_cast<size_t>(k_out) * static_cast<size_t>(rerank_factor > 0 ? rerank_factor : 1));
+    // Phase 4: recall-adaptive rerank window (batch path). AQ_RERANK_N>0 caps the exact-L2
+    // rerank to the top-N popped candidates BY QUANTIZED DISTANCE (results is keyed on the
+    // gpq4 pool distance), QG-style — rerank only the best N of the explored set instead of
+    // ALL popped. Decouples rerank cost from hop count. Finer quant (M=128) orders well
+    // enough that a small N may hold recall; sweep to find the knee.
+    static const int rerank_n_env = [] {
+        const char* e = std::getenv("AQ_RERANK_N");
+        return e ? std::atoi(e) : 0;
+    }();
+    if (use_batch && rerank_n_env > 0) refine_n = static_cast<size_t>(rerank_n_env);
     if (results.size() > refine_n) {
         std::nth_element(results.begin(), results.begin() + refine_n, results.end());
         results.resize(refine_n);
