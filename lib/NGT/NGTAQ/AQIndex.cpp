@@ -1775,12 +1775,19 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
     const int N_CLUSTER_SEEDS =
         use_coarse ? (coarse_seeds_env > 0 ? coarse_seeds_env : 8)
                    : prop_.n_cluster_seeds;
-    // n_probe: angular data seeds from more clusters than L2 for accurate d_k initialization.
-    // Per-cluster tier-2 scoring gives cross-cluster seeds with correct ADC residuals,
-    // so d_k is properly initialized before DABS beam search begins.
-    // L2 data: DABS with 3 neighbor clusters is highly effective.
+    // n_probe: number of IVF clusters probed for seeding.
+    // L2: 3 neighbor clusters (magnitude diversity keeps true NNs local).
+    // Angular (BATCH path): MEASURED — the legacy n_probe=20 cost ~225us/query of seeding
+    // (>50% of the GloVe query) for NO recall benefit over n_probe=1: a single probed
+    // cluster's seeds warm-start the now-accurate gpq4 graph walk, which recovers the rest.
+    // n_probe=1 is ~3x faster at iso-recall (GloVe r=0.66: 4737->14219 QPS) and flips angular
+    // low-recall from a loss to a WIN vs fair QG-qsg2 (r<=0.70: 1.08-1.16x). So default the
+    // BATCH angular path to n_probe=1. Legacy (non-batch) angular keeps 20 (its per-cluster
+    // ADC seeding genuinely needs the cross-cluster coverage). AQ_NPROBE / setNProbe override.
+    const bool batch_angular = is_angular_ && use_coarse;
+    const int angular_default = batch_angular ? 1 : 20;
     const int n_probe = (n_probe_override_ > 0) ? n_probe_override_
-                                                 : (is_angular_ ? 20 : 3);
+                                                 : (is_angular_ ? angular_default : 3);
     struct SeedScore { float score; uint32_t id; };
     // Phase 3: graph-only entry (QG-style). When AQ_GRAPH_ENTRY=1 (coarse/batch path only),
     // skip the IVF cluster-probe seeding entirely — no 2-level centroid scan, no per-cluster
