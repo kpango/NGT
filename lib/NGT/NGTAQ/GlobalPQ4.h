@@ -57,6 +57,110 @@ inline uint8_t gpq4_encode_sub(const float* sv, const float* cb_sub /* [16][D_su
 }
 
 // ---------------------------------------------------------------------------
+// ScaNN anisotropic (noise-shaped) encoding of ONE rotated vector across all M subspaces.
+// Port of ScaNN IndexDatapointNoiseShaped (asymmetric_hashing_impl.cc:282-503). The plain
+// per-subspace L2-argmin minimizes reconstruction MSE; anisotropic instead minimizes
+//   eta * ||r_parallel||^2 + ||r_perp||^2   (r = x - x_recon, split by x's direction),
+// penalizing the PARALLEL residual (the ranking-critical component) by eta>1. The codebook
+// stays plain k-means; only the per-vector code SELECTION changes. eta==1 reproduces the
+// L2-argmin bit-for-bit. Codes stay 0..15 (no LUT/kernel/storage change).
+//
+//   xr        : the rotated full vector [M*D_sub]
+//   cb        : codebook [M][16][D_sub] (sub-major, code-major) — same layout as gpq4_cb
+//   M, D_sub  : subspace count, subspace dim
+//   eta       : parallel cost multiplier (>=1)
+//   codes_out : [M] selected codes
+//   recon_norm_sq (out) : sum_s ||centroid[s][code_s]||^2 (feeds gpq4_norm_sq_)
+inline void gpq4_encode_anisotropic(const float* xr, const float* cb, int M, int D_sub,
+                                    float eta, uint8_t* codes_out, float& recon_norm_sq) {
+    // ||x||: norm of the rotated vector (over all M*D_sub dims). inv_norm scales the
+    // per-coordinate parallel projection r_i * x_i / ||x||.
+    double nrm2 = 0.0;
+    for (int d = 0; d < M * D_sub; ++d) nrm2 += (double)xr[d] * xr[d];
+    const double inv_norm = (nrm2 > 1e-30) ? 1.0 / std::sqrt(nrm2) : 0.0;
+
+    // Per-subspace, per-code stats: residual_norm[s][k] = ||sv_s - c_{s,k}||^2,
+    // par[s][k] = <sv_s - c_{s,k}, x_s> * inv_norm  (1-D projection contribution).
+    static thread_local std::vector<float> rn_tl, par_tl;
+    rn_tl.assign((size_t)M * GPQ4_K, 0.f);
+    par_tl.assign((size_t)M * GPQ4_K, 0.f);
+    for (int s = 0; s < M; ++s) {
+        const float* sv = xr + (size_t)s * D_sub;
+        const float* cbs = cb + (size_t)s * GPQ4_K * D_sub;
+        for (int k = 0; k < GPQ4_K; ++k) {
+            const float* c = cbs + (size_t)k * D_sub;
+            double rn = 0.0, par = 0.0;
+            for (int d = 0; d < D_sub; ++d) {
+                double rc = (double)sv[d] - (double)c[d];
+                rn  += rc * rc;
+                par += rc * (double)sv[d] * inv_norm;
+            }
+            rn_tl[(size_t)s * GPQ4_K + k]  = (float)rn;
+            par_tl[(size_t)s * GPQ4_K + k] = (float)par;
+        }
+    }
+
+    // Init each subspace to argmin residual_norm (== eta=1 L2 baseline).
+    static thread_local std::vector<uint8_t> code_tl;
+    code_tl.assign(M, 0);
+    double total_par = 0.0;
+    for (int s = 0; s < M; ++s) {
+        const float* rn = &rn_tl[(size_t)s * GPQ4_K];
+        int best = 0; float bv = rn[0];
+        for (int k = 1; k < GPQ4_K; ++k) if (rn[k] < bv) { bv = rn[k]; best = k; }
+        code_tl[s] = (uint8_t)best;
+        total_par += par_tl[(size_t)s * GPQ4_K + best];
+    }
+
+    // eta==1 (or no-op): the anisotropic cost reduces to residual_norm, so the argmin
+    // init IS the optimum — skip coordinate descent (guarantees bit-identical to L2-argmin).
+    if (eta > 1.0f) {
+        // Process subspaces in descending init-residual-norm order (ScaNN), recomputed once.
+        static thread_local std::vector<int> order_tl;
+        order_tl.assign(M, 0);
+        for (int s = 0; s < M; ++s) order_tl[s] = s;
+        std::sort(order_tl.begin(), order_tl.end(), [&](int a, int b){
+            return rn_tl[(size_t)a * GPQ4_K + code_tl[a]] > rn_tl[(size_t)b * GPQ4_K + code_tl[b]];
+        });
+        const double pcm = (double)eta;  // parallel_cost_multiplier
+        for (int round = 0, changed = 1; changed && round < 10; ++round) {
+            changed = 0;
+            for (int oi = 0; oi < M; ++oi) {
+                const int s = order_tl[oi];
+                const float* rn = &rn_tl[(size_t)s * GPQ4_K];
+                const float* pr = &par_tl[(size_t)s * GPQ4_K];
+                const uint8_t cur = code_tl[s];
+                const double old_rn = rn[cur], old_par = pr[cur];
+                double best_delta = 0.0; int best_k = cur; double best_total_par = total_par;
+                for (int k = 0; k < GPQ4_K; ++k) {
+                    if (k == (int)cur) continue;
+                    const double new_total_par = total_par - old_par + pr[k];
+                    const double par_norm_delta = new_total_par * new_total_par - total_par * total_par;
+                    if (par_norm_delta > 0.0) continue;                 // ScaNN: skip if parallel grows
+                    const double rn_delta = (double)rn[k] - old_rn;
+                    const double perp_norm_delta = rn_delta - par_norm_delta;
+                    const double cost_delta = pcm * par_norm_delta + perp_norm_delta;
+                    if (cost_delta < best_delta) {
+                        best_delta = cost_delta; best_k = k; best_total_par = new_total_par;
+                    }
+                }
+                if (best_k != (int)cur) {
+                    code_tl[s] = (uint8_t)best_k; total_par = best_total_par; changed = 1;
+                }
+            }
+        }
+    }
+
+    // Emit codes + recon_norm_sq (||centroid||^2 summed), exactly as the L2 path does.
+    for (int s = 0; s < M; ++s) {
+        const uint8_t c = code_tl[s];
+        codes_out[s] = c;
+        const float* cv = cb + ((size_t)s * GPQ4_K + c) * D_sub;
+        for (int d = 0; d < D_sub; ++d) recon_norm_sq += cv[d] * cv[d];
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Per-query uint8 LUT for the batch kernel.
 //   IP ~= acc * scale + total_offset
 // with a single global `scale` and per-subspace offsets folded into `total_offset`,

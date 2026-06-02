@@ -854,15 +854,27 @@ NGTAQIndex NGTAQIndex::fromNGTv2(const std::string& ngt_path, const Property& pr
                        sub_km.centroid(code),
                        (size_t)GDsub * sizeof(float));
         }
+        // ScaNN anisotropic encoding knob (AQ_GPQ4_ETA, default 1.0). eta=1 => plain
+        // per-subspace L2-argmin (bit-identical to gpq4_encode_sub). eta>1 => noise-shaped
+        // coordinate descent that sharpens RANKING at the same 4-bit budget (codebook,
+        // LUT, kernel, storage all unchanged — only code selection differs).
+        const float gpq4_eta = []{ const char* e = std::getenv("AQ_GPQ4_ETA");
+            float v = e ? (float)std::atof(e) : 1.0f; return v < 1.0f ? 1.0f : v; }();
+        fprintf(stderr, "[NGTAQv2] GPQ4 encoding with eta=%.2f (%s)\n", gpq4_eta,
+                gpq4_eta > 1.0f ? "ScaNN anisotropic" : "L2-argmin");
         #pragma omp parallel for schedule(static)
         for (size_t i = 0; i < N; ++i) {
             if (is_hole[i]) continue;
             const float* xr = rotated.data() + i*D;
             uint8_t* codes = gpq4_codes.data() + i*(size_t)GM;
             float rns = 0.f;
-            for (int sub = 0; sub < GM; ++sub)
-                codes[sub] = NGT::NGTAQ::gpq4_encode_sub(
-                    xr + sub*GDsub, gpq4_cb.data() + (size_t)sub*NGT::NGTAQ::GPQ4_K*GDsub, GDsub, rns);
+            if (gpq4_eta > 1.0f) {
+                NGT::NGTAQ::gpq4_encode_anisotropic(xr, gpq4_cb.data(), GM, GDsub, gpq4_eta, codes, rns);
+            } else {
+                for (int sub = 0; sub < GM; ++sub)
+                    codes[sub] = NGT::NGTAQ::gpq4_encode_sub(
+                        xr + sub*GDsub, gpq4_cb.data() + (size_t)sub*NGT::NGTAQ::GPQ4_K*GDsub, GDsub, rns);
+            }
             gpq4_norm_sq[i] = rns;
         }
         fprintf(stderr, "[NGTAQv2] GLOBAL PQ-16 done.\n");
