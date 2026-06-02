@@ -28,10 +28,17 @@
 #include <chrono>
 namespace { struct AqProf { double seed=0,dabs=0,refine=0,expand=0,rerank=0,setup=0;
   double srht=0,lut=0; double hops=0,npops=0; long n=0;
-  ~AqProf(){ if(n) fprintf(stderr,
+  // Task 1: result-set stabilization-hop = max pop-index among the final top-10 winners.
+  double stab_sum=0; long stab_n=0; std::vector<int> stab_samples;
+  ~AqProf(){ if(n) { fprintf(stderr,
     "[AQ_PROFILE] n=%ld setup=%.1f (srht=%.1f lut=%.1f) seed=%.1f dabs=%.1f refine=%.1f expand=%.1f rerank=%.1f us/query | hops=%.1f npops=%.1f ns/hop=%.1f\n",
     n, setup/n, srht/n, lut/n, seed/n, dabs/n, refine/n, expand/n, rerank/n,
-    hops/n, npops/n, hops>0?dabs*1000.0/hops:0.0); } };
+    hops/n, npops/n, hops>0?dabs*1000.0/hops:0.0);
+    if (stab_n) { auto s = stab_samples; std::sort(s.begin(), s.end());
+      auto pc=[&](double p){ return s.empty()?0:s[(size_t)(p*(s.size()-1))]; };
+      fprintf(stderr, "[AQ_STAB] stabilization-hop mean=%.1f p50=%d p90=%d p99=%d  (vs hops=%.1f) "
+        "=> wasted-frac mean=%.2f\n", stab_sum/stab_n, pc(0.50), pc(0.90), pc(0.99),
+        hops/n, 1.0 - (stab_sum/stab_n)/(hops/n>0?hops/n:1)); } } } };
   thread_local AqProf g_aqprof; }
 #define AQ_T0() auto _t=std::chrono::steady_clock::now(); auto _ts=_t
 #define AQ_ADD(f) do{auto _e=std::chrono::steady_clock::now(); \
@@ -2001,10 +2008,28 @@ seeds_done:  // Phase 3 graph-only entry jumps here, skipping the IVF seeding bl
         // per-neighbor vector data and tunes po), our batch path reads the whole GPQ4 block
         // in one vpshufb shot — there is no per-neighbor data gather to tune. So we keep the
         // single next-frontier prefetch (already optimal); no auto-tune machinery needed.
+        // Task 3: QG-style epsilon early-termination. NGTAQ's LinearPool otherwise pops the
+        // WHOLE ef frontier (has_next == cur_<ef) with no distance stop, so it over-explores
+        // far past where the top-k result set stabilizes (measured: ~56% of hops wasted at
+        // r=0.96, ~75% at r=0.99). Mirror QG (QuantizedGraph.h:331): stop when the next
+        // frontier candidate's quantized distance exceeds (1+eps) * the k-th best result
+        // distance (the pool is sorted ascending, so data_[k-1].dist IS the k-th best, and
+        // data_[cur_].dist IS the next candidate). eps=0 disables (default), preserving the
+        // exact prior behavior. The exact fp16 rerank below still recovers true k-NN.
+        static const float term_eps = [] {
+            const char* e = std::getenv("AQ_TERM_EPS");
+            return e ? (float)std::atof(e) : -1.0f;  // <0 => disabled (default)
+        }();
+        const float term_coeff = 1.0f + term_eps;
         while (lp.has_next()) {
             // Capture the frontier node's pool distance BEFORE pop advances the cursor —
             // it IS x's coarse (gpq4) score, so no recompute is needed for `results`.
             float dx = lp.data_[lp.cur_].dist;
+            // Epsilon early-stop: once the pool holds >= k results, if the next candidate is
+            // farther than (1+eps)*k-th-best, no remaining candidate can improve the top-k.
+            if (term_eps >= 0.0f && lp.size_ >= k_out &&
+                dx > term_coeff * lp.data_[k_out - 1].dist)
+                break;
             uint32_t x = lp.pop();
             // Prefetch the next frontier node's GPQ4 block + neighbor list while we work.
             if (lp.cur_ < lp.size_) {
@@ -2421,6 +2446,26 @@ post_dabs:  // Tech 2 batch LinearPool loop jumps here (skips the legacy cand_q 
     // Exact L2 refinement: l2_sq_avx2 for D=128 ≈ 5ns/vector × 150 = 0.75μs.
     // Store squared distances to avoid redundant sqrts during sort; take sqrt only
     // for the final top-k (10 sqrts instead of 150).
+#ifdef AQ_PROFILE
+    // Task 1: stabilization-hop. `results` is in pop order (one entry per popped hop), so
+    // index i == the hop at which node results[i] was discovered. Rerank ALL by exact L2,
+    // take the true top-k, and record the MAX pop-index among those k winners = the last
+    // hop that contributed a surviving result. If << total hops, the tail is wasted.
+    if (use_batch && !results.empty()) {
+        std::vector<std::pair<float,int>> ex; ex.reserve(results.size());  // (exact_sq, hop_idx)
+        for (size_t i = 0; i < results.size(); ++i) {
+            uint32_t id = results[i].second;
+            if ((size_t)id * D + D > raw_flat_.size() || graph_->isTombstone(id)) continue;
+            const uint16_t* v = raw_flat_.data() + (size_t)id * D;
+            ex.push_back({ NGT::NGTAQ::l2_sq_f32_fp16(q_ptr, v, D), (int)i });
+        }
+        size_t kk = std::min((size_t)k_out, ex.size());
+        std::partial_sort(ex.begin(), ex.begin() + kk, ex.end(),
+            [](const auto&a, const auto&b){ return a.first < b.first; });
+        int stab = 0; for (size_t i = 0; i < kk; ++i) stab = std::max(stab, ex[i].second);
+        g_aqprof.stab_sum += stab; g_aqprof.stab_n += 1; g_aqprof.stab_samples.push_back(stab);
+    }
+#endif
     std::vector<SearchResult> final_results;
     final_results.reserve(results.size());
     for (auto& [approx_d, id] : results) {
