@@ -1182,6 +1182,85 @@ float NGTAQIndex::buildGlobalLUT16(const std::vector<float>& query,
     return q_norm_sq;
 }
 
+// Diagnostic: mean |neighbor_id - node_id| over the CSR (graph ID-locality proxy).
+std::pair<double,double> NGTAQIndex::graphLocalityStats() const {
+    const size_t N = graph_->size();
+    double sum_gap = 0.0, sum_deg = 0.0; size_t cnt = 0;
+    for (uint32_t i = 0; i < (uint32_t)N; ++i) {
+        if (graph_->isTombstone(i)) continue;
+        auto nbrs = graph_->getNeighbors(i);
+        sum_deg += (double)nbrs.size();
+        for (size_t k = 0; k < nbrs.size(); ++k) {
+            uint32_t u = nbrs[k];
+            sum_gap += (u > i) ? (double)(u - i) : (double)(i - u);
+            ++cnt;
+        }
+    }
+    return { cnt ? sum_gap / cnt : 0.0, N ? sum_deg / N : 0.0 };
+}
+
+// BFS node-ID reorder for walk cache-locality (Task 2). Pure permutation; recall-invariant.
+void NGTAQIndex::reorderForLocality() {
+    const size_t N = graph_->size();
+    if (N == 0) return;
+    if (graph_->hasTombstones())
+        throw std::runtime_error("reorderForLocality: rebuild() to compact tombstones first");
+
+    // 1. BFS from entry points → old node id visited order → old_to_new (o2n).
+    std::vector<uint32_t> o2n(N, UINT32_MAX);
+    std::vector<uint32_t> queue; queue.reserve(N);
+    uint32_t next_id = 0;
+    auto push = [&](uint32_t old_id) {
+        if (o2n[old_id] == UINT32_MAX) { o2n[old_id] = next_id++; queue.push_back(old_id); }
+    };
+    for (uint32_t ep : entry_points_) if (ep < N) push(ep);
+    if (next_id == 0) push(0);  // fallback seed
+    for (size_t head = 0; head < queue.size(); ++head) {
+        uint32_t x = queue[head];
+        for (uint32_t u : graph_->getNeighbors(x)) if (u < N) push(u);
+    }
+    // Disconnected nodes (not reached by BFS) keep relative order at the tail.
+    for (uint32_t i = 0; i < (uint32_t)N; ++i) if (o2n[i] == UINT32_MAX) o2n[i] = next_id++;
+
+    // 2. Permute the graph (CSR + bq + v2 records) and invalidate gpq4/packed stores.
+    graph_->applyPermutation(o2n);
+
+    // 3. Permute NGTAQIndex node-keyed arrays. Helper for a row-major [N*stride] vector.
+    auto permute_rows = [&](auto& vec, size_t stride) {
+        if (vec.empty()) return;
+        using T = typename std::decay_t<decltype(vec)>::value_type;
+        std::vector<T> nv(vec.size());
+        for (uint32_t i = 0; i < (uint32_t)N; ++i)
+            std::memcpy(&nv[(size_t)o2n[i] * stride], &vec[(size_t)i * stride], stride * sizeof(T));
+        vec.swap(nv);
+    };
+    permute_rows(raw_flat_,          (size_t)dEff());
+    permute_rows(gpq4_codes_,        (size_t)gpq4MPQ());
+    permute_rows(gpq4_norm_sq_,      1);
+    if (has_global_pq_) { permute_rows(global_codes_, (size_t)m_pq_); permute_rows(global_pq_norm_sq_, 1); }
+    if (has_sq8_) { permute_rows(sq8_codes_, (size_t)sq8_dim_align_); permute_rows(sq8_max_, 1); permute_rows(sq8_norm_, 1); }
+
+    // 4. Remap entry points; clear lazy cluster tables (rebuilt on next search with new IDs).
+    for (auto& ep : entry_points_) if (ep < N) ep = o2n[ep];
+    v2_entry_points_ = entry_points_;
+    cluster_members_v2_.clear();
+    cluster_neighbors_v2_.clear();
+    cluster_members_once_ = std::make_unique<std::once_flag>();
+
+    // 5. Rebuild the gpq4 neighbor-code store from the permuted CSR + permuted per-node codes.
+    if (has_gpq4_)
+        graph_->buildGPQ4(gpq4MPQ(), gpq4_codes_.data(), gpq4_norm_sq_.data());
+
+    // 6. Build internal->external id map (compose with any prior map). new id o2n[old]
+    //    holds old node's data → its external id is the OLD node's external id.
+    std::vector<uint32_t> prev_ext = id_to_external_;  // empty == identity
+    id_to_external_.assign(N, 0);
+    for (uint32_t old_i = 0; old_i < (uint32_t)N; ++old_i) {
+        uint32_t ext = prev_ext.empty() ? old_i : prev_ext[old_i];
+        id_to_external_[o2n[old_i]] = ext;
+    }
+}
+
 // Diagnostic: rotate a raw query through SRHT exactly as searchV2's setup does.
 void NGTAQIndex::rotateForDiag(const float* q, int q_dim, float* out) const {
     const int D = (d_eff_ > 0) ? d_eff_ : prop_.dimension;
@@ -1887,13 +1966,19 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
         // Skip the per-neighbor isTombstone() random gather into state_ (1 MB) when the
         // index has no tombstones (the common case for a freshly built SIFT index).
         const bool has_tomb = graph_->hasTombstones();
+        // Task 1 (prefetch auto-tune, pyglass Optimize() analogue): MEASURED a sweep of the
+        // frontier-prefetch depth — depth=1 is optimal; depth>1 monotonically regresses
+        // (the pool re-sorts on every insert, so nodes past cur_ are NOT the actual
+        // next-popped ones → deeper prefetch pollutes cache). Unlike pyglass (which gathers
+        // per-neighbor vector data and tunes po), our batch path reads the whole GPQ4 block
+        // in one vpshufb shot — there is no per-neighbor data gather to tune. So we keep the
+        // single next-frontier prefetch (already optimal); no auto-tune machinery needed.
         while (lp.has_next()) {
             // Capture the frontier node's pool distance BEFORE pop advances the cursor —
             // it IS x's coarse (gpq4) score, so no recompute is needed for `results`.
             float dx = lp.data_[lp.cur_].dist;
             uint32_t x = lp.pop();
-            // Prefetch the next frontier node's GPQ4 block + co-located packed node while
-            // we process x (single 5-cache-line prefetch instead of record+offset+edges).
+            // Prefetch the next frontier node's GPQ4 block + neighbor list while we work.
             if (lp.cur_ < lp.size_) {
                 uint32_t nxt = AQLinearPool::rawid(lp.data_[lp.cur_].id);
                 graph_->prefetchGPQ4(nxt);
@@ -2218,6 +2303,9 @@ post_dabs:  // Tech 2 batch LinearPool loop jumps here (skips the legacy cand_q 
             if (graph_->isTombstone(id)) continue;
             approx_results.push_back({id, results[i].first, results[i].first});
         }
+        if (!id_to_external_.empty())
+            for (auto& r : approx_results)
+                if (r.id < id_to_external_.size()) r.id = id_to_external_[r.id];
         AQ_ADD(refine);
         AQ_ADD(expand);
         AQ_ADD(rerank);
@@ -2319,6 +2407,10 @@ post_dabs:  // Tech 2 batch LinearPool loop jumps here (skips the legacy cand_q 
     final_results.resize(out_n);
     // Now apply sqrt to the top-k distances (deferred from above).
     for (auto& r : final_results) r.distance = std::sqrt(r.distance);
+    // Task 2: translate internal ids back to original (insertion-order) ids if reordered.
+    if (!id_to_external_.empty())
+        for (auto& r : final_results)
+            if (r.id < id_to_external_.size()) r.id = id_to_external_[r.id];
 
     AQ_ADD(rerank);  // [AQ_PROFILE] region (e): exact-L2 rerank + partial_sort
 #ifdef AQ_PROFILE
@@ -2681,6 +2773,13 @@ void NGTAQIndex::saveV2(const std::string& dir) const {
         f.write(reinterpret_cast<const char*>(sq8_max_.data()),   sq8_max_.size()   * sizeof(float));
         f.write(reinterpret_cast<const char*>(sq8_norm_.data()),  sq8_norm_.size()  * sizeof(float));
     }
+    // Task 2: internal->external id map (present only after BFS reorder; sidecar, file-keyed).
+    if (!id_to_external_.empty()) {
+        std::ofstream f(dir + "/v2_idmap.bin", std::ios::binary);
+        uint64_t n = (uint64_t)id_to_external_.size();
+        f.write(reinterpret_cast<const char*>(&n), sizeof(n));
+        f.write(reinterpret_cast<const char*>(id_to_external_.data()), n * sizeof(uint32_t));
+    }
     // Metadata: is_angular_, d_eff_, m_pq_, meta_version [, gpq4_m_pq_].
     // meta_version: 1 = no global PQ (legacy), 2 = K=256 global PQ, 3 = K=16 GPQ4 store
     //               (D_sub=8, gpq4_m_pq_ == m_pq_), 4 = GPQ4 with its OWN gpq4_m_pq_ (slot 4).
@@ -2850,6 +2949,19 @@ void NGTAQIndex::loadV2(const std::string& dir) {
                 f.read(reinterpret_cast<char*>(sq8_max_.data()),   sq8_max_.size()   * sizeof(float));
                 f.read(reinterpret_cast<char*>(sq8_norm_.data()),  sq8_norm_.size()  * sizeof(float));
                 has_sq8_ = (f.good() || f.eof());
+            }
+        }
+    }
+    // Task 2: load the internal->external id map sidecar if present (BFS-reordered index).
+    {
+        std::ifstream f(dir + "/v2_idmap.bin", std::ios::binary);
+        if (f) {
+            uint64_t n = 0;
+            f.read(reinterpret_cast<char*>(&n), sizeof(n));
+            if (f && n > 0) {
+                id_to_external_.resize((size_t)n);
+                f.read(reinterpret_cast<char*>(id_to_external_.data()), n * sizeof(uint32_t));
+                if (!(f.good() || f.eof())) id_to_external_.clear();
             }
         }
     }

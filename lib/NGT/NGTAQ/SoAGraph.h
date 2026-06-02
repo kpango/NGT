@@ -83,6 +83,45 @@ public:
         }
     }
 
+    // Apply a node-ID permutation: new node `o2n[i]` gets old node i's data, and every
+    // neighbor reference is remapped through o2n. Remaps CSR (offsets/edges), bq_data_, and
+    // v2_records_flat_ consistently. Used by NGTAQIndex::reorderForLocality (BFS relayout).
+    // o2n[i] = new id of old node i (must be a bijection over [0,N)). Caller remaps the
+    // NGTAQIndex-side node-keyed arrays (gpq4/sq8/raw_flat/etc.) and rebuilds the gpq4 store.
+    void applyPermutation(const std::vector<uint32_t>& o2n) {
+        const size_t N = state_.size();
+        // 1. New per-node neighbor lists in NEW id order, neighbors remapped.
+        std::vector<std::vector<uint32_t>> adj(N);
+        for (uint32_t old_i = 0; old_i < (uint32_t)N; ++old_i) {
+            uint32_t ni = o2n[old_i];
+            uint32_t b = offsets_[old_i], e = offsets_[old_i + 1];
+            adj[ni].reserve(e - b);
+            for (uint32_t k = b; k < e; ++k) adj[ni].push_back(o2n[edge_ids_[k]]);
+        }
+        // 2. Permute bq_data_ (words_*2 uint64 per node) and v2_records_flat_.
+        std::vector<uint64_t> new_bq(bq_data_.size());
+        const size_t wstride = (size_t)words_ * 2;
+        for (uint32_t old_i = 0; old_i < (uint32_t)N; ++old_i) {
+            std::memcpy(&new_bq[(size_t)o2n[old_i] * wstride], &bq_data_[(size_t)old_i * wstride],
+                        wstride * sizeof(uint64_t));
+        }
+        bq_data_.swap(new_bq);
+        if (!v2_records_flat_.empty()) {
+            std::vector<uint8_t> new_rec(v2_records_flat_.size());
+            const size_t rs = (size_t)v2_rec_stride_;
+            for (uint32_t old_i = 0; old_i < (uint32_t)N; ++old_i)
+                std::memcpy(&new_rec[(size_t)o2n[old_i] * rs], &v2_records_flat_[(size_t)old_i * rs], rs);
+            v2_records_flat_.swap(new_rec);
+        }
+        // 3. Rebuild CSR from the permuted adjacency, then invalidate the gpq4/packed stores
+        //    (caller rebuilds them).
+        resetEdges(adj);
+        finalizeCSR();
+        gpq4_m_ = 0; gpq4_offsets_.clear(); gpq4_blocks_.clear(); gpq4_fused_norm_ = false;
+        packed_v2_.clear();
+        // state_ stays all-ACTIVE (reorder is post-load, holes already excluded).
+    }
+
     // Replace neighbor list for node_id. Adjusts all subsequent offsets.
     // Thread-unsafe: caller must hold exclusive lock.
     //

@@ -171,6 +171,17 @@ public:
     // the searchV2 setup (zero-pad to D, then SRHT apply). out must be sized dEff().
     void rotateForDiag(const float* q, int q_dim, float* out) const;
 
+    // Diagnostic: mean |neighbor_id - node_id| over the CSR (graph ID-locality proxy).
+    // Large gap => walked nodes' gpq4 blocks are scattered (reordering may help); small
+    // gap => already cache-local (reordering won't help). Returns {mean_gap, mean_degree}.
+    std::pair<double,double> graphLocalityStats() const;
+
+    // Reorder node IDs into BFS order from the entry points so graph-adjacent nodes get
+    // nearby IDs (walk cache-locality). Pure permutation — remaps CSR, gpq4 store/codes/
+    // norms, sq8, raw_flat_, global codes/norms, cluster members, entry points consistently
+    // → recall byte-identical, only memory layout changes. Call before saveV2 (needs re-save).
+    void reorderForLocality();
+
     // Rebuild v2 graph edges from a (denser) NGT source index without re-training
     // SRHT/K-means/PCA/PQ (those are reused from the existing index).
     // Only the graph construction + entry point selection are re-run.
@@ -211,6 +222,10 @@ private:
     DABSSearcher                    searcher_;
     std::vector<uint32_t>           entry_points_;
     std::vector<uint16_t>           raw_flat_;     // flat [N*D] exact vectors, fp16-packed (rerank via l2_sq_f32_fp16)
+    // Task 2 (BFS reorder): when node IDs are permuted for cache locality, results carry
+    // INTERNAL ids; this maps internal -> original (insertion-order) id so returned ids
+    // still match the caller's ground truth. Empty == identity (no reorder). Serialized.
+    std::vector<uint32_t>           id_to_external_;
 
     int                                       n_probe_override_ = 0;  // 0 = default
 
