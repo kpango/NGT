@@ -957,10 +957,55 @@ NGTAQIndex NGTAQIndex::fromNGTv2(const std::string& ngt_path, const Property& pr
         if (static_cast<int>(candidates.size()) > prop.max_edges)
             candidates.resize(static_cast<size_t>(prop.max_edges));
 
-        auto dist_fn = [&](uint32_t v, uint32_t u) -> float {
-            return bqDistance(graph->getNodeBQ(v), graph->getNodeBQ(u), words, D);
-        };
-        adj[aq_id] = pruner.prune(candidates, tau, dist_fn);
+        // Tech 3-FULL: when the source NGT index is already an ONNG (reconstruct-graph
+        // produced a navigability-optimized graph), the BQ-space AlphaCG occlusion prune
+        // can UNDO that navigability. AQ_KEEP_ONNG=1 keeps the ONNG edges verbatim
+        // (BQ-sorted + truncated to max_edges) — no re-prune.
+        static const bool keep_onng = [] {
+            const char* e = std::getenv("AQ_KEEP_ONNG");
+            return e && std::atoi(e) != 0;
+        }();
+        // Tech 3-FULL (route 2): SSG-style ANGLE occlusion (pyglass NSG sync_prune).
+        // Prune u if an accepted neighbor v subtends an angle ∠(v,p,u) below `angle` degrees,
+        // i.e. cos∠ > cos(angle). cos∠ = (d_pu + d_pv − d_vu)/(2·sqrt(d_pu·d_pv)), all in BQ
+        // distance space. A wider min-angle → more spread-out (navigable) edges. AQ_SSG_ANGLE
+        // sets the degrees (default 60, pyglass NSG default). AQ_SSG=1 enables.
+        static const bool use_ssg = [] {
+            const char* e = std::getenv("AQ_SSG");
+            return e && std::atoi(e) != 0;
+        }();
+        static const float ssg_cos = [] {
+            const char* e = std::getenv("AQ_SSG_ANGLE");
+            float deg = e ? std::atof(e) : 60.0f;
+            return std::cos(deg * 3.14159265358979f / 180.0f);
+        }();
+        if (keep_onng) {
+            adj[aq_id].reserve(candidates.size());
+            for (auto& c : candidates) adj[aq_id].push_back(c.first);
+        } else if (use_ssg) {
+            std::vector<std::pair<uint32_t, float>> acc;  // (id, d_pu) of accepted
+            acc.reserve(candidates.size());
+            for (auto& [uid, d_pu] : candidates) {
+                bool occ = false;
+                for (auto& [vid, d_pv] : acc) {
+                    float d_vu = bqDistance(graph->getNodeBQ(vid), graph->getNodeBQ(uid), words, D);
+                    float denom = 2.0f * std::sqrt(std::max(d_pu * d_pv, 1e-12f));
+                    float cos_vu = (d_pu + d_pv - d_vu) / denom;
+                    if (cos_vu > ssg_cos) { occ = true; break; }
+                }
+                if (!occ) {
+                    acc.push_back({uid, d_pu});
+                    if ((int)acc.size() >= prop.max_edges) break;
+                }
+            }
+            adj[aq_id].reserve(acc.size());
+            for (auto& a : acc) adj[aq_id].push_back(a.first);
+        } else {
+            auto dist_fn = [&](uint32_t v, uint32_t u) -> float {
+                return bqDistance(graph->getNodeBQ(v), graph->getNodeBQ(u), words, D);
+            };
+            adj[aq_id] = pruner.prune(candidates, tau, dist_fn);
+        }
     }
     graph->resetEdges(adj);
 

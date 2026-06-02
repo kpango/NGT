@@ -15,6 +15,7 @@
 #include "NGT/NGTAQ/AQIndex.h"
 #include "NGT/NGTAQ/DimUtils.h"
 #include "NGT/Index.h"
+#include "NGT/GraphReconstructor.h"
 #include "hdf5_io.h"
 #include <chrono>
 #include <cmath>
@@ -111,6 +112,40 @@ int main(int argc, char** argv) {
         fprintf(stderr, "NGT error: %s\n", e.what()); return 1;
     }
     fprintf(stderr, "[NGT] ANNG done (%.1fs)\n", elapsed_s(t0));
+
+    // 3b. Tech 3-FULL: optional ONNG reconstruction (mirrors QG's
+    //     `ngt reconstruct-graph -mS -E<o> -o<o> -i<i>`). Replaces the raw ANNG edges with
+    //     a degree-adjusted, shortcut-reduced graph (better navigability → fewer hops to
+    //     recall) BEFORE fromNGTv2 reads them. Env-gated for clean A/B:
+    //       AQ_ONNG=1            enable
+    //       AQ_ONNG_O=<n>        # outgoing edges  (default 32, QG-style)
+    //       AQ_ONNG_I=<n>        # incoming/reverse edges (default 64)
+    //       AQ_ONNG_SHORTCUT=0   disable the -mS shortcut reduction (default on)
+    {
+        const char* e = std::getenv("AQ_ONNG");
+        if (e && std::atoi(e) != 0) {
+            int onng_o = std::getenv("AQ_ONNG_O") ? std::atoi(std::getenv("AQ_ONNG_O")) : 32;
+            int onng_i = std::getenv("AQ_ONNG_I") ? std::atoi(std::getenv("AQ_ONNG_I")) : 64;
+            bool shortcut = !(std::getenv("AQ_ONNG_SHORTCUT") && std::atoi(std::getenv("AQ_ONNG_SHORTCUT")) == 0);
+            fprintf(stderr, "[ONNG] reconstruct-graph o=%d i=%d shortcut=%d ...\n",
+                    onng_o, onng_i, (int)shortcut);
+            try {
+                NGT::Index ngt(ngt_tmp);
+                NGT::GraphIndex& gi = static_cast<NGT::GraphIndex&>(ngt.getIndex());
+                std::vector<NGT::ObjectDistances> extracted;
+                NGT::GraphReconstructor::extractGraph(extracted, gi);
+                // reconstructGraph(graph, outGraph, originalEdgeSize=o, reverseEdgeSize=i)
+                NGT::GraphReconstructor::reconstructGraph(extracted, gi,
+                                                         (size_t)onng_o, (size_t)onng_i);
+                if (shortcut)
+                    NGT::GraphReconstructor::adjustPathsEffectively(ngt, (size_t)onng_o);
+                ngt.saveIndex(ngt_tmp);
+                fprintf(stderr, "[ONNG] done (%.1fs)\n", elapsed_s(t0));
+            } catch (const std::exception& ex) {
+                fprintf(stderr, "[ONNG] error: %s — falling back to raw ANNG\n", ex.what());
+            }
+        }
+    }
 
     // 4. Build AQv2 index
     NGTAQ::NGTAQIndex::Property aq_prop;
