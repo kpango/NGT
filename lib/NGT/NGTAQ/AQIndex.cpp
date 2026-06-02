@@ -1729,16 +1729,22 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
     // neighbors are skipped at INSERT (no per-pop tombstone check). Every popped node is
     // appended to `results` for the existing exact-L2 rerank below.
     if (use_batch) {
+        // Tech 4.1: prefer PackedV2Node neighbor IDs (record + IDs co-located in 5 cache
+        // lines, one prefetch covers them) over the CSR offsets_->edge_ids_ indirection.
+        // Only present when built at load via AQ_PACKED=1 (see loadV2).
+        const bool use_packed = graph_->hasPackedV2();
         while (lp.has_next()) {
             // Capture the frontier node's pool distance BEFORE pop advances the cursor —
             // it IS x's coarse (gpq4) score, so no recompute is needed for `results`.
             float dx = lp.data_[lp.cur_].dist;
             uint32_t x = lp.pop();
-            // Prefetch the next frontier node's GPQ4 block + neighbor list while we work.
+            // Prefetch the next frontier node's GPQ4 block + co-located packed node while
+            // we process x (single 5-cache-line prefetch instead of record+offset+edges).
             if (lp.cur_ < lp.size_) {
                 uint32_t nxt = AQLinearPool::rawid(lp.data_[lp.cur_].id);
                 graph_->prefetchGPQ4(nxt);
-                graph_->prefetchNeighbors(nxt);
+                if (use_packed) graph_->prefetchPackedNode(nxt);
+                else            graph_->prefetchNeighbors(nxt);
             }
             results.push_back({dx, x});  // approximate score for the exact-L2 rerank below
             ++n_visits;
@@ -1748,12 +1754,26 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
             if (!blocks || nblk == 0) continue;
             graph_->prefetchGPQ4(x);
             const size_t blk_bytes = graph_->gpq4BlockBytes();
-            auto neighbors = graph_->getNeighbors(x);
-            const size_t n_nbrs = neighbors.size();
+            // Neighbor IDs: from the packed node (co-located) when its degree fits the
+            // 64-slot store AND matches the CSR degree the GPQ4 blocks were built from;
+            // otherwise fall back to the CSR view so block-position indexing stays aligned.
+            const uint32_t* nbr_ids;
+            size_t n_nbrs;
+            SoAGraph::NeighborView csr_nbrs{nullptr, 0};
+            const SoAGraph::PackedV2Node* pn = use_packed ? graph_->getPackedNode(x) : nullptr;
+            const uint32_t csr_deg = graph_->neighborCount(x);
+            if (pn && csr_deg <= SoAGraph::PACKED_V2_MAX_NBRS && pn->n_nbrs == csr_deg) {
+                nbr_ids = pn->nbrs;
+                n_nbrs  = pn->n_nbrs;
+            } else {
+                csr_nbrs = graph_->getNeighbors(x);
+                nbr_ids  = csr_nbrs.data;
+                n_nbrs   = csr_nbrs.size();
+            }
             static thread_local std::vector<float> block_ip_lp;
             // Prefetch recon-norm gather targets before the vpshufb pass (4MB random gather).
             for (size_t ni = 0; ni < n_nbrs; ++ni) {
-                uint32_t u = neighbors[ni];
+                uint32_t u = nbr_ids[ni];
                 if (u < N) __builtin_prefetch(&gpq4_norm_sq_[u], 0, 1);
             }
             block_ip_lp.resize((size_t)nblk * 16);
@@ -1761,7 +1781,7 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
                 NGT::NGTAQ::gpq4_batch_ip(blocks + (size_t)b * blk_bytes,
                                           batch_lut_tl, block_ip_lp.data() + (size_t)b * 16);
             for (size_t ni = 0; ni < n_nbrs; ++ni) {
-                uint32_t u = neighbors[ni];
+                uint32_t u = nbr_ids[ni];
                 if (u >= N || graph_->isTombstone(u)) continue;  // skip tombstone at INSERT
                 if (is_visited(u)) continue;
                 mark_visited(u);
@@ -2608,6 +2628,17 @@ void NGTAQIndex::loadV2(const std::string& dir) {
             bool store_ok = graph_->loadGPQ4(dir + "/v2_gpq4_store.bin");
             has_gpq4_ = (fc.good() || fc.eof()) && codes_ok && store_ok && graph_->hasGPQ4();
         }
+    }
+    // Tech 4.1: optionally build the DiskANN-style PackedV2Node layout (record + up to 64
+    // neighbor IDs co-located in 5 cache lines) in-memory. The batch DABS loop can then read
+    // neighbor IDs from it instead of the CSR offsets_->edge_ids_ indirection. On SIFT-1M
+    // this saves only ~3% of dabs at mid-recall and ~0 at low recall (offsets_/edge_ids_ are
+    // largely cache-resident once LinearPool shrank the visit count), at a 320 B/node memory
+    // cost. So it is OPT-IN (AQ_PACKED=1) — useful for larger graphs where the CSR round-trip
+    // dominates. No format change (rebuilt from CSR at load).
+    {
+        const char* e = std::getenv("AQ_PACKED");
+        if (e && std::atoi(e) != 0) graph_->buildPackedV2();
     }
     is_v2_ = true;
 }

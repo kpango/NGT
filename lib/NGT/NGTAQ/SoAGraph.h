@@ -117,6 +117,12 @@ public:
         return {edge_ids_.data() + begin, end - begin};
     }
 
+    // CSR out-degree of node_id (used to validate PackedV2Node alignment with GPQ4 blocks).
+    uint32_t neighborCount(uint32_t node_id) const {
+        if (static_cast<size_t>(node_id) + 1 >= offsets_.size()) return 0;
+        return offsets_[node_id + 1] - offsets_[node_id];
+    }
+
     // Returns pointer to the interleaved BQ data for node_id.
     // Layout: [s0, m0, s1, m1, ..., s_{words-1}, m_{words-1}]
     const uint64_t* getNodeBQ(uint32_t node_id) const {
