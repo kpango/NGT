@@ -850,6 +850,27 @@ NGTAQIndex NGTAQIndex::fromNGTv2(const std::string& ngt_path, const Property& pr
         fprintf(stderr, "[NGTAQv2] GLOBAL PQ-16 done.\n");
     }
 
+    // ---- 7d. Tech 1: symmetric SQ8 codes over the SRHT-rotated vectors ----
+    // Per-node int8 (max-scaled) code + max + ||x||^2, for the cheap in-loop routing dot.
+    const int sq8_align = ((D + 63) / 64) * 64;   // pad to multiple of 64 for the VNNI dot
+    std::vector<int8_t> sq8_codes((size_t)N * sq8_align, 0);
+    std::vector<float>  sq8_max(N, 0.f);
+    std::vector<float>  sq8_norm(N, 0.f);
+    {
+        fprintf(stderr, "[NGTAQv2] Encoding symmetric SQ8 codes (dim_align=%d)...\n", sq8_align);
+        #pragma omp parallel for schedule(static)
+        for (size_t i = 0; i < N; ++i) {
+            if (is_hole[i]) continue;
+            const float* xr = rotated.data() + i * D;
+            int8_t* code = sq8_codes.data() + i * (size_t)sq8_align;
+            sq8_max[i] = NGT::NGTAQ::sq8_encode_sym(xr, code, D);  // [D, sq8_align) stays 0
+            float ns = 0.f;
+            for (int d = 0; d < D; ++d) ns += xr[d] * xr[d];
+            sq8_norm[i] = ns;
+        }
+        fprintf(stderr, "[NGTAQv2] SQ8 codes done.\n");
+    }
+
     // ---- 8. Encode all vectors into VectorRecord ----
     // Build the BQ-compatible SoAGraph (needed for existing graph infra + v1 compat)
     BinaryQuantizer bq;
@@ -1000,6 +1021,13 @@ NGTAQIndex NGTAQIndex::fromNGTv2(const std::string& ngt_path, const Property& pr
     idx.gpq4_norm_sq_ = std::move(gpq4_norm_sq);
     idx.has_gpq4_ = true;
     fprintf(stderr, "[NGTAQv2] GPQ4 neighbor-code store built (M=%d, D_sub=%d).\n", GM, GDsub);
+
+    // Tech 1: symmetric SQ8 codes (per-node int8 + max + ||x||^2) for the in-loop dot.
+    idx.sq8_dim_align_ = sq8_align;
+    idx.sq8_codes_ = std::move(sq8_codes);
+    idx.sq8_max_   = std::move(sq8_max);
+    idx.sq8_norm_  = std::move(sq8_norm);
+    idx.has_sq8_   = true;
 
     idx.is_angular_ = (prop.metric == NGT::ObjectSpace::DistanceTypeAngle ||
                        prop.metric == NGT::ObjectSpace::DistanceTypeCosine);
@@ -1482,12 +1510,31 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
         batch_ip_tl.resize((size_t)gpq4MPQ() * NGT::NGTAQ::GPQ4_K);
         q_ns_batch = buildGlobalLUT16(query, batch_lut_tl, batch_ip_tl.data());
     }
+    // Tech 1: symmetric SQ8 in-loop routing distance. Encode the rotated query to int8 once
+    // (per-vector symmetric max scale), then route every neighbor with a single signed-int8
+    // dot (one vpdpbusd pass over D bytes) — no LUT, no gpq4_norm_sq_ gather. Opt-in
+    // (AQ_SQ8=1) so we can A/B it against the gpq4 vpshufb routing.
+    static const bool use_sq8_env = [] {
+        const char* e = std::getenv("AQ_SQ8");
+        return e && std::atoi(e) != 0;
+    }();
+    const bool use_sq8 = use_batch && use_sq8_env && hasSQ8();
+    static thread_local std::vector<int8_t> q_sq8_tl;
+    float q_max_sq8 = 0.f, q_nsq_sq8 = 0.f;
+    if (use_sq8) {
+        q_sq8_tl.assign((size_t)sq8_dim_align_, 0);
+        q_max_sq8 = NGT::NGTAQ::sq8_encode_sym(q_rot_tl.data(), q_sq8_tl.data(), D);
+        for (int d = 0; d < D; ++d) q_nsq_sq8 += q_rot_tl[d] * q_rot_tl[d];
+    }
+    auto sq8_dist1 = [&](uint32_t id) -> float {
+        return sq8Dist(id, q_sq8_tl.data(), q_max_sq8, q_nsq_sq8);
+    };
     auto route_dist = [&](uint32_t id) -> float {
         return globalPQDist(id, global_lut_tl.data(), q_ns_global);
     };
     // Single-node batch-PQ distance (seeds / popped-fallback / expansion).
     auto batch_dist1 = [&](uint32_t id) -> float {
-        return gpq4Dist(id, batch_ip_tl.data(), q_ns_batch);
+        return use_sq8 ? sq8_dist1(id) : gpq4Dist(id, batch_ip_tl.data(), q_ns_batch);
     };
     // Unified single-node "coarse route" used wherever route_dist was used: batch wins.
     auto coarse_dist = [&](uint32_t id) -> float {
@@ -1769,6 +1816,24 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
                 csr_nbrs = graph_->getNeighbors(x);
                 nbr_ids  = csr_nbrs.data;
                 n_nbrs   = csr_nbrs.size();
+            }
+            if (use_sq8) {
+                // Tech 1: symmetric SQ8 routing. One signed-int8 dot per neighbor over the
+                // co-located int8 code — no vpshufb LUT pass, no recon-norm gather. Prefetch
+                // each neighbor's int8 code (sq8_dim_align_ bytes) ahead of the dot.
+                for (size_t ni = 0; ni < n_nbrs; ++ni) {
+                    uint32_t u = nbr_ids[ni];
+                    if (u < N) __builtin_prefetch(
+                        sq8_codes_.data() + (size_t)u * sq8_dim_align_, 0, 1);
+                }
+                for (size_t ni = 0; ni < n_nbrs; ++ni) {
+                    uint32_t u = nbr_ids[ni];
+                    if (u >= N || graph_->isTombstone(u)) continue;
+                    if (is_visited(u)) continue;
+                    mark_visited(u);
+                    lp.insert(u, sq8_dist1(u));
+                }
+                continue;
             }
             static thread_local std::vector<float> block_ip_lp;
             // Prefetch recon-norm gather targets before the vpshufb pass (4MB random gather).
@@ -2476,6 +2541,17 @@ void NGTAQIndex::saveV2(const std::string& dir) const {
         }
         graph_->saveGPQ4(dir + "/v2_gpq4_store.bin");
     }
+    // Tech 1: symmetric SQ8 codes (optional sidecar; loadV2 keys on file presence).
+    if (has_sq8_ && !sq8_codes_.empty()) {
+        std::ofstream f(dir + "/v2_sq8.bin", std::ios::binary);
+        uint64_t n  = (uint64_t)sq8_max_.size();
+        uint32_t da = (uint32_t)sq8_dim_align_;
+        f.write(reinterpret_cast<const char*>(&n),  sizeof(n));
+        f.write(reinterpret_cast<const char*>(&da), sizeof(da));
+        f.write(reinterpret_cast<const char*>(sq8_codes_.data()), sq8_codes_.size() * sizeof(int8_t));
+        f.write(reinterpret_cast<const char*>(sq8_max_.data()),   sq8_max_.size()   * sizeof(float));
+        f.write(reinterpret_cast<const char*>(sq8_norm_.data()),  sq8_norm_.size()  * sizeof(float));
+    }
     // Metadata: is_angular_, d_eff_, m_pq_, meta_version [, gpq4_m_pq_].
     // meta_version: 1 = no global PQ (legacy), 2 = K=256 global PQ, 3 = K=16 GPQ4 store
     //               (D_sub=8, gpq4_m_pq_ == m_pq_), 4 = GPQ4 with its OWN gpq4_m_pq_ (slot 4).
@@ -2627,6 +2703,25 @@ void NGTAQIndex::loadV2(const std::string& dir) {
             }
             bool store_ok = graph_->loadGPQ4(dir + "/v2_gpq4_store.bin");
             has_gpq4_ = (fc.good() || fc.eof()) && codes_ok && store_ok && graph_->hasGPQ4();
+        }
+    }
+    // Tech 1: load symmetric SQ8 sidecar if present (keyed on file presence, no meta bump).
+    {
+        std::ifstream f(dir + "/v2_sq8.bin", std::ios::binary);
+        if (f) {
+            uint64_t n = 0; uint32_t da = 0;
+            f.read(reinterpret_cast<char*>(&n),  sizeof(n));
+            f.read(reinterpret_cast<char*>(&da), sizeof(da));
+            if (f && n > 0 && da > 0) {
+                sq8_dim_align_ = (int)da;
+                sq8_codes_.resize((size_t)n * da);
+                sq8_max_.resize((size_t)n);
+                sq8_norm_.resize((size_t)n);
+                f.read(reinterpret_cast<char*>(sq8_codes_.data()), sq8_codes_.size() * sizeof(int8_t));
+                f.read(reinterpret_cast<char*>(sq8_max_.data()),   sq8_max_.size()   * sizeof(float));
+                f.read(reinterpret_cast<char*>(sq8_norm_.data()),  sq8_norm_.size()  * sizeof(float));
+                has_sq8_ = (f.good() || f.eof());
+            }
         }
     }
     // Tech 4.1: optionally build the DiskANN-style PackedV2Node layout (record + up to 64

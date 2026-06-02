@@ -247,6 +247,80 @@ inline float l2_sq_avx2(const float* __restrict__ a, const float* __restrict__ b
 }
 
 // ============================================================
+// Symmetric SQ8 in-loop routing distance (Tech 1, pyglass SQ8P scheme).
+//   Both query and DB vector are int8-encoded with a PER-VECTOR symmetric max scale
+//   (x_i8 = round(x/max_x * 127)). The signed int8 dot is computed with one
+//   vpdpbusd-class pass (VNNI) over D bytes (no LUT, no gather, no per-cluster state).
+//   L2(q,x) = ||q||^2 + ||x||^2 - 2<q,x>; for ROUTING only the term that varies with x
+//   matters, so the caller uses  -||x||^2 + 2 * <q_i8,x_i8> * max_x * max_q / 127^2.
+//   pyglass: glass/quant/sq8p_quant.hpp + helpa dot_s8_s8 (vpdpbusd).
+// ============================================================
+// Signed int8 dot product over D elements. vpdpbusd needs one unsigned operand, so we
+// fold the sign by adding 128 to x (unsigned) and subtracting the 128*sum(y) bias.
+// Simpler & accurate: use _mm256_maddubs on |.| is wrong for signed dot; instead widen
+// to int16 via maddubs of (x+128) then correct. We use the AVX2 madd_epi16 path which is
+// exact for the int8*int8 range (products fit int16, D-sum fits int32).
+inline int32_t dot_s8_s8(const int8_t* __restrict__ x,
+                         const int8_t* __restrict__ y, int D) {
+#if defined(__AVX512VNNI__)
+    // sign-fold: <x,y> = <x+128, y> - 128*sum(y), with (x+128) in [1..255] unsigned.
+    __m512i acc = _mm512_setzero_si512();
+    __m512i ssy = _mm512_setzero_si512();           // running sum of y (as int16 via dpbusd with 1s)
+    const __m512i bias = _mm512_set1_epi8((char)(uint8_t)128);
+    const __m512i ones = _mm512_set1_epi8(1);
+    int i = 0;
+    for (; i + 64 <= D; i += 64) {
+        __m512i xv = _mm512_loadu_si512((const void*)(x + i));
+        __m512i yv = _mm512_loadu_si512((const void*)(y + i));
+        __m512i xu = _mm512_add_epi8(xv, bias);      // unsigned [1..255]
+        acc = _mm512_dpbusd_epi32(acc, xu, yv);      // sum (x+128)*y
+        ssy = _mm512_dpbusd_epi32(ssy, _mm512_add_epi8(yv, bias), ones); // sum (y+128)
+    }
+    int32_t dot_biased = _mm512_reduce_add_epi32(acc);
+    int32_t sum_yb     = _mm512_reduce_add_epi32(ssy);   // sum(y)+128*count
+    int processed = i;
+    // sum(y) = sum_yb - 128*processed
+    int32_t sum_y = sum_yb - 128 * processed;
+    int32_t dot = dot_biased - 128 * sum_y;
+    for (; i < D; ++i) dot += (int32_t)x[i] * (int32_t)y[i];
+    return dot;
+#elif defined(__AVX2__)
+    // Exact AVX2: widen int8->int16, multiply-accumulate via madd_epi16.
+    __m256i acc = _mm256_setzero_si256();
+    int i = 0;
+    for (; i + 16 <= D; i += 16) {
+        __m256i xv = _mm256_cvtepi8_epi16(_mm_loadu_si128((const __m128i*)(x + i)));
+        __m256i yv = _mm256_cvtepi8_epi16(_mm_loadu_si128((const __m128i*)(y + i)));
+        acc = _mm256_add_epi32(acc, _mm256_madd_epi16(xv, yv));
+    }
+    __m128i lo = _mm256_castsi256_si128(acc);
+    __m128i hi = _mm256_extracti128_si256(acc, 1);
+    __m128i s  = _mm_add_epi32(lo, hi);
+    s = _mm_add_epi32(s, _mm_shuffle_epi32(s, 0x4E));
+    s = _mm_add_epi32(s, _mm_shuffle_epi32(s, 0xB1));
+    int32_t dot = _mm_cvtsi128_si32(s);
+    for (; i < D; ++i) dot += (int32_t)x[i] * (int32_t)y[i];
+    return dot;
+#else
+    int32_t dot = 0;
+    for (int i = 0; i < D; ++i) dot += (int32_t)x[i] * (int32_t)y[i];
+    return dot;
+#endif
+}
+
+// Encode a float vector to symmetric int8 with a per-vector max scale. Returns max.
+inline float sq8_encode_sym(const float* __restrict__ v, int8_t* __restrict__ out, int D) {
+    float mx = 0.f;
+    for (int i = 0; i < D; ++i) { float a = std::fabs(v[i]); if (a > mx) mx = a; }
+    const float inv = (mx > 0.f) ? (127.f / mx) : 0.f;
+    for (int i = 0; i < D; ++i) {
+        int q = (int)std::lround(v[i] * inv);
+        out[i] = (int8_t)(q < -127 ? -127 : (q > 127 ? 127 : q));
+    }
+    return mx;
+}
+
+// ============================================================
 // Full RaBitQ-style distance
 // dist ≈ q_norm_sq + norm_x² - 2*sqrt(π/2)*norm_x*adc_score/√D
 // ============================================================

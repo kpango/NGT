@@ -247,6 +247,28 @@ private:
     std::vector<uint8_t> gpq4_codes_;       // [N*gpq4_m_pq_] per-node 4-bit codes (single-node scoring)
     std::vector<float>   gpq4_norm_sq_;     // [N] per-node reconstructed-norm^2
 
+    // ---- Tech 1: symmetric SQ8 in-loop routing distance (pyglass SQ8P scheme) ----
+    // Per-node int8 code of the SRHT-rotated vector (D bytes, padded to mult of 64 for the
+    // VNNI kernel) + per-node max scale + per-node ||x||^2. The batch loop routes with a
+    // single signed-int8 dot (one vpdpbusd pass) instead of the gpq4 IP + recon-norm gather.
+    // Built in fromNGTv2 from the rotated vectors; persisted to v2_sq8.bin (loaded at loadV2).
+    bool                 has_sq8_ = false;
+    int                  sq8_dim_align_ = 0;  // D padded up to a multiple of 64 (code stride)
+    std::vector<int8_t>  sq8_codes_;          // [N * sq8_dim_align_] symmetric int8 codes
+    std::vector<float>   sq8_max_;            // [N] per-node max|x| scale
+    std::vector<float>   sq8_norm_;           // [N] per-node ||x||^2 (rotated) for exact L2
+    bool hasSQ8() const { return has_sq8_ && !sq8_codes_.empty(); }
+
+    // Symmetric SQ8 routing distance from an int8-encoded query (q_i8 with scale max_q and
+    // ||q||^2 q_nsq) to node_id. Returns approximate squared-L2:
+    //   ||q||^2 + ||x||^2 - 2 * <q_i8,x_i8> * max_q * max_x / 127^2.
+    float sq8Dist(uint32_t node_id, const int8_t* q_i8, float max_q, float q_nsq) const {
+        const int8_t* xc = sq8_codes_.data() + (size_t)node_id * sq8_dim_align_;
+        int32_t dot = NGT::NGTAQ::dot_s8_s8(q_i8, xc, sq8_dim_align_);
+        float scale = max_q * sq8_max_[node_id] * (1.0f / (127.0f * 127.0f));
+        return q_nsq + sq8_norm_[node_id] - 2.0f * (float)dot * scale;
+    }
+
     // Single-node batch-PQ distance (seeds / expansion): ||q_rot - x_pq16||^2 via the
     // node's own 4-bit code, scored against the per-query LUT's dequantized float table.
     // `ip_table` is the M*16 float IP table from gpq4_ip_table (NOT the uint8 LUT).
