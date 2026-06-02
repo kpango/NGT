@@ -1377,15 +1377,43 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
     if (results_tl.capacity() < static_cast<size_t>(k_beam * 30))
         results_tl.reserve(static_cast<size_t>(k_beam * 30));
     auto& results = results_tl;
-    // Flat bitvector for visited tracking: N=1M → 15,625 uint64_t = 125KB (fits in L2)
-    // thread_local avoids heap allocation after first query on each thread
-    static thread_local std::vector<uint64_t> t_vis;
-    t_vis.assign((N + 63) / 64, 0ULL);
+    // Visited tracking. Two backends (Lever 1):
+    //  - versioned (default): a uint16 version stamp per node + a per-thread cur_version.
+    //    visited(u) == (vis[u]==cur), mark(u) == (vis[u]=cur). Per query just ++cur — NO
+    //    125KB memset (only a rare full clear on the 65536-query wrap). hnswlib/pyglass
+    //    VisitedListPool pattern. Costs 2MB (uint16) vs 125KB bitvector — measured net win
+    //    since the memset dominated and the stamp array is touched only at visited nodes.
+    //  - bitvector (default): the 125KB flat bitvector with a per-query memset.
+    // MEASURED: versioned is a WASH-to-slight-loss on SIFT-1M — the 125KB bitvector stays
+    // L2-resident and its memset is a cheap streaming write, while the 2MB stamp array's
+    // random in-walk visited check misses cache more (profile: dabs 36->44us). So the
+    // memset was NOT the setup bottleneck (that's the 2-level centroid scan). Default OFF;
+    // AQ_VERSIONED_VIS=1 enables it (may help on larger N where the memset grows).
+    static const bool use_versioned_vis = [] {
+        const char* e = std::getenv("AQ_VERSIONED_VIS");
+        return e && std::atoi(e) != 0;  // default false (bitvector)
+    }();
+    static thread_local std::vector<uint64_t> t_vis;        // legacy bitvector backend
+    static thread_local std::vector<uint16_t> t_vis_ver;    // versioned backend (stamps)
+    static thread_local uint16_t t_vis_cur = 0;
+    if (use_versioned_vis) {
+        if (t_vis_ver.size() < N) t_vis_ver.assign(N, 0);
+        if (++t_vis_cur == 0) {                              // wrap: clear stamps, restart at 1
+            std::fill(t_vis_ver.begin(), t_vis_ver.end(), uint16_t(0));
+            t_vis_cur = 1;
+        }
+    } else {
+        t_vis.assign((N + 63) / 64, 0ULL);
+    }
+    const uint16_t vis_cur = t_vis_cur;
+    uint16_t* __restrict vis_ver = t_vis_ver.data();
     auto is_visited = [&](uint32_t id) -> bool {
-        return (t_vis[id >> 6] >> (id & 63)) & 1ULL;
+        return use_versioned_vis ? (vis_ver[id] == vis_cur)
+                                 : ((t_vis[id >> 6] >> (id & 63)) & 1ULL);
     };
     auto mark_visited = [&](uint32_t id) {
-        t_vis[id >> 6] |= 1ULL << (id & 63);
+        if (use_versioned_vis) vis_ver[id] = vis_cur;
+        else                   t_vis[id >> 6] |= 1ULL << (id & 63);
     };
     float d_k = std::numeric_limits<float>::infinity();
 
