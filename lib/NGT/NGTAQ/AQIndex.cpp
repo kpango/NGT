@@ -2021,15 +2021,43 @@ seeds_done:  // Phase 3 graph-only entry jumps here, skipping the IVF seeding bl
             return e ? (float)std::atof(e) : -1.0f;  // <0 => disabled (default)
         }();
         const float term_coeff = 1.0f + term_eps;
+        // fp16-sharpened early-termination (AQ_TERM_EPS_FP16). The 4-bit gate above failed at
+        // iso-recall because it compared a NOISY 4-bit frontier distance against a sharp fp16
+        // radius (mismatch: 4-bit underestimates → non-winners look promising → can't stop).
+        // Fix: gate the frontier node's EXACT fp16 distance against the EXACT fp16 k-th-best
+        // radius — both sharp. The frontier node is reranked anyway when popped, so its fp16
+        // distance is computed ~1 hop early and REUSED (stored as the popped node's exact
+        // dist). dk_fp16 (max-heap of the k smallest popped exact fp16 dists) is the radius.
+        static const float term_eps_fp16 = [] {
+            const char* e = std::getenv("AQ_TERM_EPS_FP16");
+            return e ? (float)std::atof(e) : -1.0f;  // <0 => disabled (default)
+        }();
+        const bool use_fp16_gate = (term_eps_fp16 >= 0.0f) && use_batch && !raw_flat_.empty();
+        const float term_coeff_fp16 = 1.0f + term_eps_fp16;
+        std::priority_queue<float> dk_fp16;  // max-heap of the k smallest popped exact fp16 dists
+        auto exact_fp16 = [&](uint32_t id) -> float {
+            if ((size_t)id * D + D > raw_flat_.size()) return std::numeric_limits<float>::max();
+            return NGT::NGTAQ::l2_sq_f32_fp16(q_ptr, raw_flat_.data() + (size_t)id * D, D);
+        };
         while (lp.has_next()) {
             // Capture the frontier node's pool distance BEFORE pop advances the cursor —
             // it IS x's coarse (gpq4) score, so no recompute is needed for `results`.
             float dx = lp.data_[lp.cur_].dist;
-            // Epsilon early-stop: once the pool holds >= k results, if the next candidate is
-            // farther than (1+eps)*k-th-best, no remaining candidate can improve the top-k.
+            // 4-bit epsilon early-stop (legacy AQ_TERM_EPS): once >= k results, stop if the
+            // next candidate is farther than (1+eps)*k-th-best (all in noisy 4-bit space).
             if (term_eps >= 0.0f && lp.size_ >= k_out &&
                 dx > term_coeff * lp.data_[k_out - 1].dist)
                 break;
+            // fp16-sharpened gate: compute the frontier candidate's EXACT fp16 distance; if it
+            // exceeds (1+eps)*the exact fp16 k-th-best radius, no later candidate can win →
+            // terminate. dxf is reused as the popped node's exact dist (no double-compute).
+            uint32_t frontier_id = AQLinearPool::rawid(lp.data_[lp.cur_].id);
+            float dxf = 0.f;
+            if (use_fp16_gate) {
+                dxf = exact_fp16(frontier_id);
+                if ((int)dk_fp16.size() >= k_out && dxf > term_coeff_fp16 * dk_fp16.top())
+                    break;
+            }
             uint32_t x = lp.pop();
             // Prefetch the next frontier node's GPQ4 block + neighbor list while we work.
             if (lp.cur_ < lp.size_) {
@@ -2040,6 +2068,12 @@ seeds_done:  // Phase 3 graph-only entry jumps here, skipping the IVF seeding bl
             }
             results.push_back({dx, x});  // approximate score for the exact-L2 rerank below
             ++n_visits;
+            // Maintain the exact fp16 k-th-best radius from popped nodes (gate uses it). dxf
+            // was already computed for the frontier == popped node, so no extra work here.
+            if (use_fp16_gate) {
+                if ((int)dk_fp16.size() < k_out) dk_fp16.push(dxf);
+                else if (dxf < dk_fp16.top()) { dk_fp16.pop(); dk_fp16.push(dxf); }
+            }
 
             const uint8_t* blocks = graph_->gpq4Blocks(x);
             const uint32_t nblk   = graph_->gpq4NumBlocks(x);
