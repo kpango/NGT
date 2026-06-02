@@ -384,6 +384,16 @@ public:
     int gpq4M() const { return gpq4_m_; }
     bool hasGPQ4() const { return !gpq4_blocks_.empty() && gpq4_m_ > 0; }
     size_t gpq4BlockBytes() const { return (size_t)gpq4_m_ * 8 + 32; }
+    // True if the inline per-neighbor norm is the usable bf16 form (built/loaded from a
+    // fused-norm index). When false (legacy fp16-norm index), callers must gather instead.
+    bool gpq4FusedNorm() const { return gpq4_fused_norm_; }
+    // Read neighbor `n`'s (0..15) fused bf16 norm^2 from a block pointer (codes+norms).
+    // Norm region starts at offset ((M+1)/2)*16 bytes into the block (16 × bf16).
+    float gpq4BlockNorm(const uint8_t* block, int n) const {
+        const uint16_t* normp = reinterpret_cast<const uint16_t*>(
+            block + (size_t)((gpq4_m_ + 1) / 2) * 16);
+        return NGT::NGTAQ::bf16_to_float(normp[n]);
+    }
 
     // Build the neighbor-code store from a per-node global 4-bit code table and per-node
     // reconstructed-norm^2. Call after finalizeCSR() (edges final). M = #subspaces.
@@ -413,7 +423,9 @@ public:
         if (!f) throw std::runtime_error("SoAGraph::saveGPQ4: cannot open " + path);
         uint64_t n_off = gpq4_offsets_.size();
         uint64_t n_blk_bytes = gpq4_blocks_.size();
-        uint32_t hdr[2] = {(uint32_t)gpq4_m_, 0};
+        // hdr[1] = norm format: 0 = legacy fp16 inline norm (overflows → gather fallback),
+        //                       1 = bf16 inline norm (fused, read in-loop, no gather).
+        uint32_t hdr[2] = {(uint32_t)gpq4_m_, (uint32_t)1};
         fwrite(hdr, sizeof(hdr), 1, f);
         fwrite(&n_off, sizeof(n_off), 1, f);
         fwrite(gpq4_offsets_.data(), sizeof(uint32_t), n_off, f);
@@ -428,6 +440,7 @@ public:
         uint32_t hdr[2] = {0, 0};
         if (fread(hdr, sizeof(hdr), 1, f) != 1) { fclose(f); return false; }
         gpq4_m_ = (int)hdr[0];
+        gpq4_fused_norm_ = (hdr[1] == 1);  // bf16 inline norm present & usable in-loop
         uint64_t n_off = 0;
         if (fread(&n_off, sizeof(n_off), 1, f) != 1) { fclose(f); return false; }
         gpq4_offsets_.resize(n_off);
@@ -504,6 +517,7 @@ private:
 
     // Stage B: GPQ4 contiguous neighbor-code store (see buildGPQ4 / gpq4Blocks).
     int                   gpq4_m_ = 0;          // #subspaces (0 = absent)
+    bool                  gpq4_fused_norm_ = false;  // block holds usable bf16 inline norm
     std::vector<uint32_t> gpq4_offsets_;        // [N+1] starting block index per node
     std::vector<uint8_t>  gpq4_blocks_;         // flat: blocks of (M*8 + 32) bytes
 };
@@ -511,6 +525,7 @@ private:
 inline void SoAGraph::buildGPQ4(int M, const uint8_t* node_codes, const float* node_norm_sq) {
     finalizeCSR();
     gpq4_m_ = M;
+    gpq4_fused_norm_ = true;  // norms stored inline as bf16 (see normp write below)
     constexpr uint32_t BLK = 16;  // neighbors per SIMD block
     const size_t N = state_.size();
     const size_t blk_bytes = (size_t)M * 8 + 32;
@@ -544,7 +559,10 @@ inline void SoAGraph::buildGPQ4(int M, const uint8_t* node_codes, const float* n
                     if (n & 1) *dst |= (code << 4);
                     else       *dst |= code;
                 }
-                normp[n] = NGT::NGTAQ::float_to_fp16(node_norm_sq[nbr]);
+                // Fused per-neighbor norm: bf16 (NOT fp16) so SIFT recon norms ~2e5 don't
+                // overflow (fp16 max 65504). The batch loop reads this inline instead of
+                // gathering gpq4_norm_sq_[u] from a 4MB array (kills the hot-path cache miss).
+                normp[n] = NGT::NGTAQ::float_to_bf16(node_norm_sq[nbr]);
             }
         }
     }

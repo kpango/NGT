@@ -1836,15 +1836,21 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
                 continue;
             }
             static thread_local std::vector<float> block_ip_lp;
-            // Prefetch recon-norm gather targets before the vpshufb pass (4MB random gather).
-            for (size_t ni = 0; ni < n_nbrs; ++ni) {
-                uint32_t u = nbr_ids[ni];
-                if (u < N) __builtin_prefetch(&gpq4_norm_sq_[u], 0, 1);
-            }
             block_ip_lp.resize((size_t)nblk * 16);
             for (uint32_t b = 0; b < nblk; ++b)
                 NGT::NGTAQ::gpq4_batch_ip(blocks + (size_t)b * blk_bytes,
                                           batch_lut_tl, block_ip_lp.data() + (size_t)b * 16);
+            // Fused norm: read ‖x‖² co-located in the block (bf16) instead of gathering from
+            // the 4MB gpq4_norm_sq_ array — the codes+norm now arrive in one contiguous
+            // stream (single prefetch), killing the per-neighbor random-gather cache miss.
+            // Legacy fp16-norm indices (gpq4FusedNorm()==false) fall back to the gather.
+            const bool fused = graph_->gpq4FusedNorm();
+            if (!fused) {
+                for (size_t ni = 0; ni < n_nbrs; ++ni) {
+                    uint32_t u = nbr_ids[ni];
+                    if (u < N) __builtin_prefetch(&gpq4_norm_sq_[u], 0, 1);
+                }
+            }
             for (size_t ni = 0; ni < n_nbrs; ++ni) {
                 uint32_t u = nbr_ids[ni];
                 if (u >= N || graph_->isTombstone(u)) continue;  // skip tombstone at INSERT
@@ -1852,7 +1858,8 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
                 mark_visited(u);
                 const uint32_t b = (uint32_t)(ni / 16), pos = (uint32_t)(ni % 16);
                 float ip   = block_ip_lp[(size_t)b * 16 + pos];
-                float nsq  = gpq4_norm_sq_[u];
+                float nsq  = fused ? graph_->gpq4BlockNorm(blocks + (size_t)b * blk_bytes, pos)
+                                   : gpq4_norm_sq_[u];
                 float d_u  = q_ns_batch + nsq - 2.0f * ip;
                 lp.insert(u, d_u);   // pool drops it if worse than the ef-th best
             }

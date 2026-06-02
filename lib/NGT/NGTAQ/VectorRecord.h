@@ -49,6 +49,26 @@ inline uint16_t float_to_fp16(float f) {
     return (uint16_t)((sign << 15) | ((uint16_t)exp16 << 10) | (mant16 & 0x3FF));
 }
 
+// ---------- bf16 utilities ----------
+// bf16 = the top 16 bits of fp32: same 8-bit exponent, so the full fp32 dynamic range
+// is preserved (no overflow for SIFT reconstructed norms ~2e5, which exceed fp16 max
+// 65504). Used for the fused per-neighbor norm in the gpq4 block. Round-to-nearest-even.
+inline uint16_t float_to_bf16(float f) {
+    uint32_t u;
+    memcpy(&u, &f, 4);
+    // NaN: force a quiet NaN that survives truncation.
+    if (((u >> 23) & 0xFF) == 0xFF && (u & 0x7FFFFF)) return (uint16_t)((u >> 16) | 0x40);
+    uint32_t rounding_bias = 0x7FFF + ((u >> 16) & 1);
+    return (uint16_t)((u + rounding_bias) >> 16);
+}
+
+inline float bf16_to_float(uint16_t b) {
+    uint32_t u = (uint32_t)b << 16;
+    float f;
+    memcpy(&f, &u, 4);
+    return f;
+}
+
 inline float fp16_to_float(uint16_t h) {
     uint32_t sign  = (h >> 15) & 0x1;
     uint32_t exp16 = (h >> 10) & 0x1F;
