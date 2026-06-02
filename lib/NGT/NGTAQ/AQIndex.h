@@ -150,10 +150,15 @@ public:
     // Build the per-query uint8 batch LUT from a raw (unrotated) query. Rotates with the
     // index SRHT, fills `lut` (interleaved planes), and returns ||q_rot||^2. Requires
     // a 16-centroid codebook (has_gpq4_). If `ip_out` != nullptr, also writes the
-    // dequantized float IP table [M_PQ*16] (for single-node gpq4Dist scoring).
+    // dequantized float table [M_PQ*16] (for single-node scoring).
+    // dist_lut=false (default): the table/LUT holds <q_sub,centroid> (IP form; caller
+    //   assembles L2 = ||q||^2 + ||x||^2 - 2*IP per neighbor).
+    // dist_lut=true: the table/LUT holds ||q_sub - centroid||^2 (QG form); the kernel
+    //   accumulates L2 DIRECTLY — no per-neighbor norm read, no IP->L2 assembly.
     float buildGlobalLUT16(const std::vector<float>& query,
                            NGT::NGTAQ::GlobalPQ4LUT& lut,
-                           float* ip_out = nullptr) const;
+                           float* ip_out = nullptr,
+                           bool dist_lut = false) const;
 
     // Accessors for raw fp16 vectors and dimension (used by standalone benchmarks).
     // Elements are fp16-packed; decode with NGT::NGTAQ::fp16_to_float.
@@ -278,6 +283,17 @@ private:
         float ip = 0.f;
         for (int s = 0; s < M_PQ; ++s) ip += ip_table[(size_t)s * NGT::NGTAQ::GPQ4_K + codes[s]];
         return q_norm_sq + gpq4_norm_sq_[node_id] - 2.0f * ip;
+    }
+
+    // Distance-LUT single-node variant (seeds/expansion): the table is squared-distance
+    // (gpq4_dist_table), so the per-subspace contributions sum to L2 directly — no norm
+    // read, no assembly. Matches the distance-LUT batch kernel's metric.
+    float gpq4DistL2(uint32_t node_id, const float* dist_table) const {
+        const int M_PQ = gpq4MPQ();
+        const uint8_t* codes = gpq4_codes_.data() + (size_t)node_id * M_PQ;
+        float d = 0.f;
+        for (int s = 0; s < M_PQ; ++s) d += dist_table[(size_t)s * NGT::NGTAQ::GPQ4_K + codes[s]];
+        return d;
     }
 
     // Lazy-built inverted list + cluster neighbor table for cluster-aware seeding.

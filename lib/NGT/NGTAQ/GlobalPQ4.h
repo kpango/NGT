@@ -105,6 +105,43 @@ inline void gpq4_ip_table(const float* q_rot, int M, const float* cb_T /* [M][8]
     }
 }
 
+// Build the per-subspace SQUARED-DISTANCE table dist[sub*16 + code] =
+//   ||q_rot_sub - centroid_{sub,code}||^2, from the transposed codebook [M][D_sub][16].
+// This is QG's createFloatL2DistanceLookup form: the kernel then accumulates
+//   sum_s dist[s][code_s] = ||q_rot - x_pq||^2  (L2 directly), with NO per-neighbor norm
+// read and NO IP->L2 assembly in the loop (vs the IP table which needs q_ns + nsq - 2*ip).
+inline void gpq4_dist_table(const float* q_rot, int M, const float* cb_T /* [M][D_sub][16] */,
+                            int D_sub, float* dist /* [M*16] */) {
+    for (int s = 0; s < M; ++s) {
+        const float* q  = q_rot + (size_t)s * D_sub;
+        const float* cb = cb_T  + (size_t)s * D_sub * GPQ4_K;
+        float* out = dist + (size_t)s * GPQ4_K;
+#if defined(__AVX2__) && defined(__FMA__)
+        // 16 codes = two __m256 accumulators of (q[d]-c[d])^2 summed over D_sub dims.
+        __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps();
+        for (int d = 0; d < D_sub; ++d) {
+            __m256 qd = _mm256_set1_ps(q[d]);
+            const float* c = cb + (size_t)d * GPQ4_K;
+            __m256 df0 = _mm256_sub_ps(qd, _mm256_loadu_ps(c));
+            __m256 df1 = _mm256_sub_ps(qd, _mm256_loadu_ps(c + 8));
+            a0 = _mm256_fmadd_ps(df0, df0, a0);
+            a1 = _mm256_fmadd_ps(df1, df1, a1);
+        }
+        _mm256_storeu_ps(out,     a0);
+        _mm256_storeu_ps(out + 8, a1);
+#else
+        for (int c = 0; c < GPQ4_K; ++c) {
+            float dsum = 0.f;
+            for (int d = 0; d < D_sub; ++d) {
+                float df = q[d] - cb[(size_t)d * GPQ4_K + c];
+                dsum += df * df;
+            }
+            out[c] = dsum;
+        }
+#endif
+    }
+}
+
 // Build the per-query LUT from the per-subspace float inner-product table.
 //   ip[sub*16 + code] = <q_rot_sub, centroid_{sub,code}>
 // Global scale = max_sub((max-min)/255); per-subspace offset = min_sub.

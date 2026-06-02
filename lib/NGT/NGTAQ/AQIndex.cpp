@@ -1135,7 +1135,7 @@ float NGTAQIndex::globalPQDist(uint32_t node_id, const float* lut, float q_norm_
 // ---------------------------------------------------------------------------
 float NGTAQIndex::buildGlobalLUT16(const std::vector<float>& query,
                                    NGT::NGTAQ::GlobalPQ4LUT& lut,
-                                   float* ip_out) const {
+                                   float* ip_out, bool dist_lut) const {
     const int D      = (d_eff_ > 0) ? d_eff_ : prop_.dimension;
     const int M_PQ   = gpq4MPQ();          // GPQ4's own (fine) subspace count
     const int D_sub  = (M_PQ > 0) ? D / M_PQ : 8;
@@ -1157,7 +1157,12 @@ float NGTAQIndex::buildGlobalLUT16(const std::vector<float>& query,
     srht_v2_->apply(q_padded_tl.data(), q_rot_tl.data());
 
     ip_tl.resize((size_t)M_PQ * NGT::NGTAQ::GPQ4_K);
-    NGT::NGTAQ::gpq4_ip_table(q_rot_tl.data(), M_PQ, gpq4_codebook_T_.data(), D_sub, ip_tl.data());
+    if (dist_lut) {
+        // QG-style squared-distance table: kernel accumulates L2 directly.
+        NGT::NGTAQ::gpq4_dist_table(q_rot_tl.data(), M_PQ, gpq4_codebook_T_.data(), D_sub, ip_tl.data());
+    } else {
+        NGT::NGTAQ::gpq4_ip_table(q_rot_tl.data(), M_PQ, gpq4_codebook_T_.data(), D_sub, ip_tl.data());
+    }
     NGT::NGTAQ::gpq4_build_lut(ip_tl.data(), M_PQ, lut);
     if (ip_out) std::copy(ip_tl.begin(), ip_tl.end(), ip_out);
 
@@ -1545,15 +1550,24 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
         global_lut_tl.resize(static_cast<size_t>(M_PQ) * 256);
         q_ns_global = buildGlobalLUT(query, global_lut_tl.data());
     }
-    // Batch (K=16) LUT + dequantized float IP table (the latter for single-node seeds).
+    // Distance-LUT gpq4 (matches QG's createFloatL2DistanceLookup): build a per-subspace
+    // squared-DISTANCE LUT so the vpshufb kernel accumulates L2 directly — dropping the
+    // per-neighbor fused-norm read and the ||q||^2+||x||^2-2*IP assembly from the hot loop.
+    // Default ON for the batch path; AQ_DIST_LUT=0 reverts to the IP-LUT form for A/B.
+    static const bool use_dist_lut_env = [] {
+        const char* e = std::getenv("AQ_DIST_LUT");
+        return !(e && std::atoi(e) == 0);  // default true
+    }();
+    // Batch (K=16) LUT + dequantized float table (the latter for single-node seeds).
     static thread_local NGT::NGTAQ::GlobalPQ4LUT batch_lut_tl;
     static thread_local std::vector<float> batch_ip_tl;
     float q_ns_batch = 0.f;
+    const bool use_dist_lut = use_batch && use_dist_lut_env;
     if (use_batch) {
         // GPQ4 has its OWN (finer) subspace count — size by gpq4MPQ(), NOT the legacy
         // M_PQ, or buildGlobalLUT16 overflows this buffer when gpq4MPQ() > m_pq_.
         batch_ip_tl.resize((size_t)gpq4MPQ() * NGT::NGTAQ::GPQ4_K);
-        q_ns_batch = buildGlobalLUT16(query, batch_lut_tl, batch_ip_tl.data());
+        q_ns_batch = buildGlobalLUT16(query, batch_lut_tl, batch_ip_tl.data(), use_dist_lut);
     }
     // Tech 1: symmetric SQ8 in-loop routing distance. Encode the rotated query to int8 once
     // (per-vector symmetric max scale), then route every neighbor with a single signed-int8
@@ -1579,7 +1593,9 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
     };
     // Single-node batch-PQ distance (seeds / popped-fallback / expansion).
     auto batch_dist1 = [&](uint32_t id) -> float {
-        return use_sq8 ? sq8_dist1(id) : gpq4Dist(id, batch_ip_tl.data(), q_ns_batch);
+        if (use_sq8)      return sq8_dist1(id);
+        if (use_dist_lut) return gpq4DistL2(id, batch_ip_tl.data());  // distance-LUT: L2 directly
+        return gpq4Dist(id, batch_ip_tl.data(), q_ns_batch);
     };
     // Unified single-node "coarse route" used wherever route_dist was used: batch wins.
     auto coarse_dist = [&](uint32_t id) -> float {
@@ -1885,28 +1901,40 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
             for (uint32_t b = 0; b < nblk; ++b)
                 NGT::NGTAQ::gpq4_batch_ip(blocks + (size_t)b * blk_bytes,
                                           batch_lut_tl, block_ip_lp.data() + (size_t)b * 16);
-            // Fused norm: read ‖x‖² co-located in the block (bf16) instead of gathering from
-            // the 4MB gpq4_norm_sq_ array — the codes+norm now arrive in one contiguous
-            // stream (single prefetch), killing the per-neighbor random-gather cache miss.
-            // Legacy fp16-norm indices (gpq4FusedNorm()==false) fall back to the gather.
-            const bool fused = graph_->gpq4FusedNorm();
-            if (!fused) {
+            if (use_dist_lut) {
+                // Distance-LUT (QG form): the kernel output IS the squared-L2 distance.
+                // No per-neighbor norm read, no IP->L2 assembly — the leanest per-hop path.
                 for (size_t ni = 0; ni < n_nbrs; ++ni) {
                     uint32_t u = nbr_ids[ni];
-                    if (u < N) __builtin_prefetch(&gpq4_norm_sq_[u], 0, 1);
+                    if (u >= N || graph_->isTombstone(u)) continue;
+                    if (is_visited(u)) continue;
+                    mark_visited(u);
+                    const uint32_t b = (uint32_t)(ni / 16), pos = (uint32_t)(ni % 16);
+                    lp.insert(u, block_ip_lp[(size_t)b * 16 + pos]);
                 }
-            }
-            for (size_t ni = 0; ni < n_nbrs; ++ni) {
-                uint32_t u = nbr_ids[ni];
-                if (u >= N || graph_->isTombstone(u)) continue;  // skip tombstone at INSERT
-                if (is_visited(u)) continue;
-                mark_visited(u);
-                const uint32_t b = (uint32_t)(ni / 16), pos = (uint32_t)(ni % 16);
-                float ip   = block_ip_lp[(size_t)b * 16 + pos];
-                float nsq  = fused ? graph_->gpq4BlockNorm(blocks + (size_t)b * blk_bytes, pos)
-                                   : gpq4_norm_sq_[u];
-                float d_u  = q_ns_batch + nsq - 2.0f * ip;
-                lp.insert(u, d_u);   // pool drops it if worse than the ef-th best
+            } else {
+                // IP-LUT (legacy): assemble L2 = ||q||^2 + ||x||^2 - 2*IP per neighbor. The
+                // fused bf16 block norm avoids the 4MB gpq4_norm_sq_ gather; legacy fp16-norm
+                // indices (gpq4FusedNorm()==false) fall back to the gather.
+                const bool fused = graph_->gpq4FusedNorm();
+                if (!fused) {
+                    for (size_t ni = 0; ni < n_nbrs; ++ni) {
+                        uint32_t u = nbr_ids[ni];
+                        if (u < N) __builtin_prefetch(&gpq4_norm_sq_[u], 0, 1);
+                    }
+                }
+                for (size_t ni = 0; ni < n_nbrs; ++ni) {
+                    uint32_t u = nbr_ids[ni];
+                    if (u >= N || graph_->isTombstone(u)) continue;  // skip tombstone at INSERT
+                    if (is_visited(u)) continue;
+                    mark_visited(u);
+                    const uint32_t b = (uint32_t)(ni / 16), pos = (uint32_t)(ni % 16);
+                    float ip   = block_ip_lp[(size_t)b * 16 + pos];
+                    float nsq  = fused ? graph_->gpq4BlockNorm(blocks + (size_t)b * blk_bytes, pos)
+                                       : gpq4_norm_sq_[u];
+                    float d_u  = q_ns_batch + nsq - 2.0f * ip;
+                    lp.insert(u, d_u);   // pool drops it if worse than the ef-th best
+                }
             }
         }
         AQ_ADD(dabs);
