@@ -1,5 +1,11 @@
 // tests/ngtaq/qg_bench.cpp
-// ANN-Benchmarks benchmark for NGTQG (QG / QSG) with epsilon sweep.
+// ANN-Benchmarks benchmark for NGTQG (QG / QSG) sweeping BOTH epsilon (quantized graph
+// exploration) AND result_expansion (full-precision exact-L2 refinement) — the two params
+// the official ann-benchmarks NGT-qg module sweeps. result_expansion>1.0 reranks
+// result_expansion*k candidates against the FULL fp32 base vectors (QuantizedGraph.h:385-407),
+// which is what lets QG reach high recall (~0.99). The pure-epsilon sweep (re=1.0) is
+// quantized-only and caps at ~0.85-0.93. The fair Pareto frontier = best QPS at each recall
+// across the epsilon × result_expansion grid.
 // Usage: qg_bench <qg_idx_dir> <hdf5_path> [k=10] [threads=4] [metric=l2|angular]
 #include "bench_common.hpp"
 #include "NGT/NGTQ/QuantizedGraph.h"
@@ -44,18 +50,36 @@ int main(int argc, char** argv) {
             l2_normalize(queries[qi].data(), D);
     }
 
-    // Warmup with middle epsilon
+    // result_expansion grid (1.0 == off == quantized-only, the prior behavior).
+    // QG_RE env (comma-separated) overrides for targeted high-recall runs.
+    std::vector<double> re_grid = { 1.0, 2.0, 3.0, 5.0, 10.0 };
+    if (const char* e = std::getenv("QG_RE")) {
+        re_grid.clear(); std::string s(e); size_t p = 0;
+        while (p < s.size()) { size_t c = s.find(',', p); double v = std::stod(s.substr(p, c==std::string::npos?std::string::npos:c-p));
+            re_grid.push_back(v); if (c==std::string::npos) break; p = c+1; }
+    }
+    // QG_EPS env (comma-separated) overrides the epsilon grid for targeted runs.
+    std::vector<double> eps_grid(EPSILON_GRID, EPSILON_GRID + EPSILON_GRID_SIZE);
+    if (const char* e = std::getenv("QG_EPS")) {
+        eps_grid.clear(); std::string s(e); size_t p = 0;
+        while (p < s.size()) { size_t c = s.find(',', p); double v = std::stod(s.substr(p, c==std::string::npos?std::string::npos:c-p));
+            eps_grid.push_back(v); if (c==std::string::npos) break; p = c+1; }
+    }
+
+    // Warmup with middle epsilon + a refining result_expansion
     const int WARMUP = std::min(200, nq);
     for (int wi = 0; wi < WARMUP; ++wi) {
         NGTQG::SearchQuery sq(queries[wi % nq]);
         NGT::ObjectDistances objs;
-        sq.setResults(&objs); sq.setSize(k); sq.setEpsilon(0.1f);
+        sq.setResults(&objs); sq.setSize(k); sq.setEpsilon(0.1f); sq.setResultExpansion(3.0f);
         index.search(sq);
     }
 
-    // Sweep
-    for (int gi = 0; gi < EPSILON_GRID_SIZE; ++gi) {
-        const float eps = (float)EPSILON_GRID[gi];
+    // Sweep epsilon × result_expansion (the official ann-benchmarks NGT-qg grid).
+    for (size_t gi = 0; gi < eps_grid.size(); ++gi) {
+        const float eps = (float)eps_grid[gi];
+      for (size_t ri = 0; ri < re_grid.size(); ++ri) {
+        const float re = (float)re_grid[ri];
 
         std::vector<std::vector<int>> results(nq);
         std::vector<double> latencies(nq, 0.0);
@@ -65,13 +89,14 @@ int main(int argc, char** argv) {
 
         const double t_start = bc_now_us();
         for (int t = 0; t < n_threads; ++t) {
-            threads.emplace_back([&, eps]() {
+            threads.emplace_back([&, eps, re]() {
                 for (;;) {
                     int qi = next_qi.fetch_add(1, std::memory_order_relaxed);
                     if (qi >= nq) break;
                     NGTQG::SearchQuery sq(queries[qi]);
                     NGT::ObjectDistances objs;
                     sq.setResults(&objs); sq.setSize(k); sq.setEpsilon(eps);
+                    sq.setResultExpansion(re);
                     const double t0 = bc_now_us();
                     index.search(sq);
                     const double t1 = bc_now_us();
@@ -95,12 +120,13 @@ int main(int argc, char** argv) {
         printf("=== NGTQG Benchmark Result ===\n");
         printf("Index   : %s\n", idx_dir);
         printf("Dataset : %s  nq=%d  D=%d\n", hdf5_path, nq, D);
-        printf("Config  : k=%d  epsilon=%.3f  threads=%d\n", k, eps, n_threads);
+        printf("Config  : k=%d  epsilon=%.3f  result_expansion=%.1f  threads=%d\n", k, eps, re, n_threads);
         printf("recall@%d  = %.4f\n", k, recall);
         printf("agg_QPS   = %.0f\n", qps);
         printf("P50(us)   = %.1f\n", p50);
         printf("P99(us)   = %.1f\n\n", p99);
         fflush(stdout);
+      }
     }
     return 0;
 }
