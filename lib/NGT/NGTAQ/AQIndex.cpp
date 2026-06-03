@@ -81,7 +81,6 @@ struct AQConfig {
     bool  dist_lut;             // AQ_DIST_LUT           (default ON — QG dist-LUT form)
     bool  use_sq8;              // AQ_SQ8                (default off)
     bool  graph_entry;          // AQ_GRAPH_ENTRY        (default off — IVF seed earns its cost)
-    bool  packed;               // AQ_PACKED             (default off)
     bool  versioned_vis;        // AQ_VERSIONED_VIS      (default off — bitvector wins on SIFT-1M)
     // --- search budget / frontier ---
     int   ef;                   // AQ_EF                 (0 = derive from max_visits)
@@ -98,10 +97,9 @@ struct AQConfig {
     AQConfig()
         : use_global_routing(env_bool ("AQ_USE_GLOBAL_ROUTING", false)),
           batch_routing     (env_bool ("AQ_BATCH_ROUTING",      true)),
-          dist_lut          (!(aq_env("AQ_DIST_LUT") && std::atoi(aq_env("AQ_DIST_LUT")) == 0)),
+          dist_lut          ([]{ const char* e = aq_env("AQ_DIST_LUT"); return !(e && std::atoi(e)==0); }()),
           use_sq8           (env_bool ("AQ_SQ8",                false)),
           graph_entry       (env_bool ("AQ_GRAPH_ENTRY",        false)),
-          packed            (env_bool ("AQ_PACKED",             false)),
           versioned_vis     (env_bool ("AQ_VERSIONED_VIS",      false)),
           ef                (env_int  ("AQ_EF",                 0)),
           cq_probe          ([]{ int v = env_int("AQ_CQ_PROBE", 4); return v > 0 ? v : 4; }()),
