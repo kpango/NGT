@@ -74,6 +74,13 @@ public:
         size_t total = 0;
         for (const auto& nbrs : adj) total += nbrs.size();
         edge_ids_.clear();
+        // Diagnostic guard: surface a garbage edge count (e.g. a corrupted adj entry) before
+        // the reserve turns it into a cryptic std::length_error.
+        if (total > edge_ids_.max_size()) {
+            fprintf(stderr, "[NGTAQ][FATAL] resetEdges overflow: total_edges=%zu N=%zu max=%zu\n",
+                    total, N, edge_ids_.max_size());
+            throw std::length_error("resetEdges: total edges exceeds vector max_size");
+        }
         edge_ids_.reserve(total);
         offsets_.resize(N + 1);
         offsets_[0] = 0;
@@ -371,7 +378,15 @@ public:
         v2_tier1_n_    = tier1_n;
         v2_tier2_n_    = tier2_n;
         v2_rec_stride_ = tier1_n + tier2_n + 6;
-        v2_records_flat_.assign((size_t)n * v2_rec_stride_, 0);
+        // Diagnostic guard (turns a cryptic std::length_error into an actionable abort):
+        // n*stride must not exceed the byte-vector max_size. Catches an underflowed/garbage n.
+        const size_t bytes = n * (size_t)v2_rec_stride_;
+        if (n > v2_records_flat_.max_size() / (size_t)v2_rec_stride_) {
+            fprintf(stderr, "[NGTAQ][FATAL] reserveV2 overflow: n=%zu stride=%d bytes=%zu max=%zu\n",
+                    n, v2_rec_stride_, bytes, v2_records_flat_.max_size());
+            throw std::length_error("reserveV2: n*stride exceeds vector max_size");
+        }
+        v2_records_flat_.assign(bytes, 0);
     }
 
     // D=128 backward compat: assumes stride=38
@@ -592,6 +607,14 @@ inline void SoAGraph::buildGPQ4(int M, const uint8_t* node_codes, const float* n
         gpq4_offsets_[i + 1] = gpq4_offsets_[i] + (nn + BLK - 1) / BLK;
     }
     const size_t total_blocks = gpq4_offsets_[N];
+    // Diagnostic guard: total_blocks*blk_bytes must fit the byte-vector. gpq4_offsets_ is
+    // uint32 — if the cumulative block count overflowed uint32 (huge graphs), total_blocks
+    // would be wrong; surface it instead of a cryptic length_error / silent corruption.
+    if (blk_bytes && total_blocks > gpq4_blocks_.max_size() / blk_bytes) {
+        fprintf(stderr, "[NGTAQ][FATAL] buildGPQ4 overflow: total_blocks=%zu blk_bytes=%zu N=%zu M=%d\n",
+                total_blocks, blk_bytes, N, M);
+        throw std::length_error("buildGPQ4: total_blocks*blk_bytes exceeds vector max_size");
+    }
     gpq4_blocks_.assign(total_blocks * blk_bytes, 0);
     // 2. Fill each node's blocks.
     for (size_t i = 0; i < N; ++i) {

@@ -722,6 +722,12 @@ NGTAQIndex NGTAQIndex::fromNGTv2(const std::string& ngt_path, const Property& pr
     NGT::Index ngt(ngt_path);
     NGT::ObjectSpace& objspace = ngt.getObjectSpace();
     const size_t repo_size = objspace.getRepository().size();
+    // Repository slot 0 is reserved (NGT object IDs are 1-based), so N = size - 1.
+    // Guard the unsigned subtraction: an empty/degenerate repo (size 0) would underflow
+    // N to SIZE_MAX and turn the next reserve/assign into a std::length_error abort.
+    if (repo_size < 2)
+        throw std::runtime_error("fromNGTv2: NGT repository has < 2 objects (size=" +
+                                 std::to_string(repo_size) + "); cannot build AQ index");
     const size_t N = repo_size - 1;
     const int words = D / 64;
 
