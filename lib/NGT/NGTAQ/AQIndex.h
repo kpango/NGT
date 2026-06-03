@@ -176,11 +176,15 @@ public:
     // gap => already cache-local (reordering won't help). Returns {mean_gap, mean_degree}.
     std::pair<double,double> graphLocalityStats() const;
 
-    // Reorder node IDs into BFS order from the entry points so graph-adjacent nodes get
-    // nearby IDs (walk cache-locality). Pure permutation — remaps CSR, gpq4 store/codes/
-    // norms, sq8, raw_flat_, global codes/norms, cluster members, entry points consistently
-    // → recall byte-identical, only memory layout changes. Call before saveV2 (needs re-save).
-    void reorderForLocality();
+    // Reorder node IDs for walk cache-locality. Pure permutation — remaps CSR, gpq4 store/
+    // codes/norms, sq8, raw_flat_, global codes/norms, cluster members, entry points
+    // consistently → recall byte-identical, only memory layout changes. Call before saveV2.
+    //   BFS    : breadth-first from entry points (the shipped baseline, commit 2766713).
+    //   RCM    : reverse Cuthill-McKee (degree-ascending BFS, reversed) — bandwidth-minimizing.
+    //   GORDER : window-based neighbor co-occurrence greedy order (Coleman NeurIPS'22) —
+    //            maximizes shared-neighbor locality over a sliding window.
+    enum class ReorderMode { BFS, RCM, GORDER };
+    void reorderForLocality(ReorderMode mode = ReorderMode::BFS);
 
     // Rebuild v2 graph edges from a (denser) NGT source index without re-training
     // SRHT/K-means/PCA/PQ (those are reused from the existing index).

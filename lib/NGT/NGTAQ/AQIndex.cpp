@@ -1218,28 +1218,112 @@ std::pair<double,double> NGTAQIndex::graphLocalityStats() const {
     return { cnt ? sum_gap / cnt : 0.0, N ? sum_deg / N : 0.0 };
 }
 
-// BFS node-ID reorder for walk cache-locality (Task 2). Pure permutation; recall-invariant.
-void NGTAQIndex::reorderForLocality() {
+// Node-ID reorder for walk cache-locality (Task 2). Pure permutation; recall-invariant.
+void NGTAQIndex::reorderForLocality(ReorderMode mode) {
     const size_t N = graph_->size();
     if (N == 0) return;
     if (graph_->hasTombstones())
         throw std::runtime_error("reorderForLocality: rebuild() to compact tombstones first");
 
-    // 1. BFS from entry points → old node id visited order → old_to_new (o2n).
+    // 1. Compute old_to_new (o2n): old node i's data lands at new id o2n[i].
     std::vector<uint32_t> o2n(N, UINT32_MAX);
-    std::vector<uint32_t> queue; queue.reserve(N);
     uint32_t next_id = 0;
-    auto push = [&](uint32_t old_id) {
-        if (o2n[old_id] == UINT32_MAX) { o2n[old_id] = next_id++; queue.push_back(old_id); }
+    auto place = [&](uint32_t old_id) {
+        if (o2n[old_id] == UINT32_MAX) { o2n[old_id] = next_id++; return true; }
+        return false;
     };
-    for (uint32_t ep : entry_points_) if (ep < N) push(ep);
-    if (next_id == 0) push(0);  // fallback seed
-    for (size_t head = 0; head < queue.size(); ++head) {
-        uint32_t x = queue[head];
-        for (uint32_t u : graph_->getNeighbors(x)) if (u < N) push(u);
+
+    if (mode == ReorderMode::GORDER) {
+        // GORDER (Coleman et al., NeurIPS'22): greedy window-based co-occurrence ordering.
+        // Maintain a sliding window of the last W placed nodes; the next node to place is the
+        // unplaced candidate with the most edges to the window (shared-neighbor locality), so
+        // nodes co-visited during a walk get nearby IDs. Candidates = neighbors of windowed
+        // nodes (so the frontier stays bounded). Score = #edges into the window.
+        const int W = 5;  // sliding window size (Coleman reports 5 near-optimal)
+        std::vector<uint32_t> order; order.reserve(N);
+        // seed with the highest-degree node (most central) for a strong locality core.
+        uint32_t seed = 0, best_deg = 0;
+        for (uint32_t i = 0; i < (uint32_t)N; ++i) {
+            uint32_t d = graph_->neighborCount(i);
+            if (d > best_deg) { best_deg = d; seed = i; }
+        }
+        std::vector<uint8_t> in_window(N, 0);
+        std::vector<int>     gain(N, 0);            // #edges from candidate to current window
+        std::vector<uint32_t> cand;                 // candidates with gain>0 (deduped via gain>0)
+        auto add_to_window = [&](uint32_t x) {
+            in_window[x] = 1;
+            for (uint32_t u : graph_->getNeighbors(x)) {
+                if (u >= N || o2n[u] != UINT32_MAX) continue;
+                if (gain[u] == 0) cand.push_back(u);
+                ++gain[u];
+            }
+        };
+        auto remove_from_window = [&](uint32_t x) {
+            in_window[x] = 0;
+            for (uint32_t u : graph_->getNeighbors(x)) {
+                if (u >= N || o2n[u] != UINT32_MAX) continue;
+                if (gain[u] > 0) --gain[u];
+            }
+        };
+        std::vector<uint32_t> window;  // ring of last W placed
+        place(seed); order.push_back(seed); add_to_window(seed); window.push_back(seed);
+        for (size_t step = 1; step < N; ++step) {
+            // pick the unplaced candidate with max gain (ties: smallest id for determinism).
+            uint32_t best = UINT32_MAX; int bg = -1;
+            for (uint32_t c : cand) {
+                if (o2n[c] != UINT32_MAX) continue;
+                if (gain[c] > bg) { bg = gain[c]; best = c; }
+            }
+            if (best == UINT32_MAX) {  // window frontier exhausted → next unplaced by id
+                for (uint32_t i = 0; i < (uint32_t)N; ++i) if (o2n[i] == UINT32_MAX) { best = i; break; }
+            }
+            place(best); order.push_back(best);
+            // slide window: evict oldest if full, then add the new node.
+            if ((int)window.size() == W) { remove_from_window(window.front());
+                                           window.erase(window.begin()); }
+            add_to_window(best); window.push_back(best);
+            // compact cand occasionally (drop placed) to bound the scan.
+            if ((step & 1023) == 0) {
+                cand.erase(std::remove_if(cand.begin(), cand.end(),
+                    [&](uint32_t c){ return o2n[c] != UINT32_MAX || gain[c] == 0; }), cand.end());
+            }
+        }
+    } else {
+        // BFS / RCM: queue-based. RCM visits neighbors in ASCENDING degree (bandwidth-min);
+        // BFS visits in CSR order. RCM additionally reverses the final order.
+        std::vector<uint32_t> queue; queue.reserve(N);
+        auto push = [&](uint32_t old_id){ if (place(old_id)) queue.push_back(old_id); };
+        if (mode == ReorderMode::RCM) {
+            // RCM seeds from the minimum-degree node; expands neighbors degree-ascending.
+            uint32_t seed = 0, mind = UINT32_MAX;
+            for (uint32_t i = 0; i < (uint32_t)N; ++i) {
+                uint32_t d = graph_->neighborCount(i);
+                if (d < mind) { mind = d; seed = i; }
+            }
+            push(seed);
+            for (size_t head = 0; head < queue.size(); ++head) {
+                uint32_t x = queue[head];
+                std::vector<uint32_t> nb;
+                for (uint32_t u : graph_->getNeighbors(x)) if (u < N && o2n[u] == UINT32_MAX) nb.push_back(u);
+                std::sort(nb.begin(), nb.end(), [&](uint32_t a, uint32_t b){
+                    return graph_->neighborCount(a) < graph_->neighborCount(b); });
+                for (uint32_t u : nb) push(u);
+            }
+        } else {  // BFS (default, shipped baseline)
+            for (uint32_t ep : entry_points_) if (ep < N) push(ep);
+            if (next_id == 0) push(0);  // fallback seed
+            for (size_t head = 0; head < queue.size(); ++head) {
+                uint32_t x = queue[head];
+                for (uint32_t u : graph_->getNeighbors(x)) if (u < N) push(u);
+            }
+        }
+        // Disconnected nodes (not reached) keep relative order at the tail.
+        for (uint32_t i = 0; i < (uint32_t)N; ++i) if (o2n[i] == UINT32_MAX) o2n[i] = next_id++;
+        if (mode == ReorderMode::RCM) {
+            // Reverse: new id k -> (N-1-k). Cuthill-McKee reversed = RCM.
+            for (uint32_t i = 0; i < (uint32_t)N; ++i) o2n[i] = (uint32_t)(N - 1) - o2n[i];
+        }
     }
-    // Disconnected nodes (not reached by BFS) keep relative order at the tail.
-    for (uint32_t i = 0; i < (uint32_t)N; ++i) if (o2n[i] == UINT32_MAX) o2n[i] = next_id++;
 
     // 2. Permute the graph (CSR + bq + v2 records) and invalidate gpq4/packed stores.
     graph_->applyPermutation(o2n);
