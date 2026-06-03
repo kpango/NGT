@@ -951,11 +951,30 @@ NGTAQIndex NGTAQIndex::fromNGTv2(const std::string& ngt_path, const Property& pr
 
     // ---- 7d. Tech 1: symmetric SQ8 codes over the SRHT-rotated vectors ----
     // Per-node int8 (max-scaled) code + max + ||x||^2, for the cheap in-loop routing dot.
+    // OPT-IN (AQ_BUILD_SQ8=1, default OFF): the SQ8 codes only feed the opt-in AQ_SQ8 routing
+    // and AQ_RERANK_SQ8 rerank — both default off — so the default build skips this entirely
+    // (no wasted ~128 B/vector storage, no encode work). Also unblocks the default fair curve:
+    // the SQ8 encode region is where the AVX-512 fresh-build std::length_error aborts.
     const int sq8_align = ((D + 63) / 64) * 64;   // pad to multiple of 64 for the VNNI dot
-    std::vector<int8_t> sq8_codes((size_t)N * sq8_align, 0);
-    std::vector<float>  sq8_max(N, 0.f);
-    std::vector<float>  sq8_norm(N, 0.f);
-    {
+    static const bool build_sq8 = [] {
+        const char* e = std::getenv("AQ_BUILD_SQ8");
+        return e && std::atoi(e) != 0;
+    }();
+    std::vector<int8_t> sq8_codes;
+    std::vector<float>  sq8_max;
+    std::vector<float>  sq8_norm;
+    if (build_sq8) {
+        // size_t-safe allocation + guard (the SQ8 codes vector is the largest in this region;
+        // surface an overflowed count instead of a cryptic vector::reserve length_error).
+        const size_t sq8_bytes = (size_t)N * (size_t)sq8_align;
+        if (sq8_align <= 0 || N > sq8_codes.max_size() / (size_t)sq8_align) {
+            fprintf(stderr, "[NGTAQ][FATAL] SQ8 alloc overflow: N=%zu sq8_align=%d bytes=%zu max=%zu\n",
+                    N, sq8_align, sq8_bytes, sq8_codes.max_size());
+            throw std::length_error("SQ8 codes: N*sq8_align exceeds vector max_size");
+        }
+        sq8_codes.assign(sq8_bytes, 0);
+        sq8_max.assign(N, 0.f);
+        sq8_norm.assign(N, 0.f);
         fprintf(stderr, "[NGTAQv2] Encoding symmetric SQ8 codes (dim_align=%d)...\n", sq8_align);
         #pragma omp parallel for schedule(static)
         for (size_t i = 0; i < N; ++i) {
@@ -968,6 +987,8 @@ NGTAQIndex NGTAQIndex::fromNGTv2(const std::string& ngt_path, const Property& pr
             sq8_norm[i] = ns;
         }
         fprintf(stderr, "[NGTAQv2] SQ8 codes done.\n");
+    } else {
+        fprintf(stderr, "[NGTAQv2] SQ8 build-encoding skipped (AQ_BUILD_SQ8 unset; opt-in).\n");
     }
 
     // ---- 8. Encode all vectors into VectorRecord ----
@@ -1167,11 +1188,15 @@ NGTAQIndex NGTAQIndex::fromNGTv2(const std::string& ngt_path, const Property& pr
     fprintf(stderr, "[NGTAQv2] GPQ4 neighbor-code store built (M=%d, D_sub=%d).\n", GM, GDsub);
 
     // Tech 1: symmetric SQ8 codes (per-node int8 + max + ||x||^2) for the in-loop dot.
-    idx.sq8_dim_align_ = sq8_align;
-    idx.sq8_codes_ = std::move(sq8_codes);
-    idx.sq8_max_   = std::move(sq8_max);
-    idx.sq8_norm_  = std::move(sq8_norm);
-    idx.has_sq8_   = true;
+    // Only attached when built (AQ_BUILD_SQ8). When absent, hasSQ8() is false and the opt-in
+    // AQ_SQ8 routing / AQ_RERANK_SQ8 rerank cleanly fall back (they all gate on hasSQ8()).
+    if (build_sq8) {
+        idx.sq8_dim_align_ = sq8_align;
+        idx.sq8_codes_ = std::move(sq8_codes);
+        idx.sq8_max_   = std::move(sq8_max);
+        idx.sq8_norm_  = std::move(sq8_norm);
+        idx.has_sq8_   = true;
+    }
 
     idx.is_angular_ = (prop.metric == NGT::ObjectSpace::DistanceTypeAngle ||
                        prop.metric == NGT::ObjectSpace::DistanceTypeCosine);
