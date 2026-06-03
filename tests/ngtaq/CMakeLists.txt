@@ -39,7 +39,7 @@ foreach(TEST_SRC
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${TEST_SRC}.cpp")
         add_executable(${TEST_SRC} ${TEST_SRC}.cpp)
         target_link_libraries(${TEST_SRC} ngt)
-        target_compile_features(${TEST_SRC} PRIVATE cxx_std_17)
+        target_compile_features(${TEST_SRC} PRIVATE cxx_std_23)
         if(${TEST_SRC} STREQUAL "benchmark_comparison")
             target_compile_definitions(${TEST_SRC} PRIVATE NGT_QBG_DISABLED)
         endif()
@@ -68,6 +68,9 @@ if(HDF5_FOUND)
         diag_route_rank
         diag_route_recall
         diag_2level
+        diag_aniso8
+        diag_aniso_glove
+        diag_opq
         qg_build
         qg_bench
         qbg_build
@@ -78,12 +81,18 @@ if(HDF5_FOUND)
             add_executable(${HDF5_SRC} ${HDF5_SRC}.cpp)
             target_include_directories(${HDF5_SRC} PRIVATE ${HDF5_INCLUDE_DIRS})
             target_link_libraries(${HDF5_SRC} ngt ${HDF5_C_LIBRARIES})
-            target_compile_features(${HDF5_SRC} PRIVATE cxx_std_17)
+            target_compile_features(${HDF5_SRC} PRIVATE cxx_std_23)
             # Diagnostic: -DAQ_PROFILE=ON enables searchV2 per-region timers (off by
             # default; normal builds unaffected). AQ_PROFILE is defined on the ngt lib
             # (where searchV2 lives) so the #ifdef-gated timers compile in.
             if(AQ_PROFILE)
                 target_compile_definitions(${HDF5_SRC} PRIVATE AQ_PROFILE)
+            endif()
+            # Diagnostic: qg_bench needs NGT_VISIT_COUNT to populate sc.visitCount in the
+            # header-inline searchQuantizedGraph (QuantizedGraph.h:363) so we can count QG's
+            # nodes-visited per query for the hop-gap analysis. Header-only counter; no lib change.
+            if(${HDF5_SRC} STREQUAL "qg_bench")
+                target_compile_definitions(${HDF5_SRC} PRIVATE NGT_VISIT_COUNT)
             endif()
         endif()
     endforeach()

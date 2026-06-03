@@ -25,9 +25,10 @@ if( ${UNIX} )
 	add_library(ngt SHARED ${NGT_SOURCES})
 	set_target_properties(ngt PROPERTIES VERSION ${ngt_VERSION})
 	set_target_properties(ngt PROPERTIES SOVERSION ${ngt_SOVERSION})
-	# NGTAQ requires C++17 (shared_mutex, unordered_dense, etc.)
-	target_compile_features(ngt PRIVATE cxx_std_17)
-	target_compile_features(ngtstatic PRIVATE cxx_std_17)
+	# NGTAQ targets C++23 (std::span, std::bit_cast, concepts; clang 21 has full support).
+	# Falls back gracefully — the code only uses zero-overhead C++23 features.
+	target_compile_features(ngt PRIVATE cxx_std_23)
+	target_compile_features(ngtstatic PRIVATE cxx_std_23)
 	# Diagnostic: -DAQ_PROFILE=ON compiles searchV2 per-region timers (AQIndex.cpp)
 	# into the ngt library. Off by default; normal builds are unaffected.
 	if(AQ_PROFILE)

@@ -60,6 +60,64 @@ namespace { struct AqProf { double seed=0,dabs=0,refine=0,expand=0,rerank=0,setu
 namespace NGTAQ {
 
 // ---------------------------------------------------------------------------
+// AQConfig: single source of truth for the search-time AQ_* tuning knobs.
+// Populated ONCE from the environment (Meyers singleton aq_cfg()), replacing the
+// scattered `static const ... = []{ getenv(...) }()` reads in searchV2. Centralizing
+// also removes the prior duplicated reads of AQ_BATCH_ROUTING / AQ_USE_GLOBAL_ROUTING
+// (two sites each, which had to agree). All knobs preserved verbatim — these are the
+// user's reversible escape hatches. Defaults match the consolidated campaign config.
+// ---------------------------------------------------------------------------
+namespace {
+
+inline const char* aq_env(const char* k) { return std::getenv(k); }
+inline bool   env_bool (const char* k, bool dflt) { const char* e=aq_env(k); return e ? (std::atoi(e)!=0) : dflt; }
+inline int    env_int  (const char* k, int dflt)  { const char* e=aq_env(k); return e ? std::atoi(e) : dflt; }
+inline float  env_float(const char* k, float dflt){ const char* e=aq_env(k); return e ? (float)std::atof(e) : dflt; }
+
+struct AQConfig {
+    // --- routing / metric path ---
+    bool  use_global_routing;   // AQ_USE_GLOBAL_ROUTING (default off)
+    bool  batch_routing;        // AQ_BATCH_ROUTING      (default ON — gather-free path, 0eb7802)
+    bool  dist_lut;             // AQ_DIST_LUT           (default ON — QG dist-LUT form)
+    bool  use_sq8;              // AQ_SQ8                (default off)
+    bool  graph_entry;          // AQ_GRAPH_ENTRY        (default off — IVF seed earns its cost)
+    bool  packed;               // AQ_PACKED             (default off)
+    bool  versioned_vis;        // AQ_VERSIONED_VIS      (default off — bitvector wins on SIFT-1M)
+    // --- search budget / frontier ---
+    int   ef;                   // AQ_EF                 (0 = derive from max_visits)
+    int   cq_probe;             // AQ_CQ_PROBE           (super-centroid probe count; <=0 -> 4)
+    int   seeds;                // AQ_SEEDS              (per-cluster seed count; 0 = default)
+    bool  seed_cap_topk;        // AQ_SEED_CAP_TOPK      (angular: scan full cluster; default off)
+    // --- termination (opt-in, default OFF) ---
+    float term_eps;             // AQ_TERM_EPS           (<0 = off)
+    float term_eps_fp16;        // AQ_TERM_EPS_FP16      (<0 = off; net-slower vs gamma_term)
+    // --- rerank (cascade) ---
+    int   refine_mult;          // AQ_REFINE_MULT        (0 = use the cascade floor)
+    int   rerank_n;             // AQ_RERANK_N           (>0 overrides refine_n)
+
+    AQConfig()
+        : use_global_routing(env_bool ("AQ_USE_GLOBAL_ROUTING", false)),
+          batch_routing     (env_bool ("AQ_BATCH_ROUTING",      true)),
+          dist_lut          (!(aq_env("AQ_DIST_LUT") && std::atoi(aq_env("AQ_DIST_LUT")) == 0)),
+          use_sq8           (env_bool ("AQ_SQ8",                false)),
+          graph_entry       (env_bool ("AQ_GRAPH_ENTRY",        false)),
+          packed            (env_bool ("AQ_PACKED",             false)),
+          versioned_vis     (env_bool ("AQ_VERSIONED_VIS",      false)),
+          ef                (env_int  ("AQ_EF",                 0)),
+          cq_probe          ([]{ int v = env_int("AQ_CQ_PROBE", 4); return v > 0 ? v : 4; }()),
+          seeds             (env_int  ("AQ_SEEDS",              0)),
+          seed_cap_topk     (env_bool ("AQ_SEED_CAP_TOPK",      false)),
+          term_eps          (env_float("AQ_TERM_EPS",           -1.0f)),
+          term_eps_fp16     (env_float("AQ_TERM_EPS_FP16",      -1.0f)),
+          refine_mult       (env_int  ("AQ_REFINE_MULT",        0)),
+          rerank_n          (env_int  ("AQ_RERANK_N",           0)) {}
+};
+
+inline const AQConfig& aq_cfg() { static const AQConfig c; return c; }
+
+}  // anonymous namespace
+
+// ---------------------------------------------------------------------------
 // LinearPool: pyglass-style ef-bounded sorted-array candidate frontier.
 // (port of glass/neighbor.hpp LinearPool, glass/searcher/graph_searcher.hpp loop)
 //
@@ -1424,22 +1482,11 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
     // (all per-cluster ADC scoring is gated behind !use_coarse). Definitions of the
     // env statics below reuse these. AQ_PROFILE showed setup (~20us) becomes the
     // dominant fixed cost once dabs is lean, and tier-1/tier-2 encode is its bulk.
-    static const bool use_global_env_e = [] {
-        const char* e = std::getenv("AQ_USE_GLOBAL_ROUTING");
-        return e && std::atoi(e) != 0;
-    }();
-    // Default ON: QG-style contiguous-neighbor 16-wide vpshufb batch path. A popped node's
-    // whole neighbor block is scored in one SIMD sweep over the co-located GPQ4 code store
-    // (dist-LUT form: no per-neighbor norm read, NO gather). Measured ns/hop 1533->995 (-35%)
-    // and ~1.4-1.8x iso-recall vs the legacy per-neighbor cand_q/per-cluster-ADC path. The
-    // recall knob for this path is AQ_EF (or max_visits); set AQ_BATCH_ROUTING=0 to revert to
-    // the legacy path (gamma_term knob). (Mirrors the search-body selector below; must agree.)
-    static const bool use_batch_env_e = [] {
-        const char* e = std::getenv("AQ_BATCH_ROUTING");
-        return e ? (std::atoi(e) != 0) : true;  // default ON (gather-free contiguous sweep)
-    }();
-    const bool use_batch_e  = hasGPQ4() && use_batch_env_e;
-    const bool use_global_e = (has_global_pq_ && use_global_env_e) && !use_batch_e;
+    // Routing selectors (single source of truth: aq_cfg()). batch_routing default ON =
+    // QG-style contiguous-neighbor 16-wide vpshufb gather-free path (ns/hop 1533->995,
+    // ~1.4-1.8x; recall knob AQ_EF/max_visits; AQ_BATCH_ROUTING=0 reverts to gamma_term path).
+    const bool use_batch_e  = hasGPQ4() && aq_cfg().batch_routing;
+    const bool use_global_e = (has_global_pq_ && aq_cfg().use_global_routing) && !use_batch_e;
     const bool use_coarse_e = use_batch_e || use_global_e;
 
     // 0. Angular/Cosine: L2-normalize query (over D_orig dims)
@@ -1483,12 +1530,8 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
     // ~3.5x fewer distance evals than the brute K-way scan). probe=4 hits 96.6% exact
     // agreement at ~3.6us vs ~9.8us fp16 / ~12.8us fp32 — the brute scan was the dominant
     // setup cost. The exact (non-coarse) path keeps the full-precision fp32 scan.
-    // AQ_CQ_PROBE tunes the super-centroid probe count (accuracy/speed knob).
-    static const int cq_probe = [] {
-        const char* e = std::getenv("AQ_CQ_PROBE");
-        int v = e ? std::atoi(e) : 4;
-        return v > 0 ? v : 4;
-    }();
+    // AQ_CQ_PROBE tunes the super-centroid probe count (accuracy/speed knob); see aq_cfg().
+    const int cq_probe = aq_cfg().cq_probe;
     uint32_t active_cid = use_coarse_e ? kmeans_v2_->nearest_2level(q_rot_tl.data(), cq_probe)
                                        : kmeans_v2_->nearest_public(q_rot_tl.data());
     q_res_tl.resize(static_cast<size_t>(D));
@@ -1598,11 +1641,8 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
     // L2-resident and its memset is a cheap streaming write, while the 2MB stamp array's
     // random in-walk visited check misses cache more (profile: dabs 36->44us). So the
     // memset was NOT the setup bottleneck (that's the 2-level centroid scan). Default OFF;
-    // AQ_VERSIONED_VIS=1 enables it (may help on larger N where the memset grows).
-    static const bool use_versioned_vis = [] {
-        const char* e = std::getenv("AQ_VERSIONED_VIS");
-        return e && std::atoi(e) != 0;  // default false (bitvector)
-    }();
+    // AQ_VERSIONED_VIS=1 enables it (may help on larger N where the memset grows). Default false.
+    const bool use_versioned_vis = aq_cfg().versioned_vis;
     static thread_local std::vector<uint64_t> t_vis;        // legacy bitvector backend
     static thread_local std::vector<uint16_t> t_vis_ver;    // versioned backend (stamps)
     static thread_local uint16_t t_vis_cur = 0;
@@ -1651,10 +1691,7 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
     // exploration heap. This shrinks the heap (cheaper push/pop) and skips the heapify of
     // hopeless candidates. ef defaults to a multiple of the visit budget (enough slack
     // that recall is preserved) and is overridable via AQ_EF for the recall-QPS sweep.
-    static const int ef_env = [] {
-        const char* e = std::getenv("AQ_EF");
-        return e ? std::atoi(e) : 0;
-    }();
+    const int ef_env = aq_cfg().ef;  // AQ_EF (0 = derive from max_visits); see aq_cfg()
     // ef ≈ the visit budget is the sweet spot: the frontier never usefully holds more
     // live candidates than nodes we will pop, so capping at ~visit_budget cuts the bulk of
     // the wasted heapify (~556 pushes -> ~mv) while preserving recall (verified iso-recall
@@ -1776,24 +1813,10 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
     // behind an opt-in flag (documented dead-end; may revisit for a batch ADC kernel).
     // AQ_USE_GLOBAL_ROUTING=1 opts INTO global-PQ routing on a Stage-A index; unset (or 0)
     // uses the LEGACY per-cluster ADC path — byte-identical in behavior to commit 99af263.
-    static const bool use_global_env = [] {
-        const char* e = std::getenv("AQ_USE_GLOBAL_ROUTING");
-        return e && std::atoi(e) != 0;
-    }();
-    // Stage C-full: QG-style 16-wide vpshufb BATCH routing. AQ_BATCH_ROUTING=1 opts in
-    // (requires a meta_version>=3 index with the K=16 GPQ4 store). When on, the popped
-    // node's WHOLE neighbor block is scored in one _mm256_shuffle_epi8 pass over a single
-    // shared per-query LUT — no per-neighbor maybe_rebuild_adc, no gather. The fp16 exact
-    // rerank below recovers true k-NN. Implies global routing for seeds/popped/expansion
-    // (single-node gpq4Dist with the same codebook), so d_k uses one consistent metric.
-    static const bool use_batch_env = [] {
-        const char* e = std::getenv("AQ_BATCH_ROUTING");
-        return e ? (std::atoi(e) != 0) : true;  // default ON (see use_batch_env_e above)
-    }();
-    const bool use_batch = hasGPQ4() && use_batch_env;
-    // Batch implies global-PQ semantics (no per-cluster ADC); legacy global PQ (K=256)
-    // is the fallback opt-in. They are mutually exclusive; batch wins if both set.
-    const bool use_global_pq = (has_global_pq_ && use_global_env) && !use_batch;
+    // Batch / global-PQ routing selectors — same aq_cfg() source as use_batch_e above
+    // (single source of truth; the two sites are now guaranteed to agree). batch wins if both.
+    const bool use_batch = hasGPQ4() && aq_cfg().batch_routing;
+    const bool use_global_pq = (has_global_pq_ && aq_cfg().use_global_routing) && !use_batch;
 
     static thread_local std::vector<float> global_lut_tl;
     float q_ns_global = 0.f;
@@ -1805,15 +1828,11 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
     // squared-DISTANCE LUT so the vpshufb kernel accumulates L2 directly — dropping the
     // per-neighbor fused-norm read and the ||q||^2+||x||^2-2*IP assembly from the hot loop.
     // Default ON for the batch path; AQ_DIST_LUT=0 reverts to the IP-LUT form for A/B.
-    static const bool use_dist_lut_env = [] {
-        const char* e = std::getenv("AQ_DIST_LUT");
-        return !(e && std::atoi(e) == 0);  // default true
-    }();
     // Batch (K=16) LUT + dequantized float table (the latter for single-node seeds).
     static thread_local NGT::NGTAQ::GlobalPQ4LUT batch_lut_tl;
     static thread_local std::vector<float> batch_ip_tl;
     float q_ns_batch = 0.f;
-    const bool use_dist_lut = use_batch && use_dist_lut_env;
+    const bool use_dist_lut = use_batch && aq_cfg().dist_lut;
     if (use_batch) {
         // GPQ4 has its OWN (finer) subspace count — size by gpq4MPQ(), NOT the legacy
         // M_PQ, or buildGlobalLUT16 overflows this buffer when gpq4MPQ() > m_pq_.
@@ -1826,11 +1845,7 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
     // (per-vector symmetric max scale), then route every neighbor with a single signed-int8
     // dot (one vpdpbusd pass over D bytes) — no LUT, no gpq4_norm_sq_ gather. Opt-in
     // (AQ_SQ8=1) so we can A/B it against the gpq4 vpshufb routing.
-    static const bool use_sq8_env = [] {
-        const char* e = std::getenv("AQ_SQ8");
-        return e && std::atoi(e) != 0;
-    }();
-    const bool use_sq8 = use_batch && use_sq8_env && hasSQ8();
+    const bool use_sq8 = use_batch && aq_cfg().use_sq8 && hasSQ8();
     static thread_local std::vector<int8_t> q_sq8_tl;
     float q_max_sq8 = 0.f, q_nsq_sq8 = 0.f;
     if (use_sq8) {
@@ -1880,10 +1895,7 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
     // +15% QPS, r=0.80: +21%, r=0.92: +14%, recall within noise). Default the coarse
     // per-cluster seed count to 8 (n_probe=3 → ~24 total, vs ~96). AQ_SEEDS overrides
     // for sweeps. Legacy/global-PQ uses prop_.n_cluster_seeds unchanged.
-    static const int coarse_seeds_env = [] {
-        const char* e = std::getenv("AQ_SEEDS");
-        return e ? std::atoi(e) : 0;
-    }();
+    const int coarse_seeds_env = aq_cfg().seeds;  // AQ_SEEDS (0 = default); see aq_cfg()
     const int N_CLUSTER_SEEDS =
         use_coarse ? (coarse_seeds_env > 0 ? coarse_seeds_env : 8)
                    : prop_.n_cluster_seeds;
@@ -1906,10 +1918,7 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
     // member scan — and seed the LinearPool from a small fixed set of entry points scored by
     // the coarse (gpq4 dist-LUT) metric. Saves the ~6us setup+seed at the cost of warm-start
     // quality (the now-accurate graph walk recovers it on L2; risky for angular / very low ef).
-    static const bool graph_entry = [] {
-        const char* e = std::getenv("AQ_GRAPH_ENTRY");
-        return e && std::atoi(e) != 0;
-    }();
+    const bool graph_entry = aq_cfg().graph_entry;  // AQ_GRAPH_ENTRY (default off); see aq_cfg()
     if (graph_entry && use_batch) {
         static thread_local std::vector<SeedScore> scored;
         scored.clear();
@@ -1989,10 +1998,7 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
             //                  tier-2 LUT estimate. Slightly higher recall per visit but pays
             //                  the full scan, so it stays at the ~600 QPS floor — opt-in only.
             //   seeds_per_cluster == 0 ⇒ unbounded (legacy full-cluster scan).
-            static const bool seed_cap_topk = [] {
-                const char* e = std::getenv("AQ_SEED_CAP_TOPK");
-                return e && std::atoi(e) != 0;
-            }();
+            const bool seed_cap_topk = aq_cfg().seed_cap_topk;  // AQ_SEED_CAP_TOPK; see aq_cfg()
             const int seed_cap = prop_.seeds_per_cluster;
             const bool angular_capped =
                 is_angular_ && seed_cap > 0 &&
@@ -2147,10 +2153,7 @@ seeds_done:  // Phase 3 graph-only entry jumps here, skipping the IVF seeding bl
         // distance (the pool is sorted ascending, so data_[k-1].dist IS the k-th best, and
         // data_[cur_].dist IS the next candidate). eps=0 disables (default), preserving the
         // exact prior behavior. The exact fp16 rerank below still recovers true k-NN.
-        static const float term_eps = [] {
-            const char* e = std::getenv("AQ_TERM_EPS");
-            return e ? (float)std::atof(e) : -1.0f;  // <0 => disabled (default)
-        }();
+        const float term_eps = aq_cfg().term_eps;  // AQ_TERM_EPS (<0 = off, default); see aq_cfg()
         const float term_coeff = 1.0f + term_eps;
         // fp16-sharpened early-termination (AQ_TERM_EPS_FP16). The 4-bit gate above failed at
         // iso-recall because it compared a NOISY 4-bit frontier distance against a sharp fp16
@@ -2159,10 +2162,7 @@ seeds_done:  // Phase 3 graph-only entry jumps here, skipping the IVF seeding bl
         // radius — both sharp. The frontier node is reranked anyway when popped, so its fp16
         // distance is computed ~1 hop early and REUSED (stored as the popped node's exact
         // dist). dk_fp16 (max-heap of the k smallest popped exact fp16 dists) is the radius.
-        static const float term_eps_fp16 = [] {
-            const char* e = std::getenv("AQ_TERM_EPS_FP16");
-            return e ? (float)std::atof(e) : -1.0f;  // <0 => disabled (default)
-        }();
+        const float term_eps_fp16 = aq_cfg().term_eps_fp16;  // AQ_TERM_EPS_FP16 (<0 = off); see aq_cfg()
         const bool use_fp16_gate = (term_eps_fp16 >= 0.0f) && use_batch && !raw_flat_.empty();
         const float term_coeff_fp16 = 1.0f + term_eps_fp16;
         std::priority_queue<float> dk_fp16;  // max-heap of the k smallest popped exact fp16 dists
@@ -2255,8 +2255,8 @@ seeds_done:  // Phase 3 graph-only entry jumps here, skipping the IVF seeding bl
                 // No per-neighbor norm read, no IP->L2 assembly — the leanest per-hop path.
                 for (size_t ni = 0; ni < n_nbrs; ++ni) {
                     uint32_t u = nbr_ids[ni];
-                    if (u >= N) continue;
-                    if (has_tomb && graph_->isTombstone(u)) continue;
+                    if (u >= N) [[unlikely]] continue;          // OOB guard: never the common case
+                    if (has_tomb && graph_->isTombstone(u)) [[unlikely]] continue;
                     if (is_visited(u)) continue;
                     mark_visited(u);
                     const uint32_t b = (uint32_t)(ni / 16), pos = (uint32_t)(ni % 16);
@@ -2544,10 +2544,7 @@ post_dabs:  // Tech 2 batch LinearPool loop jumps here (skips the legacy cand_q 
     //            Keep the original k_beam*100; rerank is only ~3% of angular query
     //            time so this is still effectively free, and recall == baseline.
     // Env override AQ_REFINE_MULT (read once) for sweeping the rerank window.
-    static const int refine_mult_env = [] {
-        const char* e = std::getenv("AQ_REFINE_MULT");
-        return e ? std::atoi(e) : 0;
-    }();
+    const int refine_mult_env = aq_cfg().refine_mult;  // AQ_REFINE_MULT (0 = cascade floor); see aq_cfg()
     const size_t refine_mult = (refine_mult_env > 0)
         ? static_cast<size_t>(refine_mult_env)
         : (is_angular_ ? (size_t)100 : (size_t)15);
@@ -2580,10 +2577,7 @@ post_dabs:  // Tech 2 batch LinearPool loop jumps here (skips the legacy cand_q 
     // gpq4 pool distance), QG-style — rerank only the best N of the explored set instead of
     // ALL popped. Decouples rerank cost from hop count. Finer quant (M=128) orders well
     // enough that a small N may hold recall; sweep to find the knee.
-    static const int rerank_n_env = [] {
-        const char* e = std::getenv("AQ_RERANK_N");
-        return e ? std::atoi(e) : 0;
-    }();
+    const int rerank_n_env = aq_cfg().rerank_n;  // AQ_RERANK_N (>0 overrides refine_n); see aq_cfg()
     if (use_batch && rerank_n_env > 0) refine_n = static_cast<size_t>(rerank_n_env);
     if (results.size() > refine_n) {
         std::nth_element(results.begin(), results.begin() + refine_n, results.end());

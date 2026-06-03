@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstring>
 #include <cmath>
+#include <bit>     // std::bit_cast (C++20/23): zero-overhead type-punning, replaces memcpy
 
 namespace NGT { namespace NGTAQ {
 
@@ -27,8 +28,7 @@ static_assert(offsetof(VectorRecord, centroid_id) == 34);
 // ---------- fp16 utilities ----------
 
 inline uint16_t float_to_fp16(float f) {
-    uint32_t u;
-    memcpy(&u, &f, 4);
+    uint32_t u = std::bit_cast<uint32_t>(f);
     uint32_t sign     = (u >> 31) & 0x1;
     uint32_t exp32    = (u >> 23) & 0xFF;
     uint32_t mant32   = u & 0x7FFFFF;
@@ -54,8 +54,7 @@ inline uint16_t float_to_fp16(float f) {
 // is preserved (no overflow for SIFT reconstructed norms ~2e5, which exceed fp16 max
 // 65504). Used for the fused per-neighbor norm in the gpq4 block. Round-to-nearest-even.
 inline uint16_t float_to_bf16(float f) {
-    uint32_t u;
-    memcpy(&u, &f, 4);
+    uint32_t u = std::bit_cast<uint32_t>(f);
     // NaN: force a quiet NaN that survives truncation.
     if (((u >> 23) & 0xFF) == 0xFF && (u & 0x7FFFFF)) return (uint16_t)((u >> 16) | 0x40);
     uint32_t rounding_bias = 0x7FFF + ((u >> 16) & 1);
@@ -63,10 +62,7 @@ inline uint16_t float_to_bf16(float f) {
 }
 
 inline float bf16_to_float(uint16_t b) {
-    uint32_t u = (uint32_t)b << 16;
-    float f;
-    memcpy(&f, &u, 4);
-    return f;
+    return std::bit_cast<float>((uint32_t)b << 16);
 }
 
 inline float fp16_to_float(uint16_t h) {
@@ -91,9 +87,7 @@ inline float fp16_to_float(uint16_t h) {
         mant32 = mant << 13;
     }
     uint32_t u2 = (sign << 31) | (exp32 << 23) | mant32;
-    float result;
-    memcpy(&result, &u2, 4);
-    return result;
+    return std::bit_cast<float>(u2);
 }
 
 // ---------- tier-1 bit access (128 sign bits) ----------
