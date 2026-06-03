@@ -2533,13 +2533,26 @@ post_dabs:  // Tech 2 batch LinearPool loop jumps here (skips the legacy cand_q 
     // top-10 sit within global-PQ top-200=92.8%, top-500=98.2%, top-1000=99.4%), so the
     // exact-rerank pool needs a wide floor (~1000) to recover true k-NN. AQ_REFINE_MULT
     // still drives it higher when set (k_beam*mult overrides the floor when larger).
-    // Batch (K=16) routing is coarser still than K=256 global PQ, so it needs a wider
-    // exact-rerank pool to recover true k-NN. AQ_REFINE_MULT still overrides when larger.
-    const size_t refine_floor = use_batch ? (size_t)2000
+    // Batch (K=16, M=128, GORDER) cascade rerank (Lever 4): the gpq4 pre-ranking is fine
+    // enough that the true top-k sit within the top ~64 candidates BY GPQ4 DISTANCE across
+    // the whole recall curve (measured: N=64 recall-neutral vs uncapped at r=0.93..0.997,
+    // |delta|<=2e-4). So cap the exact-fp16 rerank set (reads the cold 256B/cand raw_flat_)
+    // to a tight floor instead of 2000 — ~47% less rerank time, recall-neutral. AQ_REFINE_MULT
+    // raises it (k_beam*mult) and AQ_RERANK_N overrides outright for sweeps / safety.
+    const size_t refine_floor = use_batch ? (size_t)64
                                           : (use_global_pq ? (size_t)1000 : (size_t)0);
-    size_t refine_n = std::max<size_t>(
-        std::max<size_t>(static_cast<size_t>(k_beam) * refine_mult, refine_floor),
-        static_cast<size_t>(k_out) * static_cast<size_t>(rerank_factor > 0 ? rerank_factor : 1));
+    size_t refine_n;
+    if (use_batch && refine_mult_env == 0) {
+        // Batch cascade: tight recall-safe cap (top-64 by gpq4 distance holds the true top-k).
+        // Stays >= k_out*rerank_factor so we never under-fill the result set.
+        refine_n = std::max<size_t>(refine_floor,
+            static_cast<size_t>(k_out) * static_cast<size_t>(rerank_factor > 0 ? rerank_factor : 1));
+    } else {
+        // Legacy / explicitly-tuned path: k_beam*mult with the (wide) floor.
+        refine_n = std::max<size_t>(
+            std::max<size_t>(static_cast<size_t>(k_beam) * refine_mult, refine_floor),
+            static_cast<size_t>(k_out) * static_cast<size_t>(rerank_factor > 0 ? rerank_factor : 1));
+    }
     // Phase 4: recall-adaptive rerank window (batch path). AQ_RERANK_N>0 caps the exact-L2
     // rerank to the top-N popped candidates BY QUANTIZED DISTANCE (results is keyed on the
     // gpq4 pool distance), QG-style — rerank only the best N of the explored set instead of
