@@ -1,0 +1,201 @@
+name: NGTAQ vs QG benchmark
+
+# Runs the NGTAQ-vs-QG recall→QPS benchmark on a GitHub-hosted runner so the
+# AVX-512/VNNI distance kernels get exercised on a modern Intel CPU (the local
+# dev box is AVX2-only Zen 2). The NGTAQ SIMD kernels are compile-time gated on
+# __AVX512F__/__AVX512DQ__ and run-time dispatched (CPUID); building with
+# -march=native on an AVX-512 runner is what enables + selects them.
+#
+# - workflow_dispatch: full manual run (SIFT always; GloVe opt-in). Heavy work is
+#   manual to respect the 6h job limit.
+# - push (this branch): a light smoke run (SIFT only, narrow sweep) to keep CI in
+#   a small time budget while still confirming the build + AVX-512 path.
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_glove:
+        description: "Also build + bench GloVe-100-angular (heavier; opt-in)"
+        type: boolean
+        default: false
+      full_sweep:
+        description: "Wide AQ_EF / epsilon×result_expansion sweep (slower, denser curve)"
+        type: boolean
+        default: true
+  push:
+    branches: [feat/ngtaq-speedup]
+    paths:
+      - ".github/workflows/benchmark.yml"
+      - "tests/ngtaq/**"
+      - "lib/NGT/NGTAQ/**"
+      - "lib/NGT/CMakeLists.txt"
+      - "CMakeLists.txt"
+
+# One in-flight run per ref; cancel superseded pushes (manual runs are not cancelled).
+concurrency:
+  group: bench-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'push' }}
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350  # < the 360-minute (6h) hosted-runner hard cap
+    env:
+      DATA_DIR: ${{ github.workspace }}/data/ann-benchmarks
+      IDX_DIR: ${{ github.workspace }}/data/indices
+      BUILD_DIR: ${{ github.workspace }}/build_ci
+      LOGS_DIR: ${{ github.workspace }}/benchmarks/results/ci
+      DATASET_BASE_URL: https://ann-benchmarks.com
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ---- 1. Runner ISA report (the reason we run this in CI at all) ----
+      - name: Runner CPU / SIMD ISA report
+        id: isa
+        run: |
+          chmod +x tests/ngtaq/ci_isa_report.sh
+          tests/ngtaq/ci_isa_report.sh
+
+      # ---- 2. Toolchain + math/IO deps (clang, OpenBLAS, HDF5) ----
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang cmake ninja-build \
+            libopenblas-dev liblapack-dev \
+            libhdf5-dev hdf5-tools \
+            libomp-dev python3
+          echo "clang: $(clang --version | head -1)"
+          echo "cmake: $(cmake --version | head -1)"
+
+      # ---- 3. Datasets (cached, keyed per dataset) ----
+      # Cache the whole ann-benchmarks dir; key folds in which datasets we want so a
+      # GloVe-enabled run does not collide with a SIFT-only cache entry.
+      - name: Resolve dataset list
+        id: datasets
+        run: |
+          want_glove="${{ github.event.inputs.run_glove }}"
+          # push events get the light path: SIFT only.
+          if [ "${{ github.event_name }}" = "push" ]; then want_glove="false"; fi
+          list="sift-128-euclidean:euclidean"
+          tag="sift"
+          if [ "$want_glove" = "true" ]; then
+            list="$list glove-100-angular:angular"
+            tag="sift-glove"
+          fi
+          echo "list=$list" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag"   >> "$GITHUB_OUTPUT"
+          echo "Datasets: $list"
+
+      - name: Cache ANN-Benchmarks datasets
+        id: ds-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.DATA_DIR }}
+          key: ann-datasets-${{ steps.datasets.outputs.tag }}-v1
+
+      - name: Download datasets (on cache miss)
+        if: steps.ds-cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p "$DATA_DIR"
+          for spec in ${{ steps.datasets.outputs.list }}; do
+            ds="${spec%%:*}"
+            dst="$DATA_DIR/$ds.hdf5"
+            if [ -s "$dst" ]; then echo "[skip] $ds present"; continue; fi
+            echo "[download] $ds.hdf5"
+            curl -fL --retry 3 --retry-delay 5 -o "$dst" "$DATASET_BASE_URL/$ds.hdf5"
+            ls -lh "$dst"
+          done
+
+      # ---- 4. Configure + build (NOT the `all` target — only the bench tools) ----
+      # No NGT_AVX2 flag: that would `#undef NGT_AVX512` (defines.h.in) and cap at AVX2.
+      # The default Release path compiles with `-Ofast -march=native -DNDEBUG`, so on an
+      # AVX-512 runner clang defines __AVX512F__/__AVX512DQ__/__AVX512VNNI__ and the
+      # kernels (compile-time-gated + run-time-dispatched) light up.
+      - name: Configure (CMake, clang, Release, -march=native)
+        run: |
+          cmake -S . -B "$BUILD_DIR" -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER=clang \
+            -DCMAKE_CXX_COMPILER=clang++ \
+            -DNGT_BUILD_TESTS=ON
+
+      - name: Build bench tools (ann_bench, qg_bench, index builders)
+        run: |
+          # Explicit targets only — never `all` (pre-existing broken test_vector_record).
+          cmake --build "$BUILD_DIR" -j "$(nproc)" --target \
+            ngt ngtstatic \
+            build_ngtaqv2_ann qg_build \
+            ann_bench qg_bench reorder_index
+          echo "Built binaries:"
+          ls -lh "$BUILD_DIR/tests/ngtaq"/{ann_bench,qg_bench,build_ngtaqv2_ann,qg_build} 2>/dev/null || true
+
+      # Confirm the AVX-512 codegen actually made it into the library (sanity check that
+      # -march=native picked AVX-512 on this runner). Informational; never fails the job.
+      - name: Verify AVX-512 codegen in libngt
+        run: |
+          so=$(ls "$BUILD_DIR"/lib/NGT/libngt.so* 2>/dev/null | head -1 || true)
+          n512=0
+          if [ -n "$so" ] && command -v objdump >/dev/null; then
+            n512=$(objdump -d "$so" 2>/dev/null | grep -cE 'zmm[0-9]|vpdpbusd|vfmadd[0-9]+ps.*zmm' || true)
+          fi
+          echo "libngt.so AVX-512 (zmm/VNNI) instruction sites: $n512"
+          {
+            echo "### Build"
+            echo ""
+            echo "- clang \`$(clang --version | head -1 | sed 's/.*version //')\`, \`-march=native\`, Release"
+            echo "- AVX-512 (zmm/VNNI) instruction sites in \`libngt.so\`: **${n512}** (0 ⇒ runner had no AVX-512 → AVX2 fallback)"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # ---- 5. Build indexes (cached per dataset; restored cache skips the rebuild) ----
+      - name: Cache built indexes
+        id: idx-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.IDX_DIR }}
+          # Index layout depends on the build tools' source; invalidate when they change.
+          key: ngtaq-qg-indexes-${{ steps.datasets.outputs.tag }}-${{ hashFiles('tests/ngtaq/build_ngtaqv2_ann.cpp', 'tests/ngtaq/qg_build.cpp', 'lib/NGT/NGTAQ/AQIndex.cpp') }}
+
+      - name: Build NGTAQ + QG indexes
+        run: |
+          chmod +x tests/ngtaq/ci_build_indexes.sh
+          for spec in ${{ steps.datasets.outputs.list }}; do
+            ds="${spec%%:*}"; raw_metric="${spec##*:}"
+            metric=l2; [ "$raw_metric" = "angular" ] && metric=angular
+            tests/ngtaq/ci_build_indexes.sh "$BUILD_DIR" "$DATA_DIR" "$IDX_DIR" "$ds" "$metric"
+          done
+
+      # ---- 6. Benchmark: fair NGTAQ AQ_EF sweep vs QG epsilon×result_expansion ----
+      - name: Run NGTAQ-vs-QG fair sweep
+        run: |
+          chmod +x tests/ngtaq/ci_bench.sh
+          mkdir -p "$LOGS_DIR"
+          # push = light run: narrow sweeps to stay in time budget.
+          if [ "${{ github.event_name }}" = "push" ] || [ "${{ github.event.inputs.full_sweep }}" = "false" ]; then
+            export CI_AQ_EF="20 50 120 320 1000"
+            export CI_QG_EPS="0.05,0.1,0.3,0.8"
+            export CI_QG_RE="1.0,2.0,5.0,12.0"
+            echo "Light sweep (push / full_sweep=false)"
+          fi
+          for spec in ${{ steps.datasets.outputs.list }}; do
+            ds="${spec%%:*}"; raw_metric="${spec##*:}"
+            metric=l2; [ "$raw_metric" = "angular" ] && metric=angular
+            tests/ngtaq/ci_bench.sh "$BUILD_DIR" "$DATA_DIR" "$IDX_DIR" "$LOGS_DIR" "$ds" "$metric"
+          done
+
+      # ---- 7. Artifacts (how we retrieve results instead of local runs) ----
+      - name: Upload raw benchmark results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ngtaq-vs-qg-results-${{ steps.datasets.outputs.tag }}-${{ github.run_id }}
+          path: |
+            ${{ env.LOGS_DIR }}/*.log
+            ${{ env.LOGS_DIR }}/grid_*.txt
+          if-no-files-found: warn
+          retention-days: 30
