@@ -93,6 +93,9 @@ struct AQConfig {
     // --- rerank (cascade) ---
     int   refine_mult;          // AQ_REFINE_MULT        (0 = use the cascade floor)
     int   rerank_n;             // AQ_RERANK_N           (>0 overrides refine_n)
+    int   rerank_sq8;           // AQ_RERANK_SQ8         (>0: SQ8 mid-stage prunes to top-N before
+                                //                        exact fp16; 0 = off, direct fp16). VNNI
+                                //                        rerank: 128B/cand vs fp16 256B/cand.
 
     AQConfig()
         : use_global_routing(env_bool ("AQ_USE_GLOBAL_ROUTING", false)),
@@ -108,7 +111,8 @@ struct AQConfig {
           term_eps          (env_float("AQ_TERM_EPS",           -1.0f)),
           term_eps_fp16     (env_float("AQ_TERM_EPS_FP16",      -1.0f)),
           refine_mult       (env_int  ("AQ_REFINE_MULT",        0)),
-          rerank_n          (env_int  ("AQ_RERANK_N",           0)) {}
+          rerank_n          (env_int  ("AQ_RERANK_N",           0)),
+          rerank_sq8        (env_int  ("AQ_RERANK_SQ8",         0)) {}
 };
 
 inline const AQConfig& aq_cfg() { static const AQConfig c; return c; }
@@ -1846,7 +1850,10 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
     const bool use_sq8 = use_batch && aq_cfg().use_sq8 && hasSQ8();
     static thread_local std::vector<int8_t> q_sq8_tl;
     float q_max_sq8 = 0.f, q_nsq_sq8 = 0.f;
-    if (use_sq8) {
+    // Encode the SQ8 query when EITHER SQ8 routing (use_sq8) OR the SQ8 rerank mid-stage
+    // (AQ_RERANK_SQ8>0) is active. Cheap one-time per query; needs hasSQ8() codes present.
+    const bool need_sq8_q = (use_sq8 || (aq_cfg().rerank_sq8 > 0 && use_batch)) && hasSQ8();
+    if (need_sq8_q) {
         q_sq8_tl.assign((size_t)sq8_dim_align_, 0);
         q_max_sq8 = NGT::NGTAQ::sq8_encode_sym(q_rot_tl.data(), q_sq8_tl.data(), D);
         for (int d = 0; d < D; ++d) q_nsq_sq8 += q_rot_tl[d] * q_rot_tl[d];
@@ -2612,6 +2619,22 @@ post_dabs:  // Tech 2 batch LinearPool loop jumps here (skips the legacy cand_q 
     }
 
     AQ_ADD(expand);  // [AQ_PROFILE] region (d): EXPAND_N 1-hop expansion
+
+    // Lever 2: VNNI-SQ8 rerank mid-stage (AQ_RERANK_SQ8>0, opt-in). The exact fp16 rerank
+    // below reads raw_flat_ (256 B/cand). SQ8 codes are HALF that (128 B/cand) and score with
+    // one vpdpbusd pass — so prune the (already gpq4-ordered) candidate set to the top-N by
+    // SQ8 L2 here, then the fp16 loop touches only N cold 256 B reads. SQ8 L2 is approximate,
+    // so N is kept generous (>= the final cascade pool the fp16 stage would have used) → the
+    // fp16 pass over the top-N is still exact for the true top-k. Default OFF (byte-identical).
+    {
+        const int sq8_rr = aq_cfg().rerank_sq8;
+        if (sq8_rr > 0 && use_batch && need_sq8_q && results.size() > (size_t)sq8_rr) {
+            // Re-key results by SQ8 L2 (128 B read + VNNI dot), keep the top-N closest.
+            for (auto& [d, id] : results) d = sq8Dist(id, q_sq8_tl.data(), q_max_sq8, q_nsq_sq8);
+            std::nth_element(results.begin(), results.begin() + sq8_rr, results.end());
+            results.resize(sq8_rr);
+        }
+    }
 
     // Exact L2 refinement: l2_sq_avx2 for D=128 ≈ 5ns/vector × 150 = 0.75μs.
     // Store squared distances to avoid redundant sqrts during sort; take sqrt only
