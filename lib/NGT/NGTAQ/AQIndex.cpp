@@ -1322,9 +1322,15 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
         const char* e = std::getenv("AQ_USE_GLOBAL_ROUTING");
         return e && std::atoi(e) != 0;
     }();
+    // Default ON: QG-style contiguous-neighbor 16-wide vpshufb batch path. A popped node's
+    // whole neighbor block is scored in one SIMD sweep over the co-located GPQ4 code store
+    // (dist-LUT form: no per-neighbor norm read, NO gather). Measured ns/hop 1533->995 (-35%)
+    // and ~1.4-1.8x iso-recall vs the legacy per-neighbor cand_q/per-cluster-ADC path. The
+    // recall knob for this path is AQ_EF (or max_visits); set AQ_BATCH_ROUTING=0 to revert to
+    // the legacy path (gamma_term knob). (Mirrors the search-body selector below; must agree.)
     static const bool use_batch_env_e = [] {
         const char* e = std::getenv("AQ_BATCH_ROUTING");
-        return e && std::atoi(e) != 0;
+        return e ? (std::atoi(e) != 0) : true;  // default ON (gather-free contiguous sweep)
     }();
     const bool use_batch_e  = hasGPQ4() && use_batch_env_e;
     const bool use_global_e = (has_global_pq_ && use_global_env_e) && !use_batch_e;
@@ -1676,7 +1682,7 @@ std::vector<SearchResult> NGTAQIndex::searchV2(
     // (single-node gpq4Dist with the same codebook), so d_k uses one consistent metric.
     static const bool use_batch_env = [] {
         const char* e = std::getenv("AQ_BATCH_ROUTING");
-        return e && std::atoi(e) != 0;
+        return e ? (std::atoi(e) != 0) : true;  // default ON (see use_batch_env_e above)
     }();
     const bool use_batch = hasGPQ4() && use_batch_env;
     // Batch implies global-PQ semantics (no per-cluster ADC); legacy global PQ (K=256)
