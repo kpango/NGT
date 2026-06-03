@@ -823,8 +823,11 @@ NGTAQIndex NGTAQIndex::fromNGTv2(const std::string& ngt_path, const Property& pr
     // GPQ4 uses its OWN subspace dimension, DECOUPLED from the legacy tier-2 D_sub=8.
     // QG (D<=400) defaults to D_sub=1 → M=D subspaces (fine routing); our coarse D_sub=8
     // → M=D/8 caps skip-rerank routing recall at ~12%. AQ_GPQ4_DSUB selects D_sub
-    // (must divide D); default 2 (M=D/2) as the recall/size sweet spot. K stays 16.
-    int gpq4_dsub = 2;
+    // (must divide D). Default 1 (M=D, finest) — the consolidated campaign default: best
+    // walk-routing ordering at high recall; M=64 (dsub=2) was an iso-recall wash (coarser
+    // quant needs proportionally more hops) but a smaller index. AQ_GPQ4_DSUB=2 for the
+    // small-memory tradeoff. K stays 16.
+    int gpq4_dsub = 1;
     {
         const char* e = std::getenv("AQ_GPQ4_DSUB");
         if (e) { int v = std::atoi(e); if (v > 0) gpq4_dsub = v; }
@@ -1108,6 +1111,25 @@ NGTAQIndex NGTAQIndex::fromNGTv2(const std::string& ngt_path, const Property& pr
                        prop.metric == NGT::ObjectSpace::DistanceTypeCosine);
     idx.d_eff_ = D;
     idx.m_pq_  = M_PQ;
+
+    // Consolidated default: GORDER cache-locality node-ID reorder (commit 8e6d4d2). Pure
+    // permutation, recall byte-stable, dynamic-safe (re-run after bulk updates). Folds the
+    // former post-build reorder_index step into the default build. AQ_NO_REORDER=1 skips it;
+    // AQ_REORDER=bfs|rcm selects an alternate mode. Requires a tombstone-free fresh build (true).
+    {
+        const char* skip = std::getenv("AQ_NO_REORDER");
+        if (!(skip && std::atoi(skip) != 0)) {
+            ReorderMode rm = ReorderMode::GORDER;
+            if (const char* m = std::getenv("AQ_REORDER")) {
+                std::string ms(m);
+                if (ms == "bfs") rm = ReorderMode::BFS;
+                else if (ms == "rcm") rm = ReorderMode::RCM;
+            }
+            fprintf(stderr, "[NGTAQv2] Reordering for cache locality (mode=%s)...\n",
+                    rm == ReorderMode::GORDER ? "gorder" : rm == ReorderMode::RCM ? "rcm" : "bfs");
+            idx.reorderForLocality(rm);
+        }
+    }
 
     fprintf(stderr, "[NGTAQv2] Build complete. N=%zu K=%u\n", N, K);
     return idx;
