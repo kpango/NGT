@@ -1,0 +1,11 @@
+=== BEFORE-optimization NGTAQ (clean, AQ_PROFILE=off, t=1) ===
+-- SIFT L2 (gt=0.02/0.20/0.40, ge=0.20) --
+gt=0.02 recall@10  = 0.8259	agg_QPS   = 4398
+gt=0.20 recall@10  = 0.9856	agg_QPS   = 1399
+gt=0.40 recall@10  = 0.9955  *** >=0.99 ***	agg_QPS   = 755
+-- GIST L2 (gt=0.10/0.40) --
+gt=0.10 recall@10  = 0.9539	agg_QPS   = 207
+gt=0.40 recall@10  = 0.9957  *** >=0.99 ***	agg_QPS   = 38
+-- GloVe angular (gt=0.40/0.90, ge=0.50, np=20) --
+gt=0.40 recall@10  = 0.9907  *** >=0.99 ***	agg_QPS   = 36
+gt=0.90 recall@10  = 0.9906  *** >=0.99 ***	agg_QPS   = 13

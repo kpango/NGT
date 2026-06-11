@@ -1,0 +1,10 @@
+# nytimes-256-angular AFTER (1T)  NGTAQ_maxrecall=0.9263  (pts: ngtaq=16 qbg=21 qg=26)
+ recall |    NGTAQ |      QBG |       QG |  vs max | verdict
+----------------------------------------------------------------
+   0.50 |      199 |     3424 |      N/A |   0.06x | LOSS
+   0.70 |      199 |      N/A |      N/A |     N/A | N/A
+   0.80 |      199 |      N/A |      N/A |     N/A | N/A
+   0.85 |      161 |      N/A |      N/A |     N/A | N/A
+   0.90 |      109 |      N/A |      N/A |     N/A | N/A
+   0.95 |  unreach |      N/A |      N/A |       - | NGTAQ cannot reach
+   0.99 |  unreach |      N/A |      N/A |       - | NGTAQ cannot reach

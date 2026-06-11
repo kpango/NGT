@@ -1,0 +1,10 @@
+# glove-100-angular FINAL (1T)  NGTAQ_maxrecall=0.9906  (pts: ngtaq=24 qbg=21 qg=24)
+ recall |    NGTAQ |      QBG |       QG |  vs max | verdict
+----------------------------------------------------------------
+   0.50 |      960 |     5138 |     9107 |   0.11x | LOSS
+   0.70 |      960 |     2863 |      N/A |   0.34x | LOSS
+   0.80 |      960 |     1849 |      N/A |   0.52x | LOSS
+   0.85 |      400 |     1392 |      N/A |   0.29x | LOSS
+   0.90 |      400 |      802 |      N/A |   0.50x | LOSS
+   0.95 |       42 |      325 |      N/A |   0.13x | LOSS
+   0.99 |       42 |      N/A |      N/A |     N/A | N/A
