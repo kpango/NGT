@@ -43,7 +43,9 @@
 
 #define MULTIPLE_OBJECT_LISTS
 #define NGTQG_ROTATION
+#ifdef NGTQ_QBG
 #define NGTQ_BLAS_FOR_ROTATION
+#endif
 #define NGTQG_ROTATED_GLOBAL_CODEBOOKS
 #define NGTQ_OBJECT_IN_MEMORY
 
@@ -65,10 +67,12 @@
 #define NGTQ_SHARED_INVERTED_INDEX
 #endif
 
+#ifdef NGTQ_BLAS_FOR_ROTATION
 extern "C" {
 void sgemv_(char *trans, int *m, int *n, float *alpha, float *A, int *ldA, float *x, int *incx, float *beta,
             float *y, int *incy);
 }
+#endif // NGTQ_BLAS_FOR_ROTATION
 
 namespace NGTQ {
 
