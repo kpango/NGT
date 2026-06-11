@@ -1,0 +1,10 @@
+# sift-128-euclidean FINAL (1T)  ArcFlare_maxrecall=0.9964  (pts: arcflare=21 qbg=21 qg=26)
+ recall |    ArcFlare |      QBG |       QG |  vs max | verdict
+----------------------------------------------------------------
+   0.50 |     8323 |     8724 |    35991 |   0.23x | LOSS
+   0.70 |     5376 |     4748 |      N/A |   1.13x | win<2x
+   0.80 |     3486 |     3969 |      N/A |   0.88x | LOSS
+   0.85 |     3486 |     2923 |      N/A |   1.19x | win<2x
+   0.90 |     2921 |     2818 |      N/A |   1.04x | win<2x
+   0.95 |     1798 |     1755 |      N/A |   1.02x | win<2x
+   0.99 |      939 |     1013 |      N/A |   0.93x | LOSS

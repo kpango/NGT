@@ -1,0 +1,10 @@
+# gist-960-euclidean FINAL (1T)  ArcFlare_maxrecall=0.9961  (pts: arcflare=21 qbg=21 qg=25)
+ recall |    ArcFlare |      QBG |       QG |  vs max | verdict
+----------------------------------------------------------------
+   0.50 |     1131 |      910 |    10019 |   0.11x | LOSS
+   0.70 |      640 |      484 |      N/A |   1.32x | win<2x
+   0.80 |      324 |      287 |      N/A |   1.13x | win<2x
+   0.85 |      324 |      287 |      N/A |   1.13x | win<2x
+   0.90 |      324 |      208 |      N/A |   1.56x | win<2x
+   0.95 |      216 |       77 |      N/A |   2.81x | PASS>=2x
+   0.99 |       76 |      N/A |      N/A |     N/A | N/A
