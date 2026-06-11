@@ -1,0 +1,183 @@
+// lib/NGT/ArcFlare/DABSSearcher.h
+//
+// DABS (Dual-Adaptive Beam Search) searcher for AQ-DABS.
+//
+// Algorithm:
+//   1. Encode query to interleaved BQ buffer query_bq[words*2] (caller's responsibility).
+//   2. Initialize candidate min-heap with entry points.
+//   3. Pop closest unvisited x:
+//      - if k results found AND δ_BQ(q,x) > (1+γ_term)*d_k → TERMINATE
+//   4. For each neighbor u of x:
+//      - if k results found AND δ_BQ(q,u) > (1+γ_enq)*d_k → skip
+//      - if not visited: push to candidate queue + update result heap
+//   5. Return top-k' = 2k candidate IDs sorted by BQ distance ascending.
+//
+// Cold start: γ gates don't fire until k results are accumulated.
+// d_k = k-th best BQ distance (max-heap top when result_q has exactly k entries).
+//
+#pragma once
+
+#include "NGT/ArcFlare/BQDistance.h"
+#include "NGT/ArcFlare/SoAGraph.h"
+
+#include <algorithm>
+#include <cstdint>
+#include <limits>
+#include <queue>
+#include "NGT/ArcFlare/unordered_dense.h"
+#include <vector>
+
+namespace ArcFlare {
+
+struct SearchResult {
+    uint32_t id;
+    float    distance;     // exact distance (after refinement)
+    float    bq_distance;  // BQ routing distance
+};
+
+// Optional output statistics for a single route() call.
+// Pass a non-null pointer to collect; nullptr (default) has no overhead.
+struct RouteStats {
+    uint32_t hop_count = 0;   // nodes popped from cand_q and expanded
+    uint32_t bq_calls  = 0;   // total bqDistance() invocations (seeds + neighbors)
+    uint32_t visited_n = 0;   // nodes inserted into visited set
+};
+
+class DABSSearcher {
+public:
+    float gamma_enq      = 0.15f;  // enqueue gate
+    float gamma_term     = 0.35f;  // termination gate
+    float k_prime_factor = 2.0f;   // refinement candidates = k * k_prime_factor
+
+    // BQ-only routing. Returns up to k' = k*k_prime_factor candidate IDs sorted
+    // by BQ distance ascending.
+    //
+    // Thread safety: NOT safe against concurrent modifications to `graph`.
+    // Callers must hold at least a shared lock on graph.mutex() for the duration
+    // of this call.
+    std::vector<uint32_t> route(
+        const uint64_t* query_bq,
+        int k,
+        const SoAGraph& graph,
+        const std::vector<uint32_t>& entry_points,
+        RouteStats* stats = nullptr) const
+    {
+        const int k_prime = static_cast<int>(k * k_prime_factor);
+        if (k <= 0) return {};
+        if (k_prime <= 0) return {};
+        const int words   = graph.words();
+        const int D       = words * 64;
+
+        using Entry = std::pair<float, uint32_t>;
+        // Min-heap: closest candidate first
+        std::priority_queue<Entry, std::vector<Entry>, std::greater<Entry>> cand_q;
+        // Max-heap of size k_prime: farthest on top, used for result collection
+        std::priority_queue<Entry> result_q;
+        // Separate max-heap of exactly k items to track the true k-th best distance.
+        // result_q grows to k_prime, so result_q.top() tracks the k_prime-th best,
+        // which is too loose for early termination gates.
+        std::priority_queue<float> dk_tracker;
+        ankerl::unordered_dense::set<uint32_t> visited;
+        visited.reserve(entry_points.size() * 16);  // reduce rehash for typical fan-out
+
+        // d_k: true k-th best BQ distance; gates don't fire until k results found
+        float d_k = std::numeric_limits<float>::infinity();
+
+        // Helper: update dk_tracker and d_k when a new result candidate arrives.
+        auto update_dk = [&](float dist) {
+            if (dk_tracker.size() < static_cast<size_t>(k)) {
+                dk_tracker.push(dist);
+                if (dk_tracker.size() == static_cast<size_t>(k))
+                    d_k = dk_tracker.top();
+            } else if (dist < dk_tracker.top()) {
+                dk_tracker.pop();
+                dk_tracker.push(dist);
+                d_k = dk_tracker.top();
+            }
+        };
+
+        // Seed from entry points
+        for (uint32_t ep : entry_points) {
+            if (ep >= static_cast<uint32_t>(graph.size()) || graph.isTombstone(ep))
+                continue;
+            if (visited.count(ep)) continue;
+            float d = bqDistance(query_bq, graph.getNodeBQ(ep), words, D);
+            if (stats) ++stats->bq_calls;
+            cand_q.push({d, ep});
+            visited.insert(ep);
+        }
+
+        while (!cand_q.empty()) {
+            auto [dist_qx, x] = cand_q.top();
+            cand_q.pop();
+            if (stats) ++stats->hop_count;
+
+            // Termination gate: only after k results accumulated
+            if (dk_tracker.size() >= static_cast<size_t>(k) &&
+                dist_qx > (1.0f + gamma_term) * d_k) {
+                break;
+            }
+
+            // Update result heap and dk_tracker
+            if (result_q.size() < static_cast<size_t>(k_prime)) {
+                result_q.push({dist_qx, x});
+                update_dk(dist_qx);
+            } else if (dist_qx < result_q.top().first) {
+                result_q.pop();
+                result_q.push({dist_qx, x});
+                update_dk(dist_qx);
+            }
+
+            // Explore neighbors
+            // Prefetch interleaved BQ data PREFETCH_DIST nodes ahead so the cache
+            // line arrives before bqDistance() needs it.  16 chosen for DDR4:
+            // ~300-cycle miss / ~15-cycle bqDistance(D=128,AVX2) ≈ 20 ideal;
+            // 16 is conservative to avoid over-prefetch on L3-resident graphs.
+            // D=128: sign+mag fit in 1 interleaved cache line (was 2 separate prefetches).
+            auto neighbors = graph.getNeighbors(x);
+            constexpr int PREFETCH_DIST = 16;
+            for (size_t ni = 0; ni < neighbors.size(); ++ni) {
+                uint32_t u = neighbors[ni];
+                if (ni + PREFETCH_DIST < neighbors.size()) {
+                    uint32_t nxt = neighbors[ni + PREFETCH_DIST];
+                    __builtin_prefetch(graph.getNodeBQ(nxt), 0, 1);
+                }
+                if (graph.isTombstone(u)) continue;
+                // Mark visited immediately to prevent redundant BQ distance
+                // computations when the same node appears as a neighbor of
+                // multiple visited nodes.
+                if (visited.count(u)) continue;
+                visited.insert(u);
+
+                float d_qu = bqDistance(query_bq, graph.getNodeBQ(u), words, D);
+                if (stats) ++stats->bq_calls;
+
+                // Enqueue gate: skip if clearly too far (only after k results found).
+                if (dk_tracker.size() >= static_cast<size_t>(k) &&
+                    d_qu > (1.0f + gamma_enq) * d_k) {
+                    continue;
+                }
+
+                cand_q.push({d_qu, u});
+            }
+        }
+
+        // Drain result_q into sorted vector (ascending by BQ distance)
+        std::vector<Entry> rv;
+        rv.reserve(result_q.size());
+        while (!result_q.empty()) {
+            rv.push_back(result_q.top());
+            result_q.pop();
+        }
+        std::sort(rv.begin(), rv.end());  // ascending by distance
+
+        if (stats) stats->visited_n = static_cast<uint32_t>(visited.size());
+
+        std::vector<uint32_t> ids;
+        ids.reserve(rv.size());
+        for (auto& [d, id] : rv) ids.push_back(id);
+        return ids;
+    }
+};
+
+} // namespace ArcFlare
