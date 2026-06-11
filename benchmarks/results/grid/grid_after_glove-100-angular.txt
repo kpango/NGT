@@ -1,0 +1,10 @@
+# glove-100-angular AFTER (1T)  ArcFlare_maxrecall=0.9907  (pts: arcflare=16 qbg=21 qg=22)
+ recall |    ArcFlare |      QBG |       QG |  vs max | verdict
+----------------------------------------------------------------
+   0.50 |      353 |     4775 |     9211 |   0.04x | LOSS
+   0.70 |      341 |     2723 |      N/A |   0.13x | LOSS
+   0.80 |      312 |     1762 |      N/A |   0.18x | LOSS
+   0.85 |      266 |     1343 |      N/A |   0.20x | LOSS
+   0.90 |      227 |      776 |      N/A |   0.29x | LOSS
+   0.95 |      151 |      307 |      N/A |   0.49x | LOSS
+   0.99 |       39 |      N/A |      N/A |     N/A | N/A
